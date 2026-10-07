@@ -121,7 +121,21 @@ server:
   priorityClassName: ""
   podAnnotations: {}
   podLabels: {}
-  extraEnv: []
+  # Langfuse project keys for the ai-gateway-usage skill's daily report.
+  # Sourced from the langfuse-credentials Secret in this namespace so the
+  # value stays out of these (version-controlled) values. scrubbed_env()
+  # forwards these names unstripped, so they reach the workstream scripts.
+  extraEnv:
+    - name: LANGFUSE_PK
+      valueFrom:
+        secretKeyRef:
+          name: langfuse-credentials
+          key: LANGFUSE_PK
+    - name: LANGFUSE_SK
+      valueFrom:
+        secretKeyRef:
+          name: langfuse-credentials
+          key: LANGFUSE_SK
   # Rollout strategy. For a Deployment `maxUnavailable: 0, maxSurge: 1`
   # registers the new node before the old one leaves. StatefulSets roll
   # ordered, one at a time, and ignore maxSurge.
