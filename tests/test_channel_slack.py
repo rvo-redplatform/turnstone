@@ -407,7 +407,7 @@ class TestMrkdwnFieldEscaping:
 
         assert text["text"].split("\n")[1:] == [
             chr(0x2022) + " `bash`",
-            "```bash: rm -rf ~/x```",
+            "```rm -rf ~/x```",
         ]
         assert text["verbatim"] is True
 
@@ -443,7 +443,7 @@ class TestMrkdwnFieldEscaping:
             "needs_approval": True,
         }
 
-        assert "```bash: rm -rf ~/x```" in self._approval_card_text([*reads, bash])["text"]
+        assert "```rm -rf ~/x```" in self._approval_card_text([*reads, bash])["text"]
 
     def test_a_call_already_refused_shows_only_its_name(self) -> None:
         """A call the policy denied won't run whatever the person picks, so its header gets no
@@ -477,6 +477,44 @@ class TestMrkdwnFieldEscaping:
         text = self._approval_card_text([{"call_id": "c-1", "func_name": raw, "preview": "p"}])
 
         assert text["text"].split("\n")[1:] == [chr(0x2022) + f" `{shown}`", "```p```"]
+
+    def test_a_header_loses_its_glyph_and_tool_name_prefix(self) -> None:
+        """The card names the tool already; "\u2699 bash: cmd" shows as just the command."""
+        item = {
+            "call_id": "c-1",
+            "func_name": "bash",
+            "approval_label": "bash",
+            "header": "\u2699 bash: find /data -type f -name '*.csv' | head -50",
+            "preview": "",
+            "needs_approval": True,
+        }
+        body = self._approval_card_text([item])["text"]
+
+        assert "```find /data -type f -name '*.csv' | head -50```" in body
+        assert "\u2699" not in body
+
+    def test_trim_approval_header(self) -> None:
+        from turnstone.channels.slack.bot import _trim_approval_header
+
+        assert _trim_approval_header("\u2699 bash: ls /data", "bash") == "ls /data"
+        # Qualified headers keep their qualifier; other tools keep their path.
+        assert _trim_approval_header("\u2699 bash (30s): sleep 5", "bash") == "bash (30s): sleep 5"
+        assert _trim_approval_header("\u270e write_file: /tmp/x.txt", "write_file") == "/tmp/x.txt"
+        assert _trim_approval_header("\x1b[2mbash: ls\x1b[0m", "bash") == "ls"
+        assert _trim_approval_header("", "bash") == ""
+
+    def test_a_preview_loses_its_ansi_colour_codes(self) -> None:
+        item = {
+            "call_id": "c-1",
+            "func_name": "bash",
+            "header": "bash: echo one ... (1 more line)",
+            "preview": "\x1b[2m    echo one\n    echo two\x1b[0m",
+            "needs_approval": True,
+        }
+        body = self._approval_card_text([item])["text"]
+
+        assert "    echo one\n    echo two" in body
+        assert "\x1b" not in body
 
     def test_policy_deny_notice_escapes_names_but_feedback_stays_verbatim(self) -> None:
         from turnstone.channels._routing import PolicyVerdict

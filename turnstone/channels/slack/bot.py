@@ -113,6 +113,30 @@ _ZWSP = "\u200b"
 # backticks, however long, holds a fence delimiter.  Splicing each disjoint triple instead left
 # one in a run of five.
 _FENCE_RUN = re.compile(r"(?<=``)`")
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _strip_ansi(text: str) -> str:
+    """Drop terminal colour codes the server embeds in tool previews/headers."""
+    return _ANSI_RE.sub("", text)
+
+
+def _trim_approval_header(header: str, name: str) -> str:
+    """Return the part of a one-line approval ``header`` worth showing.
+
+    The header reads ``"<glyph> <func_name>: <args>"``.  The card already names
+    the tool, so drop the leading status glyph (U+2699 gear, U+2717 cross, ...)
+    and the redundant ``"<name>: "`` prefix: ``"\u2699 bash: ls /data"`` becomes
+    ``"ls /data"``.  Qualified forms such as ``"bash (30s): cmd"`` keep their
+    qualifier.
+    """
+    header = _strip_ansi(header).strip()
+    if header and not header[0].isalnum():
+        header = header[1:].lstrip()
+    prefix = f"{name}: "
+    if header.startswith(prefix) and len(header) > len(prefix):
+        header = header[len(prefix) :]
+    return header
 
 
 def _sanitize_slack_preview(text: str, max_length: int = 1200) -> str:
@@ -125,7 +149,7 @@ def _sanitize_slack_preview(text: str, max_length: int = 1200) -> str:
     escaped for good measure.  Single backticks are kept intact so code snippets in plans and
     tool previews remain readable.
     """
-    text = _escape_mrkdwn(text)
+    text = _escape_mrkdwn(_strip_ansi(text))
     text = _FENCE_RUN.sub(_ZWSP + "`", text)
     if len(text) > max_length:
         text = text[: max_length - 3] + "..."
@@ -1323,7 +1347,9 @@ class TurnstoneSlackBot:
             # their name, as before, so no header of theirs can crowd it off the card.
             raw_preview = item.get("preview", "")
             if not raw_preview and item.get("needs_approval") and not item.get("error"):
-                raw_preview = item.get("header", "")
+                raw_preview = _trim_approval_header(
+                    item.get("header", ""), item.get("func_name") or "tool"
+                )
             preview = (
                 _sanitize_slack_preview(raw_preview, max_length=_APPROVAL_PER_ITEM_PREVIEW)
                 if raw_preview
