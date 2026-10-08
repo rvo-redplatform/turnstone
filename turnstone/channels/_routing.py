@@ -371,9 +371,17 @@ class ChannelRouter:
             )
 
             async def _create(resume_from: str) -> str:
+                # On resume the server applies ``name`` as the fork's alias,
+                # and finalize refuses an alias another row already holds
+                # (HTTP 409 "Workstream creation was superseded"). The saved
+                # source still owns the channel's fixed name
+                # (``slack-dm-<user>``), so every recovery of a channel
+                # conversation after a node restart would fail. Suffix the
+                # source id so the fork's alias is unique yet still readable.
+                create_name = f"{name}-{resume_from[:6]}" if (resume_from and name) else name
                 if self._console:
                     result = await self._console.route_create_workstream(
-                        name=name,
+                        name=create_name,
                         model=model,
                         resume_ws=resume_from,
                         resume_ws_exact=bool(resume_from),
@@ -386,7 +394,7 @@ class ChannelRouter:
 
                 assert self._server is not None
                 response = await self._server.create_workstream(
-                    name=name,
+                    name=create_name,
                     model=model,
                     resume_ws=resume_from,
                     resume_ws_exact=bool(resume_from),
