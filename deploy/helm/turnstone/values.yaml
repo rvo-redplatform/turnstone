@@ -199,10 +199,10 @@ console:
 # advertise its Service DNS name, not its pod hostname -- the chart sets
 # TURNSTONE_CHANNEL_ADVERTISE_URL accordingly.
 channel:
-  enabled: true
+  enabled: false
   replicas: 1
   port: 8091
-  existingSecret: turnstone-slack
+  existingSecret: ""
   discordGuild: "0"
   resources:
     requests:
