@@ -6357,9 +6357,11 @@ function _rememberModelResponseControl(spec) {
 // well-defined alias (model.default_alias / coordinator alias) so we
 // surface that concrete model in the placeholder.  The Task agent
 // cascades through ``[model].task_model → [model].agent_model →
-// session model`` per turnstone/core/settings_registry.py — there's
-// no single "default" to advertise, so the blank reads "(inherit)"
-// to match the vocabulary of the reasoning-effort dropdowns.
+// session model`` per turnstone/core/settings_registry.py, and the
+// Output guard judge through ``judge.output_guard_model → judge.model →
+// session model`` — there's no single "default" to advertise, so the
+// blank reads "(inherit)" to match the vocabulary of the
+// reasoning-effort dropdowns.
 const MODEL_ROLES = [
   {
     label: "Coordinator",
@@ -6372,16 +6374,16 @@ const MODEL_ROLES = [
   {
     label: "Judge",
     description:
-      "Intent-validation judge that scores tool calls before approval.",
+      "Intent-validation judge that scores tool calls before approval. Also runs the output guard when no output guard judge is set.",
     aliasKey: "judge.model",
     fallbackKind: "default",
   },
   {
     label: "Output guard judge",
     description:
-      "Output-guard judge that semantically evaluates tool results for camouflaged prompt injection (active when judge.output_guard_llm is enabled).",
+      "Output-guard judge that semantically evaluates tool results for camouflaged prompt injection (active when judge.output_guard_llm is enabled). Empty uses the Judge model, then the session's model.",
     aliasKey: "judge.output_guard_model",
-    fallbackKind: "default",
+    fallbackKind: "inherit",
   },
   {
     label: "Task agent",
@@ -7026,11 +7028,11 @@ function _renderModelRoles(container, values, schema) {
     // Format the blank/inherit option in the same "alias (model)" shape
     // as the other rows so the dropdown reads consistently — without
     // this the empty row was bare "(default — flatspark)" while every
-    // other row carried a "(/models/...)" suffix.  Plan/Task agent
-    // fall back through a multi-step chain (config.toml → agent_model
-    // → session) that has no single concrete "default", so they get
-    // a plain "(inherit)" instead of the misleading
-    // "(default — <coordinator-alias>)".
+    // other row carried a "(/models/...)" suffix.  Plan/Task agent and
+    // the Output guard judge fall back through a multi-step chain
+    // (config.toml → agent_model → session; judge.model → session) that
+    // has no single concrete "default", so they get a plain "(inherit)"
+    // instead of the misleading "(default — <coordinator-alias>)".
     const blank = document.createElement("option");
     blank.value = "";
     if (role.fallbackKind === "disabled") {

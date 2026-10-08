@@ -70,9 +70,9 @@
   --row-alt: rgba(255, 255, 255, 0.01);
 
   /* Typography — Inter for UI, JetBrains Mono for code. */
-  --font-ui: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-ui: "Inter", "Turnstone Symbols", system-ui, sans-serif;
   --font-mono:
-    "JetBrains Mono", "SF Mono", "IBM Plex Mono", Consolas, monospace;
+    "JetBrains Mono", "Turnstone Symbols", monospace;
 
   /* ========================================================================
      Design-system tokens — semantic palette + shape + rhythm.  These
@@ -1038,6 +1038,8 @@ body {
 /* ==========================================================================
    Empty state
    ========================================================================== */
+/* --fg-dim alone clears WCAG AA in both themes; an extra opacity dropped
+   this small italic text below it.  Messages can echo a long search. */
 .dashboard-empty {
   color: var(--fg-dim);
   font-size: 12px;
@@ -1045,7 +1047,7 @@ body {
   text-align: center;
   font-family: var(--font-ui);
   font-style: italic;
-  opacity: 0.7;
+  overflow-wrap: anywhere;
 }
 
 /* ==========================================================================

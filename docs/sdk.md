@@ -88,7 +88,7 @@ Both `TurnstoneServer` (sync) and `AsyncTurnstoneServer` (async) expose:
 | **Streaming** | `stream_events(ws_id, *, last_event_id=None, history_token=None)` | `Iterator[ServerEvent]` |
 | | `stream_global_events()` | `Iterator[ServerEvent]` |
 | **High-level** | `send_and_wait(message, ws_id, *, timeout, on_event)` | `TurnResult` |
-| **Saved** | `list_saved_workstreams()` | `ListSavedWorkstreamsResponse` |
+| **Saved** | `list_saved_workstreams(*, limit, offset, search, sort, order)` | `ListSavedWorkstreamsResponse` |
 | **Auth** | `login(username=..., password=...)` | `AuthLoginResponse` |
 | | `login(token="ts_xxx")` | `AuthLoginResponse` |
 | | `logout()` | `StatusResponse` |
@@ -252,6 +252,7 @@ retain any existing transcript and do not open a tokenless replacement stream.
 | `ws_activity` | `WsActivityEvent` | `ws_id`, `activity`, `activity_state` |
 | `ws_rename` | `WsRenameEvent` | `ws_id`, `name` |
 | `ws_closed` | `WsClosedEvent` | `ws_id` |
+| `ws_unloaded` | `WsUnloadedEvent` | `ws_id` (this node let go of the workstream: another process took it over, or its lease lapsed; drop it from this node only) |
 
 **Cluster events** (from `stream_cluster_events()`):
 
@@ -262,6 +263,7 @@ retain any existing transcript and do not open a tokenless replacement stream.
 | `cluster_state` | `ClusterStateEvent` | `ws_id`, `node_id`, `state`, `tokens`, `persistence_state` |
 | `ws_created` | `ClusterWsCreatedEvent` | `ws_id`, `node_id`, `name`, `persistence_state` |
 | `ws_closed` | `ClusterWsClosedEvent` | `ws_id` |
+| `ws_unloaded` | `ClusterWsUnloadedEvent` | `ws_id`, `node_id` (that node let go of the workstream; drop it from that node only) |
 | `ws_rename` | `ClusterWsRenameEvent` | `ws_id`, `name` |
 | `snapshot` | `ClusterSnapshotEvent` | `nodes`, `overview`, `timestamp` |
 

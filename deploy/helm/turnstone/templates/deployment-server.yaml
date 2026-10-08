@@ -56,6 +56,9 @@ spec:
       securityContext:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      # The pause container becomes PID 1 and reaps orphaned processes, such as the
+      # helpers a stdio MCP server leaves behind; Turnstone as PID 1 never would.
+      shareProcessNamespace: true
       {{- with .Values.server.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

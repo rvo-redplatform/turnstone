@@ -190,6 +190,15 @@ function patchClusterState(data) {
         persona: data.persona || "",
       });
     }
+  } else if (t === "ws_unloaded") {
+    // The node let go of a workstream another process holds (it did not
+    // close): drop it from that node only, and leave panes and the saved list.
+    const node = clusterState.nodes[data.node_id];
+    if (node) {
+      node.workstreams = (node.workstreams || []).filter(function (ws) {
+        return ws.id !== data.ws_id;
+      });
+    }
   } else if (t === "ws_closed") {
     Object.keys(clusterState.nodes).forEach(function (nid) {
       const n = clusterState.nodes[nid];
@@ -198,8 +207,8 @@ function patchClusterState(data) {
       });
     });
     // The saved list spans BOTH kinds now, so refresh on any close — the
-    // in-flight coalescing guard in loadSavedCoordinators (single fetch +
-    // one catch-up) prevents per-close fan-out into the saved endpoint.
+    // saved table keeps one request out and asks once more after it, so a
+    // burst of closes never fans out into the saved endpoint.
     if (typeof loadSavedCoordinators === "function") {
       loadSavedCoordinators();
     }
@@ -458,6 +467,7 @@ function handleClusterEvent(data) {
   if (
     data.type === "cluster_state" ||
     data.type === "ws_created" ||
+    data.type === "ws_unloaded" ||
     data.type === "ws_closed" ||
     data.type === "ws_rename" ||
     data.type === "node_joined" ||
@@ -2358,84 +2368,15 @@ document.addEventListener("keydown", function (e) {
 // each kind independently; activation follows the returned kind and node.
 // ---------------------------------------------------------------------------
 
-// In-flight de-dup for loadSavedCoordinators.  ws_closed events can
-// arrive in bursts on a busy cluster; without this guard each one
-// triggers a parallel fetch.  Single boolean is enough because the
-// renderer reads from the latest response — a coalesced re-fetch right
-// after the in-flight one resolves catches any state change.
-let _savedCoordsInFlight = false;
-let _savedCoordsRetry = false;
-
+// Refresh the saved table (at boot, after events, from Retry).  The table
+// keeps one request out at a time and asks once more after it, however many
+// calls arrive meanwhile.
 function loadSavedCoordinators() {
   if (!hasScope("read") || !_coordTable) return;
-  // Freeze the list while the user is multi-selecting — re-rendering
-  // mid-mode would shuffle the visible page out from under them.  The
-  // delete-mode wrapper drains the retry flag on cancel/onClose.
-  if (_coordTable && _coordTable.controller.inMode()) {
-    _savedCoordsRetry = true;
-    return;
-  }
-  if (_savedCoordsInFlight) {
-    _savedCoordsRetry = true;
-    return;
-  }
-  _savedCoordsInFlight = true;
-  const generation = authGeneration();
-  authFetch("/v1/api/workstreams/saved")
-    .then(function (r) {
-      if (!r.ok)
-        throw new Error("Could not load saved sessions (" + r.status + ").");
-      return r.json();
-    })
-    .then(function (data) {
-      if (generation !== authGeneration()) return;
-      // Belt-and-braces: if the user entered delete mode while this
-      // fetch was already in flight, defer the render — re-rendering
-      // mid-selection would shuffle visible cards and reshape selections.
-      if (_coordTable && _coordTable.controller.inMode()) {
-        _savedCoordsRetry = true;
-        return;
-      }
-      const saved = data.workstreams || [];
-      _setSavedError("");
-      const sec = document.getElementById("saved-coordinators");
-      if (sec) sec.style.display = saved.length ? "" : "none";
-      _coordTable.setItems(saved);
-    })
-    .catch(function (error) {
-      if (generation !== authGeneration()) return;
-      _coordTable.setItems([]);
-      _setSavedError(error.message || "Could not load saved sessions.");
-      const sec = document.getElementById("saved-coordinators");
-      if (sec) sec.style.display = "";
-    })
-    .finally(function () {
-      if (generation !== authGeneration()) return;
-      _savedCoordsInFlight = false;
-      // If at least one call arrived while we were in flight, fire one
-      // catch-up fetch (not N) so the UI reflects the latest state
-      // without a per-event fan-out.
-      if (_savedCoordsRetry) {
-        _savedCoordsRetry = false;
-        loadSavedCoordinators();
-      }
-    });
-}
-
-function _setSavedError(message) {
-  const error = document.getElementById("coord-saved-error");
-  if (error) error.hidden = !message;
-  const text = document.getElementById("coord-saved-error-text");
-  if (text) text.textContent = message;
-  ["saved-coord-cards", "coord-saved-footer"].forEach(function (id) {
-    const element = document.getElementById(id);
-    if (element) element.style.display = message ? "none" : "";
-  });
+  _coordTable.load();
 }
 
 function _savedAuthChanged() {
-  _savedCoordsInFlight = _savedCoordsRetry = false;
-  _setSavedError("");
   if (_coordTable) _coordTable.reset();
   const sec = document.getElementById("saved-coordinators");
   if (sec) sec.style.display = "none";
@@ -2470,15 +2411,15 @@ function _initSavedCoordTable() {
       key: "kind",
       label: "KIND",
       width: "62px",
+      order: "asc",
+      // Last to go when the table is too narrow for NAME.
+      drop: 6,
       cell: function (s) {
         const tag = document.createElement("span");
         const coord = s.kind === "coordinator";
         tag.className = "kind-tag" + (coord ? " coord" : " int");
         tag.textContent = coord ? "COORD" : "INT";
         return tag;
-      },
-      sort: function (s) {
-        return s.kind || "";
       },
     },
     SavedColumns.persona(),
@@ -2495,11 +2436,27 @@ function _initSavedCoordTable() {
     filterEl: document.getElementById("coord-filter"),
     footerEl: document.getElementById("coord-saved-footer"),
     paginationEl: document.getElementById("coord-pagination"),
+    errorEl: document.getElementById("coord-saved-error"),
+    errorTextEl: document.getElementById("coord-saved-error-text"),
     columns: COORD_COLUMNS,
     noun: "session",
     emptyText: "No saved sessions",
+    // The section shows while there is a list, a search (whose box must stay
+    // up when nothing matches) or an error to show.
+    onLoad: function (page) {
+      const sec = document.getElementById("saved-coordinators");
+      if (sec) {
+        sec.style.display =
+          page.total || page.filter || page.failed ? "" : "none";
+      }
+    },
     canActivate: _canActOnSavedSession,
     canDelete: _canActOnSavedSession,
+    // Interactive sessions need only write; the button stays put on pages
+    // of coordinators this viewer cannot delete.
+    canDeleteAny: function () {
+      return hasScope("write");
+    },
     activateLabel: function (s) {
       return (
         "Resume " +
@@ -2562,7 +2519,26 @@ function _initSavedCoordTable() {
             showToast("Coordinator no longer available");
             loadSavedCoordinators();
           } else if (r.status === 503) {
-            showToast("Coordinator subsystem not configured");
+            // A missing coordinator subsystem, a session-factory error or a
+            // history read to retry: the body says which.
+            readRefusal(r).then(function (refusal) {
+              showToast(
+                (typeof refusal.data.error === "string" &&
+                  refusal.data.error) ||
+                  "Coordinator subsystem not configured",
+              );
+            });
+          } else if (r.status === 409) {
+            readRefusal(r).then(function (refusal) {
+              showToast(
+                // The holder of a coordinator's lease is always a console.
+                refusal.where
+                  ? "This coordinator is open on another console. Retry once it closes there."
+                  : (typeof refusal.data.error === "string" &&
+                      refusal.data.error) ||
+                      "Failed to restore coordinator (409)",
+              );
+            });
           } else {
             showToast("Failed to restore coordinator (" + r.status + ")");
           }
@@ -2575,9 +2551,9 @@ function _initSavedCoordTable() {
     delete: {
       idPrefix: "coord-delete",
       buttonId: "coord-delete-btn",
-      // Coordinators live on whichever node owns the ws_id; the router proxy
-      // reads ws_id from the body, resolves the owning node via rendezvous
-      // hashing, and forwards to that node's POST workstreams/{ws_id}/delete.
+      // The console deletes a coordinator itself (it holds coordinator
+      // leases); the same route forwards an interactive delete to the node
+      // that owns the workstream.
       buildDeleteRequest: function (wsId) {
         return {
           url: "/v1/api/route/workstreams/delete",
@@ -2587,12 +2563,6 @@ function _initSavedCoordTable() {
             body: JSON.stringify({ ws_id: wsId }),
           },
         };
-      },
-      onClose: function () {
-        // Drain queued retries before the explicit reload (see the freeze
-        // gate in loadSavedCoordinators) so .finally() doesn't double-fetch.
-        _savedCoordsRetry = false;
-        loadSavedCoordinators();
       },
     },
   });
@@ -2617,12 +2587,6 @@ function startCoordDeleteMode() {
 }
 function cancelCoordDeleteMode() {
   _coordTable.controller.cancel();
-  // The freeze gate (see loadSavedCoordinators) may have queued retries
-  // while we were multi-selecting; drain them now that we're idle again.
-  if (_savedCoordsRetry) {
-    _savedCoordsRetry = false;
-    loadSavedCoordinators();
-  }
 }
 function toggleCoordSelectAll() {
   _coordTable.controller.toggleAll();
@@ -2675,40 +2639,46 @@ window.TS_APP.buildNodeInfo = function (node) {
 // saved-row resume, AND reload-rehydrate all funnel through here).
 //
 // Try the live/origin hint first to reuse an already loaded session. A missing,
-// unreachable, or wrong-node hint requires a fresh route lookup. The router
-// preserves durable node requirements; flexible sessions retain HRW recovery.
-// Both the router and the executing node enforce the requirement.
+// unreachable, or wrong-node hint requires a fresh route lookup, and so does a
+// hint whose node refused because another node owns the session's lease: the
+// router prefers that owner. The router preserves durable node requirements;
+// flexible sessions retain HRW recovery. Both the router and the executing node
+// enforce the requirement.
 window.TS_APP.resolveInteractiveNode = function (wsId, hintNodeId) {
   const readFailure = function (r) {
-    return Promise.resolve()
-      .then(function () {
-        return r.json();
-      })
-      .catch(function () {
-        return {};
-      })
-      .then(function (data) {
-        const required = data && data.required_node_id;
-        if (
-          data &&
-          ((r.status === 503 && data.code === "required_node_unavailable") ||
-            (r.status === 409 && data.code === "wrong_execution_node")) &&
-          typeof required === "string" &&
-          /^[A-Za-z0-9_.-]{1,256}$/.test(required)
-        ) {
-          return {
-            status: r.status,
-            code: data.code,
-            requiredNodeId: required,
-            error:
-              "This session requires node '" +
-              required +
-              "'. Retry when it returns, or continue elsewhere from saved history.",
-            canContinue: true,
-          };
-        }
-        return { status: r.status };
-      });
+    return readRefusal(r).then(function (refusal) {
+      const data = refusal.data;
+      const required = data.required_node_id;
+      if (
+        ((r.status === 503 && data.code === "required_node_unavailable") ||
+          (r.status === 409 && data.code === "wrong_execution_node")) &&
+        typeof required === "string" &&
+        /^[A-Za-z0-9_.-]{1,256}$/.test(required)
+      ) {
+        return {
+          status: r.status,
+          code: data.code,
+          requiredNodeId: required,
+          error:
+            "This session requires node '" +
+            required +
+            "'. Retry when it returns, or continue elsewhere from saved history.",
+          canContinue: true,
+        };
+      }
+      if (refusal.where) {
+        // Another node owns the session's lease; the route lookup leads to it.
+        return {
+          status: r.status,
+          code: data.code,
+          error:
+            "This session is open " +
+            refusal.where +
+            " and could not be reached there. Retry in a moment.",
+        };
+      }
+      return { status: r.status };
+    });
   };
   const openOn = function (nodeId) {
     return authFetch(
@@ -2761,7 +2731,8 @@ window.TS_APP.resolveInteractiveNode = function (wsId, hintNodeId) {
         if (
           res.status === 404 ||
           res.status === 502 ||
-          res.code === "wrong_execution_node"
+          res.code === "wrong_execution_node" ||
+          res.code === "workstream_lease_held"
         )
           return routeFallback();
         return failResult(res);

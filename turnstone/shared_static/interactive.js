@@ -1077,7 +1077,7 @@ class Pane {
         const func = verdict.func_name || "";
         showToast(
           "Judge verdict for " + func + ": " + rec + " (" + conf + "%)",
-          rec === "approve" ? "success" : rec === "deny" ? "error" : "warning",
+          rec === "approve" ? "success" : rec === "deny" ? "error" : "warn",
         );
         return;
       }
@@ -5370,11 +5370,12 @@ class Pane {
 
 // Build a structured ``.msg.guard-finding`` card for an ``output_guard``
 // operator-context system turn.  ``meta`` carries the structured finding
-// ``{flags, risk_level, annotations, redacted}``.  Reuses the tool-result
-// warning chip (``_buildOutputWarningEl``) for the risk / flags / redaction
-// header so the operator-context finding speaks the same visual vocabulary,
-// then appends the annotations (matched-pattern detail) — which the inline
-// tool chip omits to stay terse.  All text via textContent.
+// ``{flags, risk_level, annotations, redacted}``, and ``result`` when it is
+// about one of a step's several results.  Reuses the tool-result warning chip
+// (``_buildOutputWarningEl``) for the risk / flags / result / redaction header
+// so the operator-context finding speaks the same visual vocabulary, then
+// appends the annotations (matched-pattern detail) — which the inline tool
+// chip omits to stay terse.  All text via textContent.
 function _buildGuardFindingBubble(meta) {
   const el = document.createElement("div");
   el.className = "msg guard-finding operator-context";

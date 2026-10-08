@@ -5902,6 +5902,108 @@
         }
       }
     },
+    "/v1/api/route/workstreams/delete": {
+      "post": {
+        "summary": "Permanently delete a workstream through the console",
+        "operationId": "v1_api_route_workstreams_delete_post",
+        "tags": [
+          "Routing"
+        ],
+        "description": "Body ``{\"ws_id\": \"...\"}``.  A coordinator is deleted on this console, which holds its lease; any other workstream is forwarded to the node that owns it, and retried once at the holder when that node answers ``409`` ``workstream_lease_held``.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkstreamDeleteRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkstreamDeleteResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Error 409",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error 500",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Error 502",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/api/route": {
       "get": {
         "summary": "Look up which node owns a workstream",
@@ -6095,7 +6197,7 @@
         "tags": [
           "Coordinator"
         ],
-        "description": "Returns the persisted coordinator's display fields.  If the session isn't currently in memory, write scope is additionally required before the manager rehydrates it before responding; ``500`` on rehydrate failure carries a correlation id matching the server log line.",
+        "description": "Returns the persisted coordinator's display fields.  If the session isn't currently in memory, write scope is additionally required before the manager rehydrates it before responding; ``500`` on rehydrate failure carries a correlation id matching the server log line; ``409`` ``workstream_lease_held`` when another console holds it; ``429`` when every coordinator slot is busy (retry later).",
         "parameters": [
           {
             "name": "ws_id",
@@ -6147,6 +6249,26 @@
               }
             }
           },
+          "409": {
+            "description": "Error 409",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Error 429",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Error 500",
             "content": {
@@ -6177,7 +6299,74 @@
         "tags": [
           "Workstreams"
         ],
-        "description": "Requires read scope. Interactive rows use creator/project visibility; coordinator rows additionally require admin.coordinator. A caller without that permission receives only interactive rows.",
+        "description": "One page of sessions with history that no process has loaded, interactive and coordinator rows sorted and paged as one list. Requires read scope. Interactive rows use creator/project visibility; coordinator rows additionally require admin.coordinator. A caller without that permission receives only interactive rows. total counts every matching row across pages. A malformed parameter returns 400.",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 50
+            },
+            "description": "Rows per page (default 50, at most 200; larger values are clamped, and 0 returns only the total)."
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 0
+            },
+            "description": "Matching rows to skip before the page starts."
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Case-insensitive substring of the alias, title, name, project name or ws_id (at most 256 characters)."
+          },
+          {
+            "name": "sort",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "updated",
+              "enum": [
+                "child_count",
+                "context_ratio",
+                "kind",
+                "message_count",
+                "model",
+                "name",
+                "persona",
+                "project",
+                "updated",
+                "ws_id"
+              ]
+            },
+            "description": "Column to sort by; ws_id breaks ties so pages never overlap."
+          },
+          {
+            "name": "order",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "desc",
+              "enum": [
+                "asc",
+                "desc"
+              ]
+            },
+            "description": "Sort direction."
+          }
+        ],
         "responses": {
           "200": {
             "description": "Success",
@@ -6185,6 +6374,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ListSavedWorkstreamsResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
@@ -6209,7 +6408,7 @@
         "tags": [
           "Coordinator"
         ],
-        "description": "Parity with ``POST /v1/api/workstreams/{ws_id}/open`` \u2014 gives SDK callers and operators a way to warm a coordinator without browsing to it.  Idempotent: ``already_loaded=true`` when the session was already in memory.",
+        "description": "Parity with ``POST /v1/api/workstreams/{ws_id}/open`` \u2014 gives SDK callers and operators a way to warm a coordinator without browsing to it.  Idempotent: ``already_loaded=true`` when the session was already in memory.  ``409`` ``workstream_lease_held`` when another console holds the coordinator; ``429`` when every coordinator slot is busy (retry later).",
         "parameters": [
           {
             "name": "ws_id",
@@ -6261,8 +6460,103 @@
               }
             }
           },
+          "409": {
+            "description": "Error 409",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Error 429",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Error 500",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/workstreams/{ws_id}/title": {
+      "post": {
+        "summary": "Set a coordinator workstream's title",
+        "operationId": "v1_api_workstreams_{ws_id}_title_post",
+        "tags": [
+          "Coordinator"
+        ],
+        "description": "Body ``{\"title\": \"...\"}``.  ``409`` when another workstream already uses the name, or with code ``workstream_lease_held`` when another console holds the coordinator. ``503`` when the console runs no coordinator subsystem.",
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Error 409",
             "content": {
               "application/json": {
                 "schema": {
@@ -7931,6 +8225,45 @@
             "description": "Error message",
             "title": "Error",
             "type": "string"
+          },
+          "code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Machine-readable reason on some refusals, e.g. ``workstream_lease_held`` (another process owns the workstream) or ``wrong_execution_node``",
+            "title": "Code"
+          },
+          "holder_node_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "With ``workstream_lease_held``: the node holding the lease, if known",
+            "title": "Holder Node Id"
+          },
+          "retry_after_ms": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "With ``workstream_lease_held``: milliseconds until that lease expires",
+            "title": "Retry After Ms"
           }
         },
         "required": [
@@ -9052,7 +9385,7 @@
           },
           "judge_model": {
             "default": "",
-            "description": "Override judge model alias for this workstream",
+            "description": "Override judge model alias for this workstream; the output guard's LLM stage runs on it too unless judge.output_guard_model is set",
             "title": "Judge Model",
             "type": "string"
           }
@@ -15294,7 +15627,7 @@
           },
           "judge_model": {
             "default": "",
-            "description": "Optional judge model alias for this workstream. Empty uses the server's configured judge model.",
+            "description": "Optional judge model alias for this workstream. Empty uses the server's configured judge model. The output guard's LLM stage runs on it too unless judge.output_guard_model is set.",
             "title": "Judge Model",
             "type": "string"
           },
@@ -16033,6 +16366,36 @@
         "title": "RewindRequest",
         "type": "object"
       },
+      "WorkstreamDeleteRequest": {
+        "description": "POST /v1/api/route/workstreams/delete request.",
+        "properties": {
+          "ws_id": {
+            "description": "ID of the workstream to delete",
+            "title": "Ws Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "ws_id"
+        ],
+        "title": "WorkstreamDeleteRequest",
+        "type": "object"
+      },
+      "WorkstreamDeleteResponse": {
+        "description": "Success response of a workstream delete.",
+        "properties": {
+          "deleted": {
+            "description": "ID of the workstream that was deleted",
+            "title": "Deleted",
+            "type": "string"
+          }
+        },
+        "required": [
+          "deleted"
+        ],
+        "title": "WorkstreamDeleteResponse",
+        "type": "object"
+      },
       "ListWorkstreamsResponse": {
         "description": "Response body for ``GET /v1/api/workstreams`` on either kind.\n\nTop-level key is ``workstreams`` regardless of the kind serving\nthe request \u2014 pre-lift coord returned ``{\"coordinators\": [...]}``;\nconvergence lifted both kinds onto the same shape. Coord SDK /\nfrontend consumers branching on ``data.coordinators`` swap to\n``data.workstreams``.",
         "properties": {
@@ -16120,6 +16483,7 @@
         "type": "object"
       },
       "ListSavedWorkstreamsResponse": {
+        "description": "One page of saved workstreams.\n\n``total`` counts every row matching the request's search, across all\npages; ``limit`` and ``offset`` echo the page the server applied. A server\nolder than paging sends only ``workstreams``; the defaults keep a newer\nSDK reading it.",
         "properties": {
           "workstreams": {
             "items": {
@@ -16127,6 +16491,21 @@
             },
             "title": "Workstreams",
             "type": "array"
+          },
+          "total": {
+            "default": 0,
+            "title": "Total",
+            "type": "integer"
+          },
+          "limit": {
+            "default": 0,
+            "title": "Limit",
+            "type": "integer"
+          },
+          "offset": {
+            "default": 0,
+            "title": "Offset",
+            "type": "integer"
           }
         },
         "required": [
@@ -16164,6 +16543,11 @@
             ],
             "default": null,
             "title": "Title"
+          },
+          "name": {
+            "default": "",
+            "title": "Name",
+            "type": "string"
           },
           "created": {
             "title": "Created",

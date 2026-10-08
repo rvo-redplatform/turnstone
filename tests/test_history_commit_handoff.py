@@ -1719,11 +1719,18 @@ def test_foreign_actor_cannot_consume_owned_queue_at_advisory_drain(tmp_db: Any)
     )
     session.bind_acting_user("bob")
 
-    assert session._collect_advisories(None, "some_tool", True) == []
+    assert (
+        session._collect_advisories(
+            None, "some_tool", received=None, result_index=1, result_count=1
+        )
+        == []
+    )
     assert list(session._queued_messages) == ["alice-advisory"]
 
     session.bind_acting_user("alice")
-    specs = session._collect_advisories(None, "some_tool", True)
+    specs = session._collect_advisories(
+        None, "some_tool", received=None, result_index=1, result_count=1
+    )
     assert [(source, meta.get("message")) for source, _content, meta in specs] == [
         ("user_interjection", "alice advisory")
     ]
@@ -1748,7 +1755,9 @@ def test_mixed_ownership_advisory_drain_emits_own_and_retains_foreign(tmp_db: An
         interjector_user_id="bob",
     )
 
-    specs = session._collect_advisories(None, "some_tool", True)
+    specs = session._collect_advisories(
+        None, "some_tool", received=None, result_index=1, result_count=1
+    )
     assert [(source, meta.get("message")) for source, _content, meta in specs] == [
         ("user_interjection", "bob advisory")
     ]
@@ -1831,7 +1840,9 @@ def test_empty_principal_queue_items_keep_internal_drain_compatibility(tmp_db: A
         turn_principal_id="",
     )
     session.bind_acting_user("bob")
-    specs = session._collect_advisories(None, "some_tool", True)
+    specs = session._collect_advisories(
+        None, "some_tool", received=None, result_index=1, result_count=1
+    )
     assert [(source, meta.get("message")) for source, _content, meta in specs] == [
         ("user_interjection", "internal advisory")
     ]

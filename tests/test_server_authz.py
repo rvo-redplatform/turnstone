@@ -296,8 +296,9 @@ class _FakeSession:
     def set_watch_runner(self, *_a: Any, **_kw: Any) -> None:
         pass
 
-    def resume(self, _ws_id: str, *, fork: bool = False) -> bool:
-        return False
+    def rehydrate(self) -> bool:
+        # Open loads the saved history through this; the fake has none to load.
+        return True
 
     def fork_from_storage(
         self,
@@ -1094,8 +1095,7 @@ class TestSavedWorkstreamsTrustedTeamVisibility:
 
     def _seed(self, client):
         """Create two workstreams per user, each with a message so they
-        land in list_workstreams_with_history (the SQL gates on an
-        EXISTS conversation)."""
+        count as saved (the saved list needs conversation history)."""
         from turnstone.core.storage import get_storage
 
         storage = get_storage()
@@ -2182,37 +2182,6 @@ class TestCompactCommandDispatch:
         assert ws.session.sends == []
         assert ws.session.queue_calls == []
 
-    def test_deferred_send_dispatches_into_post_swap_session(self, app_client):
-        """The drain re-captures ws.session per attempt: a /resume-style
-        identity swap during the window routes the deferred message into
-        the POST-swap session — the same guarantee the park's
-        per-iteration re-capture provided."""
-        client, mgr = app_client
-        ws_id = self._create_ws(client)
-        ws = mgr.get(ws_id)
-        assert ws is not None
-        old_session = ws.session
-        gate = threading.Event()
-        old_session.compact_gate = gate
-        client.post(
-            "/v1/api/command",
-            json={"command": "/compact", "ws_id": ws_id},
-            headers=_auth("user-1"),
-        )
-        r = client.post(
-            f"/v1/api/workstreams/{ws_id}/send",
-            json={"message": "post-swap please"},
-            headers=_auth("user-1"),
-        )
-        assert r.json()["status"] == "queued"
-        new_session = _FakeSession(ws_id=ws_id, user_id="user-1")
-        ws.session = new_session  # the in-place identity swap
-        gate.set()
-        wait_until(lambda: new_session.sends, timeout=8.0)
-        assert [s[0] for s in new_session.sends] == ["post-swap please"]
-        assert old_session.sends == []
-        wait_until(lambda: self._drain_idle(ws), timeout=8.0)
-
     def test_rejected_deferred_entry_waits_for_slot_then_fresh_spawns(self, app_client):
         """The drain's rejection arm: an entry the interjection fallback
         refuses (cross-user here; attachments/oversized take the same
@@ -3284,6 +3253,80 @@ class TestCreateForkRollback:
             if event.get("type") in {"ws_created", "ws_rename"}
         }
 
+    @pytest.mark.parametrize(
+        "key", ["temperature", "max_tokens", "token_budget", "applied_skill_version"]
+    )
+    def test_invalid_fork_config_rolls_back_cloned_history_and_attachments(
+        self, app_client, monkeypatch, key
+    ) -> None:
+        from tests._session_helpers import make_session
+        from turnstone.core.storage import get_storage
+
+        client, mgr = app_client
+        storage = get_storage()
+        source_id = "a" * 32
+        destination_id = "b" * 32
+        self._register_source(storage, source_id, with_history=False)
+        attachment_id = "c" * 64
+        storage.save_attachment(attachment_id, "notes.txt", "text/plain", 5, "text", b"notes")
+        row_id = storage.save_message(source_id, "user", "source text")
+        storage.set_message_attachments(source_id, row_id, [attachment_id])
+        storage.save_workstream_config(source_id, {key: "not-a-number"})
+
+        sessions = []
+
+        def _real_session_factory(ui, _model, ws_id, **kwargs):
+            session = make_session(
+                ui=ui,
+                ws_id=ws_id,
+                user_id=ui._user_id,
+                fork_reservation_token=kwargs["fork_reservation_token"],
+                workstream_lease=kwargs.get("workstream_lease"),
+            )
+            sessions.append(session)
+            return session
+
+        monkeypatch.setattr(mgr._adapter, "_session_factory", _real_session_factory)
+        clone_workstream = storage.clone_workstream
+        committed_snapshots = []
+
+        def _record_clone(*args, **kwargs):
+            snapshot = clone_workstream(*args, **kwargs)
+            committed_snapshots.append(snapshot)
+            return snapshot
+
+        monkeypatch.setattr(storage, "clone_workstream", _record_clone)
+        response = client.post(
+            "/v1/api/workstreams/new",
+            json={"ws_id": destination_id, "resume_ws": source_id},
+            headers=_auth("user-1"),
+        )
+
+        assert response.status_code == 503, response.text
+        assert response.json() == {"error": "Fork could not be completed"}
+        assert len(committed_snapshots) == 1
+        assert committed_snapshots[0].config == {key: "not-a-number"}
+        assert committed_snapshots[0].turns[0].text == "source text"
+        assert len(sessions) == 1 and sessions[0].messages == []
+        assert mgr.get(destination_id) is None
+        assert storage.get_workstream(destination_id) is None
+        assert storage.load_message_turns(destination_id) == []
+        assert storage.load_workstream_config(destination_id) == {}
+        attachment = storage.get_attachment(attachment_id)
+        assert attachment is not None and attachment["refcount"] == 1
+        assert storage.attachment_referenced_in_ws(attachment_id, source_id)
+        assert not storage.attachment_referenced_in_ws(attachment_id, destination_id)
+        assert not [
+            event
+            for event in storage.list_audit_events(action="workstream.created")
+            if event["resource_id"] == destination_id
+        ]
+        assert not {
+            event["type"]
+            for event in self._global_events(client)
+            if event.get("type") in {"ws_created", "ws_rename"}
+        }
+
     def test_caller_chosen_destination_collision_preserves_existing_row(self, app_client) -> None:
         """An unloaded durable row is not a blank reservation for a fork.
 
@@ -3419,7 +3462,10 @@ class TestCreateForkRollback:
             if lifecycle == "close":
                 assert mgr.close(destination_id) is True
             else:
-                assert storage.delete_workstream(destination_id) is True
+                assert (
+                    storage.delete_workstream(destination_id, lease=mgr.lease_fence(destination_id))
+                    is True
+                )
                 assert mgr.delete(destination_id) is True
         finally:
             release_clone.set()

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -127,6 +128,57 @@ INTERACTIVE_TOOLS = [
 INTERACTIVE_TOOL_NAMES = frozenset(t["function"]["name"] for t in INTERACTIVE_TOOLS)
 TASK_AUTO_TOOLS = {n for n, m in _META.items() if m.get("auto_approve")}
 PRIMARY_KEY_MAP = {n: m["primary_key"] for n, m in _META.items() if "primary_key" in m}
+
+
+# Keys a malformed call's arguments are searched for: primary and identifying
+# ones, so the model sees a minimal salvaged call and resubmits with correct
+# JSON.  Coordinator keys (ws_id, message, initial_message, parent_ws_id) keep a
+# malformed coordinator call from being a dead end.
+_SALVAGE_KEYS = (
+    "action",
+    "command",
+    "code",
+    "content",
+    "initial_message",
+    "message",
+    "name",
+    "page",
+    "parent_ws_id",
+    "path",
+    "pattern",
+    "prompt",
+    "query",
+    "status",
+    "task_id",
+    "title",
+    "uri",
+    "url",
+    "ws_id",
+)
+
+
+def salvage_tool_arguments(func_name: str, raw_args: str) -> dict[str, Any] | None:
+    """Arguments recovered from *raw_args* that are not valid JSON, else ``None``.
+
+    First the string value of a known key (:data:`_SALVAGE_KEYS`), then a bare
+    string with no JSON wrapper, taken as the tool's primary key
+    (:data:`PRIMARY_KEY_MAP`).
+    """
+    for key in _SALVAGE_KEYS:
+        m = re.search(rf'"{key}"\s*:\s*"((?:[^"\\]|\\.)*)"', raw_args)
+        if m:
+            try:
+                val = json.loads('"' + m.group(1) + '"')
+            except (json.JSONDecodeError, Exception):
+                val = m.group(1)
+            return {key: val}
+    if raw_args.strip() and not raw_args.strip().startswith("{"):
+        pk = PRIMARY_KEY_MAP.get(func_name)
+        if pk:
+            return {pk: raw_args}
+    return None
+
+
 BUILTIN_TOOL_NAMES = frozenset(_META)
 
 

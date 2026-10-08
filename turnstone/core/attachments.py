@@ -433,24 +433,31 @@ def safe_attachment_label(name: str | None, *, default: str = "file", max_len: i
     return cleaned or default
 
 
-def neutralize_untrusted_fences(text: str) -> str:
-    """Defang every session-trusted marker in model-visible untrusted text."""
+def neutralize_untrusted_fences(text: str, *, tokens: tuple[str, ...]) -> str:
+    """Defang every session-trusted marker in model-visible untrusted text.
+
+    Each of *tokens*, the session's fence tokens, is removed as well
+    (:func:`turnstone.core.fence.remove_token`); a caller whose result passes
+    through a pass that removes them passes none.
+    """
     safe = fence.neutralize(text, fence.SYSTEM_REMINDER_TAG, opening=True)
-    return fence.neutralize(safe, fence.SENDER_LABEL_TAG, opening=True)
+    safe = fence.neutralize(safe, fence.SENDER_LABEL_TAG, opening=True)
+    return fence.remove_token(safe, *tokens)
 
 
-def neutralize_attachment_part(part: Any) -> Any:
+def neutralize_attachment_part(part: Any, *, tokens: tuple[str, ...]) -> Any:
     """Return an attachment part with textual trust-marker forgeries defanged.
 
-    Attachment placeholders are materialized after ordinary message folding and
-    before model admission, so their text cannot rely on the folding pass for
-    this boundary. Only model-visible text and document strings are inspected;
-    binary image/audio data and base64 PDF payloads retain their exact bytes.
+    The fold reaches only a message's text parts, so the strings of document
+    parts (text files, a PDF's extracted text) are cleaned here: markers are
+    defanged and each of *tokens* removed.  Only model-visible text and
+    document strings are inspected; binary image/audio data and base64 PDF
+    payloads retain their exact bytes.
     """
     if isinstance(part, list):
         safe_parts: list[Any] | None = None
         for idx, item in enumerate(part):
-            safe = neutralize_attachment_part(item)
+            safe = neutralize_attachment_part(item, tokens=tokens)
             if safe is not item:
                 if safe_parts is None:
                     safe_parts = list(part)
@@ -460,7 +467,7 @@ def neutralize_attachment_part(part: Any) -> Any:
         return part
     if part.get("type") == "text" and isinstance(part.get("text"), str):
         text = part["text"]
-        safe = neutralize_untrusted_fences(text)
+        safe = neutralize_untrusted_fences(text, tokens=tokens)
         return part if safe == text else {**part, "text": safe}
     if part.get("type") != "document" or not isinstance(part.get("document"), dict):
         return part
@@ -474,7 +481,7 @@ def neutralize_attachment_part(part: Any) -> Any:
         # the potentially large payload rather than scanning it pointlessly.
         if field == "data" and document.get("media_type") == "application/pdf":
             continue
-        safe = neutralize_untrusted_fences(value)
+        safe = neutralize_untrusted_fences(value, tokens=tokens)
         if safe != value:
             if safe_document is None:
                 safe_document = dict(document)

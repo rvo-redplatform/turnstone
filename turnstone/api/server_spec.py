@@ -18,6 +18,7 @@ from turnstone.api.schemas import (
     AuthWhoamiResponse,
     ErrorResponse,
     StatusResponse,
+    WorkstreamDeleteResponse,
 )
 from turnstone.api.server_schemas import (
     MEMORY_NAME_INPUT_DESCRIPTION,
@@ -55,6 +56,42 @@ from turnstone.api.server_schemas import (
     WorkstreamDetailResponse,
     WorkstreamHistoryResponse,
 )
+from turnstone.core.workstream import (
+    SAVED_PAGE_DEFAULT_LIMIT,
+    SAVED_PAGE_MAX_LIMIT,
+    SAVED_SEARCH_MAX_CHARS,
+    SAVED_WORKSTREAM_SORT_KEYS,
+)
+
+#: Query parameters of ``GET /v1/api/workstreams/saved``, shared with the
+#: console spec.
+SAVED_WORKSTREAMS_QUERY_PARAMS: list[QueryParam] = [
+    QueryParam(
+        "limit",
+        f"Rows per page (default {SAVED_PAGE_DEFAULT_LIMIT}, at most {SAVED_PAGE_MAX_LIMIT}; "
+        "larger values are clamped, and 0 returns only the total).",
+        schema_type="integer",
+        default=SAVED_PAGE_DEFAULT_LIMIT,
+    ),
+    QueryParam(
+        "offset",
+        "Matching rows to skip before the page starts.",
+        schema_type="integer",
+        default=0,
+    ),
+    QueryParam(
+        "q",
+        "Case-insensitive substring of the alias, title, name, project name or ws_id "
+        f"(at most {SAVED_SEARCH_MAX_CHARS} characters).",
+    ),
+    QueryParam(
+        "sort",
+        "Column to sort by; ws_id breaks ties so pages never overlap.",
+        default="updated",
+        enum=sorted(SAVED_WORKSTREAM_SORT_KEYS),
+    ),
+    QueryParam("order", "Sort direction.", default="desc", enum=["asc", "desc"]),
+]
 
 SERVER_ENDPOINTS: list[EndpointSpec] = [
     # --- Workstream management ---
@@ -257,14 +294,21 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         "/v1/api/workstreams/{ws_id}/delete",
         "POST",
         "Permanently delete a saved workstream",
-        error_codes=[400, 404, 500],
+        response_model=WorkstreamDeleteResponse,
+        error_codes=[400, 404, 409, 500],
         tags=["Workstreams"],
     ),
     EndpointSpec(
         "/v1/api/workstreams/{ws_id}/open",
         "POST",
         "Load a saved workstream into memory",
-        error_codes=[400, 404, 500],
+        description=(
+            "``409`` with code ``workstream_lease_held`` names the node that has "
+            "the workstream open. ``429`` when every session slot on the node is "
+            "busy (retry later). ``503`` when its history or saved settings could "
+            "not be read (retry shortly) or the session factory is misconfigured."
+        ),
+        error_codes=[400, 404, 409, 429, 500, 503],
         tags=["Workstreams"],
     ),
     EndpointSpec(
@@ -289,13 +333,14 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
             "Returns the persisted workstream's display fields. If the "
             "session isn't currently in memory, write scope is additionally "
             "required before the manager rehydrates it "
-            "before responding; ``500`` on rehydrate failure carries a "
+            "before responding; ``429`` when every session slot is busy "
+            "(retry later); ``500`` on rehydrate failure carries a "
             "correlation id matching the server log line. Lifted from "
             "the coord-only surface in the Stage 2 history/detail verb "
             "lift — interactive previously had no detail endpoint."
         ),
         response_model=WorkstreamDetailResponse,
-        error_codes=[400, 403, 404, 500, 503],
+        error_codes=[400, 403, 404, 409, 429, 500, 503],
         tags=["Workstreams"],
     ),
     EndpointSpec(
@@ -414,9 +459,15 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         "/v1/api/workstreams/saved",
         "GET",
         "List saved workstreams",
-        description="Lists interactive history visible through creator/project access; requires read scope.",
+        description=(
+            "One page of interactive workstreams with history that no process has "
+            "loaded, visible through creator/project access; requires read scope. "
+            "total counts every matching row across pages. A malformed parameter "
+            "returns 400."
+        ),
         response_model=ListSavedWorkstreamsResponse,
-        error_codes=[503],
+        query_params=SAVED_WORKSTREAMS_QUERY_PARAMS,
+        error_codes=[400, 503],
         tags=["Workstreams"],
     ),
     # --- Skills ---

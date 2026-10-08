@@ -16,7 +16,7 @@
     <link rel="stylesheet" href="/shared/cards.css" />
     <link rel="stylesheet" href="/static/style.css" />
     <link rel="stylesheet" href="/shared/shell.css" />
-    <link rel="stylesheet" href="/shared/katex-0.18.10/katex.min.css" />
+    <link rel="stylesheet" href="/shared/katex-0.19.0/katex.min.css" />
     <link rel="stylesheet" href="/static/coordinator/coordinator.css" />
     <link rel="stylesheet" href="/static/coordinator/coord-chrome.css" />
     <link rel="stylesheet" href="/shared/interactive.css" />
@@ -177,12 +177,12 @@
           ></div>
         </section>
 
-        <!-- Saved coordinators — closed sessions that persist on disk.
-         Mirrors the interactive UI's "Saved Workstreams" card grid
-         (same /shared/cards.css primitives, same response item shape
-         from /v1/api/workstreams/saved).  Click a card →
-         /coordinator/{ws_id} → the lifted detail factory lazy-rehydrates
-         from storage.  Hidden until at least one saved coordinator loads. -->
+        <!-- Saved sessions — coordinators and interactive sessions with
+         history that no process has open.  Mirrors the interactive UI's
+         "Saved Workstreams" table (same /shared/cards.js table, same
+         /v1/api/workstreams/saved pages).  A coordinator row opens as a
+         pane after POST /open; an interactive row opens on its node.
+         Hidden until there is a list, a search or an error to show. -->
         <section
           id="saved-coordinators"
           style="display: none"
@@ -195,8 +195,9 @@
                 id="coord-filter"
                 class="saved-filter"
                 type="search"
-                placeholder="Filter by name&#x2026;"
-                aria-label="Filter saved sessions"
+                maxlength="256"
+                placeholder="Search name, project or ID&#x2026;"
+                aria-label="Search saved sessions"
                 autocomplete="off"
               />
               <button
@@ -211,7 +212,7 @@
           </div>
           <div
             id="coord-saved-error"
-            class="dashboard-empty"
+            class="dashboard-empty saved-error"
             role="alert"
             hidden
           >
@@ -975,9 +976,13 @@
                 style="display: none"
               >
                 <div class="mcp-registry-notice" role="note">
-                  <span class="mcp-registry-notice-icon" aria-hidden="true"
-                    >&#9432;</span
-                  >
+                  <span class="mcp-registry-notice-icon" aria-hidden="true">
+                    <svg width="13" height="13" viewBox="0 0 16 16" fill="none">
+                      <circle cx="8" cy="8" r="6.5" stroke="currentColor" />
+                      <path d="M8 7v4" stroke="currentColor" />
+                      <circle cx="8" cy="4.5" r="0.7" fill="currentColor" />
+                    </svg>
+                  </span>
                   Skills are community-published and not vetted by Turnstone.<br />
                   <span style="margin-left: 19px"
                     >Review source content before installing.</span
@@ -1447,9 +1452,13 @@
               </div>
               <div id="mcp-view-registry" role="tabpanel" style="display: none">
                 <div class="mcp-registry-notice" role="note">
-                  <span class="mcp-registry-notice-icon" aria-hidden="true"
-                    >&#9432;</span
-                  >
+                  <span class="mcp-registry-notice-icon" aria-hidden="true">
+                    <svg width="13" height="13" viewBox="0 0 16 16" fill="none">
+                      <circle cx="8" cy="8" r="6.5" stroke="currentColor" />
+                      <path d="M8 7v4" stroke="currentColor" />
+                      <circle cx="8" cy="4.5" r="0.7" fill="currentColor" />
+                    </svg>
+                  </span>
                   Servers are community-published via the
                   <a
                     href="https://registry.modelcontextprotocol.io"
@@ -4227,7 +4236,7 @@
     <script type="module" src="/shared/composer_attachments.js"></script>
     <script type="module" src="/shared/composer_queue.js"></script>
     <script type="module" src="/shared/status_bar.js"></script>
-    <script src="/shared/katex-0.18.10/katex.min.js"></script>
+    <script src="/shared/katex-0.19.0/katex.min.js"></script>
     <script src="/shared/hljs-11.12.0/highlight.min.js"></script>
     <script type="module" src="/shared/renderer.js"></script>
 

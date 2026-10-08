@@ -682,6 +682,10 @@ class TestCompactBeforeTruncate:
             ),
             patch.object(session, "_do_auto_compact") as compact,
             patch.object(session, "_maybe_compact_midturn") as midturn,
+            # Room for the tool result whatever the base prompt's size (the
+            # file tools' descriptions name the checkout path), so the
+            # zero-budget backstop stays out of this test.
+            patch.object(session, "_remaining_token_budget", return_value=1_000),
             patch("turnstone.core.session.save_message"),
         ):
             session.send("go")
@@ -2977,34 +2981,6 @@ class TestCompactionNoticeStamp:
         assert "notice" not in seen
         seen = self._emit(session, {"phase": "start", "trigger": "manual"})
         assert "notice" not in seen
-
-
-class TestPreSwapQueueFlush:
-    def test_new_flushes_stranded_queue_into_old_workstream(self, session):
-        """A message stranded in the queue from BEFORE a /new (a dying send
-        worker's closing race) must be persisted into the workstream it was
-        ADDRESSED to — flushed pre-swap, never carried across the identity
-        change into the fresh workstream's transcript."""
-        session._ws_id = "ws-old"
-        session.queue_message("stranded text")
-        saved: list[tuple[str, str, str]] = []
-
-        def fake_save(ws_id, role, content, **_kw):
-            saved.append((ws_id, role, content))
-            return 1
-
-        with (
-            patch("turnstone.core.session.save_message", side_effect=fake_save),
-            patch("turnstone.core.memory.register_workstream"),
-            patch.object(session, "_save_config"),
-            patch.object(session, "_follow_watch_registration"),
-        ):
-            session.handle_command("/new")
-        assert session._ws_id != "ws-old"
-        assert not session._queued_messages
-        flushed = [row for row in saved if row[2] == "stranded text"]
-        assert flushed and flushed[0][0] == "ws-old"  # old identity, pre-swap
-        assert all(row[2] != "stranded text" for row in saved if row[0] != "ws-old")
 
 
 class TestOrphanedCompactionRetirement:

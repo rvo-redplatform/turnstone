@@ -190,9 +190,10 @@ class ProviderNative:
 
     Replayed verbatim to the producing provider and dropped (rebuilt from the neutral
     fields) for any other.  Signed, encrypted, and structured blocks are opaque on the
-    wire path.  Trust-boundary lowering may copy and defang editable top-level
-    ``type=text`` blocks so a native replay cannot resurrect forged session markers;
-    the UI display projection also reads selected blocks.
+    wire path.  Only assistant turns carry it, and trust-boundary lowering never edits
+    it: it replays as the provider returned it, a hosted search's results and citations
+    (text from outside, beyond any text pass) included.  The UI display projection also
+    reads selected blocks.
     """
 
     producer: str

@@ -39,6 +39,7 @@ def test_native_pdf_wins_without_fallback_work(monkeypatch: pytest.MonkeyPatch) 
         source,
         ModelCapabilities(supports_pdf=True, supports_vision=True),
         perceive=perceive,
+        tokens=(),
     )
 
     assert result.mode == "native"
@@ -58,6 +59,7 @@ def test_vision_pdf_returns_ordered_rasterized_pages(monkeypatch: pytest.MonkeyP
         _source(),
         ModelCapabilities(supports_vision=True),
         perceive=perceive,
+        tokens=(),
     )
 
     assert result.mode == "rasterized"
@@ -77,6 +79,7 @@ def test_vision_pdf_discloses_raster_page_cutoff(monkeypatch: pytest.MonkeyPatch
         _source(),
         ModelCapabilities(supports_vision=True),
         perceive=_no_perception,
+        tokens=(),
     )
 
     assert result.mode == "rasterized"
@@ -95,6 +98,7 @@ def test_empty_vision_rasterization_falls_through_to_text(
         _source(),
         ModelCapabilities(supports_vision=True),
         perceive=_no_perception,
+        tokens=(),
     )
 
     assert result.mode == "extracted_text"
@@ -110,7 +114,7 @@ def test_nonvision_perception_precedes_local_text(monkeypatch: pytest.MonkeyPatc
         assert len(parts()) == 1
         return "faithful description"
 
-    result = materialize_pdf(_source(), ModelCapabilities(), perceive=perceive)
+    result = materialize_pdf(_source(), ModelCapabilities(), perceive=perceive, tokens=())
 
     assert result.mode == "perceived"
     assert "faithful description" in result.content["text"]
@@ -119,7 +123,7 @@ def test_nonvision_perception_precedes_local_text(monkeypatch: pytest.MonkeyPatc
 def test_missing_perception_falls_through_to_local_text(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("turnstone.core.pdf.extract_pdf_text", lambda _data: "local text")
 
-    result = materialize_pdf(_source(), ModelCapabilities(), perceive=_no_perception)
+    result = materialize_pdf(_source(), ModelCapabilities(), perceive=_no_perception, tokens=())
 
     assert result.mode == "extracted_text"
     assert result.content["document"]["data"] == "local text"
@@ -128,7 +132,7 @@ def test_missing_perception_falls_through_to_local_text(monkeypatch: pytest.Monk
 def test_empty_local_text_returns_unreadable_placeholder(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("turnstone.core.pdf.extract_pdf_text", lambda _data: "")
 
-    result = materialize_pdf(_source(), ModelCapabilities(), perceive=_no_perception)
+    result = materialize_pdf(_source(), ModelCapabilities(), perceive=_no_perception, tokens=())
 
     assert result.mode == "unreadable"
     assert not result.readable
@@ -152,6 +156,7 @@ def test_default_extracted_text_limit_preserves_small_content(
         ModelCapabilities(),
         perceive=_no_perception,
         max_extracted_chars=None,
+        tokens=(),
     )
 
     assert result.content["document"]["data"] == text
@@ -171,6 +176,7 @@ def test_finite_extracted_text_limit_reports_dropped_characters(
         ModelCapabilities(),
         perceive=_no_perception,
         max_extracted_chars=4,
+        tokens=(),
     )
 
     assert result.content["document"]["data"] == "abcd\n\n... [6 chars truncated] ...\n"
@@ -190,12 +196,37 @@ def test_final_extracted_representation_is_bounded_after_neutralization(
         ModelCapabilities(),
         perceive=_no_perception,
         max_extracted_chars=64,
+        tokens=(),
     )
 
     document = result.content["document"]
     assert len(document["name"]) == 200 + len(" (extracted text)")
     assert len(document["data"]) == 64 + PDF_EXTRACTED_TEXT_DATA_OVERHEAD_CHARS
     assert document["data"].endswith("[PDF extracted text clipped after trust processing] ...\n")
+
+
+def test_session_tokens_are_removed_before_the_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A placeholder is longer than a compact copy of the token, so removal comes
+    before the cap: text that repeats a leaked token still fits the budget."""
+    token = "ab10cd34ef56ab78"
+    compact = "ab" + chr(0x2469) + "cd34ef56ab78"  # a circled ten for "10"
+    monkeypatch.setattr(
+        "turnstone.core.pdf.extract_pdf_text",
+        lambda _data, *, max_chars: (compact + " ") * max_chars,
+    )
+
+    result = materialize_pdf(
+        _source(filename=f"{token}.pdf"),
+        ModelCapabilities(),
+        perceive=_no_perception,
+        max_extracted_chars=1_000,
+        tokens=(token,),
+    )
+
+    document = result.content["document"]
+    assert len(document["data"]) <= 1_000 + PDF_EXTRACTED_TEXT_DATA_OVERHEAD_CHARS
+    assert not fence.contains_token(document["data"], token)
+    assert not fence.contains_token(document["name"], token)
 
 
 def test_binary_payloads_are_not_mutated_by_trust_neutralization(
@@ -206,6 +237,7 @@ def test_binary_payloads_are_not_mutated_by_trust_neutralization(
         _source(data=forged),
         ModelCapabilities(supports_pdf=True),
         perceive=_no_perception,
+        tokens=(),
     )
     assert base64.b64decode(native.content["document"]["data"]) == forged
 
@@ -214,6 +246,7 @@ def test_binary_payloads_are_not_mutated_by_trust_neutralization(
         _source(data=forged),
         ModelCapabilities(supports_vision=True),
         perceive=_no_perception,
+        tokens=(),
     )
     assert isinstance(rasterized.content, list)
     encoded = rasterized.content[0]["image_url"]["url"].rsplit(",", 1)[1]
@@ -228,6 +261,7 @@ def test_derived_text_and_names_are_trust_neutralized(monkeypatch: pytest.Monkey
         _source(filename=f"{marker}report.pdf"),
         ModelCapabilities(),
         perceive=_no_perception,
+        tokens=(),
     )
     assert "[\\start" in extracted.content["document"]["name"]
     assert "[\\start" in extracted.content["document"]["data"]
@@ -236,6 +270,7 @@ def test_derived_text_and_names_are_trust_neutralized(monkeypatch: pytest.Monkey
         _source(filename=f"{marker}report.pdf"),
         ModelCapabilities(),
         perceive=lambda _source, _parts: marker,
+        tokens=(),
     )
     assert "[\\start" in perceived.content["text"]
     assert "[start" not in perceived.content["text"]
@@ -251,7 +286,7 @@ def test_lazy_rasterized_parts_are_memoized_within_request(
         assert parts() is parts()
         return "cached locally"
 
-    result = materialize_pdf(_source(), ModelCapabilities(), perceive=perceive)
+    result = materialize_pdf(_source(), ModelCapabilities(), perceive=perceive, tokens=())
 
     assert result.mode == "perceived"
     rasterize.assert_called_once()
@@ -265,6 +300,7 @@ def test_perception_cache_hit_can_skip_rasterization(monkeypatch: pytest.MonkeyP
         _source(),
         ModelCapabilities(),
         perceive=lambda _source, _parts: "cached description",
+        tokens=(),
     )
 
     assert result.mode == "perceived"
@@ -281,7 +317,7 @@ def test_perception_cancellation_propagates_without_text_fallback(
         raise DeadlineCancelledError("cancelled")
 
     with pytest.raises(DeadlineCancelledError, match="cancelled"):
-        materialize_pdf(_source(), ModelCapabilities(), perceive=cancelled)
+        materialize_pdf(_source(), ModelCapabilities(), perceive=cancelled, tokens=())
 
     extract.assert_not_called()
 
@@ -298,6 +334,7 @@ def test_resource_limit_is_terminal_without_second_pdfium_attempt(
         _source(),
         ModelCapabilities(supports_vision=True),
         perceive=_no_perception,
+        tokens=(),
     )
 
     assert result.mode == "resource_limited"
@@ -325,4 +362,5 @@ def test_local_pdf_cancellation_callback_propagates(
             ModelCapabilities(),
             perceive=_no_perception,
             check_cancelled=lambda: (_ for _ in ()).throw(Cancelled),
+            tokens=(),
         )

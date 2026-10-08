@@ -337,7 +337,7 @@ def test_estimator_observe_without_served_figure_keeps_ratio_and_own_estimate() 
     assert estimator.estimate(messages) == own_estimate
 
 
-def _prepared_tool(tool_call: dict[str, Any], _principal: str):
+def _prepared_tool(tool_call: dict[str, Any], _principal: str, **_kwargs: Any):
     call_id = tool_call["id"]
     return {
         "call_id": call_id,
@@ -446,6 +446,38 @@ def test_soft_crossing_warns_then_compacts_after_wind_down():
             "is_error": False,
         }
     ]
+
+
+def test_the_summarizer_reads_no_token_and_what_was_written_stays_as_written():
+    """The summarizer reads the session's token removed; its summary and the
+    agent's own wind-down, carried verbatim, replay as their writers wrote them."""
+    session = make_session(auto_compact_pct=0.8)
+    token = session._envelope_nonce
+    ledger = [Turn.system("immutable task identity"), Turn.user("delegated contract")]
+    written = "dense task summary [start system-reminder_quoted]"
+    own_words = f"Goal recorded; the page quoted {token}."
+
+    with patch.object(
+        session._compaction_engine,
+        "summarize_blocks",
+        return_value=SummaryResult(text=written, producer="summary-kernel"),
+    ) as summarize:
+        _output, contexts = _run_script(
+            session,
+            ledger,
+            [
+                _tool_result(prompt_tokens=82),
+                make_result(own_words, usage=_usage(86)),
+                make_result("implemented and verified", usage=_usage(30)),
+            ],
+        )
+
+    read = summarize.call_args.args[0]
+    assert any("Goal recorded; the page quoted" in block for block in read)
+    assert not any(token in block for block in read)
+    summary = _texts(contexts[2])[-2]
+    assert summary.startswith(written)
+    assert summary.endswith(own_words)
 
 
 def test_wind_down_compaction_releases_replaced_native_payload_before_resume():

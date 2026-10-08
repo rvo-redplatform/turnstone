@@ -7,6 +7,9 @@ from typing import Any
 import pytest
 import sqlalchemy as sa
 
+from tests._storage_fakes import acquire_lease as _acquire
+from tests._storage_fakes import expire_lease as _expire_lease
+from turnstone.core.storage._protocol import WorkstreamLeaseLostError
 from turnstone.core.storage._schema import workstreams
 
 # -- Workstream registration ---------------------------------------------------
@@ -499,10 +502,8 @@ class TestListWorkstreamsWithHistory:
         rows = backend.list_workstreams_with_history(limit=3)
         assert len(rows) == 3
 
-    def test_kind_filter_excludes_coordinators(self, backend):
-        """The interactive 'saved workstreams' sidebar calls this with
-        kind=INTERACTIVE so coordinator rows (which also persist
-        conversation history) don't leak into the interactive UI."""
+    def test_lists_every_kind(self, backend):
+        """The CLI's listing spans kinds: coordinator rows persist history too."""
         from turnstone.core.workstream import WorkstreamKind
 
         backend.register_workstream("interactive-1", kind=WorkstreamKind.INTERACTIVE)
@@ -510,79 +511,8 @@ class TestListWorkstreamsWithHistory:
         backend.register_workstream("coord-1", kind=WorkstreamKind.COORDINATOR)
         backend.save_message("coord-1", "user", "plan something")
 
-        # Default (no filter) returns both — preserves legacy behaviour.
-        rows_all = backend.list_workstreams_with_history()
-        assert {r[0] for r in rows_all} == {"interactive-1", "coord-1"}
-
-        # kind=INTERACTIVE drops the coordinator row at the SQL layer.
-        rows_i = backend.list_workstreams_with_history(kind=WorkstreamKind.INTERACTIVE)
-        assert {r[0] for r in rows_i} == {"interactive-1"}
-
-        # kind=COORDINATOR symmetric — for admin tooling that wants
-        # the opposite view.
-        rows_c = backend.list_workstreams_with_history(kind=WorkstreamKind.COORDINATOR)
-        assert {r[0] for r in rows_c} == {"coord-1"}
-
-    def test_kind_filter_accepts_string(self, backend):
-        """String form (``"interactive"``) works too — matches how the
-        memory.py helper forwards caller-supplied values."""
-        from turnstone.core.workstream import WorkstreamKind
-
-        backend.register_workstream("interactive-1", kind=WorkstreamKind.INTERACTIVE)
-        backend.save_message("interactive-1", "user", "hi")
-        backend.register_workstream("coord-1", kind=WorkstreamKind.COORDINATOR)
-        backend.save_message("coord-1", "user", "plan")
-
-        rows = backend.list_workstreams_with_history(kind="interactive")
-        assert {r[0] for r in rows} == {"interactive-1"}
-
-    def test_enriched_columns(self, backend):
-        """The saved-list query carries the enrichment trailing columns:
-        node_id, state, model_alias + launch_skill (workstream_config),
-        child_count (parent_ws_id), context_tokens (latest usage_events row)
-        and context_window (model_definitions join)."""
-        from turnstone.core.workstream import WorkstreamKind
-
-        backend.register_workstream(
-            "parent", node_id="n1", state="error", kind=WorkstreamKind.COORDINATOR
-        )
-        backend.save_message("parent", "user", "orchestrate")
-        backend.save_workstream_config("parent", {"model_alias": "m1", "skill": "news"})
-        # child via parent_ws_id → child_count = 1 (no message needed; the
-        # child_count subquery doesn't gate on EXISTS conversation)
-        backend.register_workstream("child", kind=WorkstreamKind.INTERACTIVE, parent_ws_id="parent")
-        backend.record_usage_event("e-parent", ws_id="parent", prompt_tokens=250)
-        # a usage event on a different ws must not bleed into parent's tokens
-        backend.record_usage_event("e-other", ws_id="child", prompt_tokens=999)
-        backend.create_model_definition("d1", alias="m1", model="m1-model", context_window=1000)
-
         rows = backend.list_workstreams_with_history()
-        row = next(r for r in rows if r[0] == "parent")
-        # (ws_id, alias, title, name, created, updated, message_count,
-        #  node_id, state, kind, model_alias, launch_skill, child_count,
-        #  context_tokens, context_window)
-        assert row[7] == "n1"  # node_id
-        assert row[8] == "error"  # state
-        assert row[10] == "m1"  # model_alias
-        assert row[11] == "news"  # launch_skill
-        assert row[12] == 1  # child_count
-        assert row[13] == 250  # context_tokens — parent's event, not child's 999
-        assert row[14] == 1000  # context_window from model_definitions
-
-    def test_enriched_columns_null_when_absent(self, backend):
-        """A bare workstream (no config / usage / model_def / children) leaves
-        the enrichment columns NULL / zero — the LEFT JOIN + subquery misses
-        degrade gracefully (the handler coerces these to defaults)."""
-        backend.register_workstream("bare")
-        backend.save_message("bare", "user", "hi")
-
-        rows = backend.list_workstreams_with_history()
-        row = next(r for r in rows if r[0] == "bare")
-        assert row[10] is None  # model_alias — no config row
-        assert row[11] is None  # launch_skill
-        assert row[12] == 0  # child_count
-        assert row[13] is None  # context_tokens — no usage events
-        assert row[14] is None  # context_window — no model def
+        assert {r[0] for r in rows} == {"interactive-1", "coord-1"}
 
 
 class TestDeleteWorkstream:
@@ -624,6 +554,29 @@ class TestPruneWorkstreams:
             conn.commit()
         _, stale = backend.prune_workstreams(retention_days=30)
         assert stale == 1
+
+    def test_rows_a_holder_lapsed_on_recently_are_kept(self, backend):
+        """A holder that only stopped renewing may still have the workstream
+        open, with an ``updated`` as old as its conversation."""
+        import sqlalchemy as sa
+
+        backend.register_workstream("orphan-held", fork_reservation_token="tok-orphan-held")
+        backend.register_workstream("stale-held", fork_reservation_token="tok-stale-held")
+        backend.save_message("stale-held", "user", "hi")
+        for ws_id in ("orphan-held", "stale-held"):
+            _acquire(backend, ws_id)
+            with backend._engine.connect() as conn:
+                conn.execute(
+                    sa.text("UPDATE workstreams SET updated = '2020-01-01' WHERE ws_id = :w"),
+                    {"w": ws_id},
+                )
+                conn.commit()
+            _expire_lease(backend, ws_id, seconds_ago=1.0)
+        assert backend.prune_workstreams(retention_days=30) == (0, 0)
+
+        for ws_id in ("orphan-held", "stale-held"):
+            _expire_lease(backend, ws_id)
+        assert backend.prune_workstreams(retention_days=30) == (1, 1)
 
 
 class TestResolveWorkstream:
@@ -796,9 +749,9 @@ class TestWorkstreams:
         backend.save_message("ws1", "user", "hello")
         rows = backend.list_workstreams_with_history()
         assert len(rows) == 1
-        # Columns: ws_id, alias, title, name, created, updated, count, node_id
+        # Columns: ws_id, alias, title, name, created, updated, message_count
         assert rows[0][0] == "ws1"
-        assert rows[0][7] == "node-a"
+        assert rows[0][6] == 1
 
 
 # -- Per-workstream usage aggregation -----------------------------------------
@@ -1002,159 +955,170 @@ class TestBulkCloseStaleOrphans:
 
         assert set(closed) == {"o-idle", "o-thinking", "o-attention", "o-running"}
 
-    def test_bumps_updated_on_close(self, backend):
+    def test_keeps_updated_on_close(self, backend):
+        """Closing an abandoned row is maintenance, not activity: ``updated``
+        keeps the session's last real use, which the saved list sorts and
+        shows and from which retention ages the row (#1268)."""
         stale_updated = "2020-01-01T00:00:00"
         backend.register_workstream("orphan", kind="interactive")
         _force_updated(backend, "orphan", stale_updated)
 
-        backend.bulk_close_stale_orphans(
-            "interactive", cutoff="2024-01-01T00:00:00", exclude_ws_ids=[]
-        )
-
-        # ``updated`` must change away from the forced stale value.  Asserting
-        # inequality from the seed (rather than ``> "2024-01-01..."``) keeps
-        # the test independent of wall-clock date.
-        with backend._engine.connect() as conn:
-            row = conn.execute(
-                sa.select(workstreams.c.updated).where(workstreams.c.ws_id == "orphan")
-            ).one()
-        assert row[0] != stale_updated
-
-    def test_protects_rows_owned_by_live_services(self, backend):
-        """Liveness scoping (post-#384 rendezvous-routing world): rows
-        whose ``node_id`` matches a heartbeating service must NOT be
-        reaped, because that owner may legitimately have them loaded on
-        another worker.  Rows whose ``node_id`` matches a dead service
-        ARE eligible — that's how dead-pod orphans get reclaimed in
-        containerized deployments with dynamic hostnames."""
-        backend.register_workstream("dead-node", node_id="dead-pod-x4k2", kind="interactive")
-        backend.register_workstream("alive-node", node_id="alive-pod-y9p3", kind="interactive")
-        _force_updated(backend, "dead-node", "2020-01-01T00:00:00")
-        _force_updated(backend, "alive-node", "2020-01-01T00:00:00")
-
-        closed = backend.bulk_close_stale_orphans(
-            "interactive",
-            cutoff="2024-01-01T00:00:00",
-            exclude_ws_ids=[],
-            live_node_ids=["alive-pod-y9p3"],
-        )
-
-        assert closed == ["dead-node"]
-        rows = backend.get_workstreams_batch(["dead-node", "alive-node"])
-        assert rows["dead-node"]["state"] == "closed"
-        assert rows["alive-node"]["state"] == "idle"
-
-    def test_null_node_id_always_eligible(self, backend):
-        """A row with NULL ``node_id`` has no owner identity — age alone
-        gates the reap.  Belt-and-suspenders against ``NULL NOT IN (...)``
-        evaluating to NULL (not TRUE) and silently protecting orphans
-        forever."""
-        backend.register_workstream("no-owner", node_id=None, kind="interactive")
-        _force_updated(backend, "no-owner", "2020-01-01T00:00:00")
-
-        closed = backend.bulk_close_stale_orphans(
-            "interactive",
-            cutoff="2024-01-01T00:00:00",
-            exclude_ws_ids=[],
-            live_node_ids=["some-other-node"],
-        )
-
-        assert closed == ["no-owner"]
-
-    def test_live_node_ids_none_skips_filter(self, backend):
-        """``live_node_ids=None`` is the single-process / operator-backfill
-        mode — all rows of *kind* are eligible regardless of node_id."""
-        backend.register_workstream("node-a", node_id="node-a", kind="interactive")
-        backend.register_workstream("node-b", node_id="node-b", kind="interactive")
-        _force_updated(backend, "node-a", "2020-01-01T00:00:00")
-        _force_updated(backend, "node-b", "2020-01-01T00:00:00")
-
         closed = backend.bulk_close_stale_orphans(
             "interactive", cutoff="2024-01-01T00:00:00", exclude_ws_ids=[]
         )
 
-        assert set(closed) == {"node-a", "node-b"}
-
-    def test_empty_live_node_ids_treats_all_as_dead(self, backend):
-        """Empty list ``live_node_ids=[]`` means "no nodes alive" — every
-        row's owner is unprotected.  Useful for operator scripts that
-        want to reap regardless of liveness."""
-        backend.register_workstream("any", node_id="node-a", kind="interactive")
-        _force_updated(backend, "any", "2020-01-01T00:00:00")
-
-        closed = backend.bulk_close_stale_orphans(
-            "interactive",
-            cutoff="2024-01-01T00:00:00",
-            exclude_ws_ids=[],
-            live_node_ids=[],
-        )
-
-        assert closed == ["any"]
-
-    def test_combines_live_node_ids_and_exclude_ws_ids(self, backend):
-        """Both filters stack as AND clauses on the UPDATE.  Covers the
-        full 2x2 matrix to catch a future edit that replaces an AND with
-        an OR or drops one of the filters: only the (orphan + dead-node)
-        cell should be reaped."""
-        # All four registered with the same stale ``updated``.
-        for ws_id, node in [
-            ("loaded-alive", "alive-node"),
-            ("loaded-dead", "dead-node"),
-            ("orphan-alive", "alive-node"),
-            ("orphan-dead", "dead-node"),
-        ]:
-            backend.register_workstream(ws_id, node_id=node, kind="interactive")
-            _force_updated(backend, ws_id, "2020-01-01T00:00:00")
-
-        closed = backend.bulk_close_stale_orphans(
-            "interactive",
-            cutoff="2024-01-01T00:00:00",
-            exclude_ws_ids=["loaded-alive", "loaded-dead"],
-            live_node_ids=["alive-node"],
-        )
-
-        # Only orphan-dead is unprotected by both filters.
-        assert closed == ["orphan-dead"]
-        rows = backend.get_workstreams_batch(
-            ["loaded-alive", "loaded-dead", "orphan-alive", "orphan-dead"]
-        )
-        assert rows["loaded-alive"]["state"] == "idle"
-        assert rows["loaded-dead"]["state"] == "idle"
-        assert rows["orphan-alive"]["state"] == "idle"
-        assert rows["orphan-dead"]["state"] == "closed"
-
-
-# -- touch_workstream ----------------------------------------------------------
-
-
-class TestTouchWorkstream:
-    def test_bumps_updated_only(self, backend):
-        """Used by ``open()`` on rehydrate to defend against the orphan
-        reaper clobbering a freshly-loaded row.  Must not change ``state``
-        (the open() path explicitly avoids state writes to dodge a race
-        with concurrent close())."""
-        stale_updated = "2020-01-01T00:00:00"
-        backend.register_workstream("ws-touch", kind="interactive")
-        backend.update_workstream_state("ws-touch", "closed")  # simulate prior close
-        _force_updated(backend, "ws-touch", stale_updated)
-
-        backend.touch_workstream("ws-touch")
-
+        assert closed == ["orphan"]
         with backend._engine.connect() as conn:
             row = conn.execute(
                 sa.select(workstreams.c.state, workstreams.c.updated).where(
-                    workstreams.c.ws_id == "ws-touch"
+                    workstreams.c.ws_id == "orphan"
                 )
             ).one()
-        assert row[0] == "closed", "state must not be modified by touch"
-        # Compare against the forced stale value rather than a fixed calendar
-        # date so the test is independent of wall-clock time.
-        assert row[1] != stale_updated, "updated must be bumped"
+        assert tuple(row) == ("closed", stale_updated)
 
-    def test_unknown_id_is_noop(self, backend):
-        """Touch on a missing id must not raise — open()'s exception
-        handler is best-effort."""
-        backend.touch_workstream("nonexistent")  # must not raise
+    def test_live_lease_protects_row_whatever_its_node(self, backend):
+        """A workstream loaded by any live process carries a renewed owner
+        lease, so bulk close never touches it.  The creating ``node_id``
+        grants no protection of its own: a crashed process's rows are
+        reclaimable whatever node id the next process carries."""
+        for ws_id in ("leased", "unleased"):
+            backend.register_workstream(
+                ws_id, node_id="node-a", kind="interactive", fork_reservation_token=f"tok-{ws_id}"
+            )
+            _force_updated(backend, ws_id, "2020-01-01T00:00:00")
+        _acquire(backend, "leased", holder="node-b/1")
+
+        closed = backend.bulk_close_stale_orphans(
+            "interactive", cutoff="2024-01-01T00:00:00", exclude_ws_ids=[]
+        )
+
+        assert closed == ["unleased"]
+        rows = backend.get_workstreams_batch(["leased", "unleased"])
+        assert rows["leased"]["state"] == "idle"
+        assert rows["unleased"]["state"] == "closed"
+
+    def test_lease_that_lapsed_after_the_cutoff_still_protects(self, backend):
+        """A holder that missed renewals may still have the row open, and an
+        open row keeps an ``updated`` as old as its conversation."""
+        from datetime import UTC, datetime, timedelta
+
+        backend.register_workstream(
+            "lapsed", kind="interactive", fork_reservation_token="tok-lapsed"
+        )
+        _acquire(backend, "lapsed", holder="node-a/1")
+        _force_updated(backend, "lapsed", "2020-01-01T00:00:00")
+        _expire_lease(backend, "lapsed", seconds_ago=1.0)
+        cutoff = (datetime.now(UTC) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%S")
+
+        assert backend.bulk_close_stale_orphans("interactive", cutoff, []) == []
+        assert backend.get_workstream("lapsed")["state"] == "idle"
+
+        _expire_lease(backend, "lapsed")
+        assert backend.bulk_close_stale_orphans("interactive", cutoff, []) == ["lapsed"]
+
+    def test_expired_lease_is_closed_and_fenced_out(self, backend):
+        """An expired lease no longer protects the row, and the closing
+        statement retires it: the paused former holder cannot write after."""
+        backend.register_workstream(
+            "expired", kind="interactive", fork_reservation_token="tok-expired"
+        )
+        fence = _acquire(backend, "expired", holder="node-a/1")
+        _force_updated(backend, "expired", "2020-01-01T00:00:00")
+        _expire_lease(backend, "expired")
+
+        closed = backend.bulk_close_stale_orphans(
+            "interactive", cutoff="2024-01-01T00:00:00", exclude_ws_ids=[]
+        )
+
+        assert closed == ["expired"]
+        assert backend.get_workstream("expired")["state"] == "closed"
+        with backend._engine.connect() as conn:
+            holder, epoch = conn.execute(
+                sa.select(workstreams.c.lease_holder, workstreams.c.lease_epoch).where(
+                    workstreams.c.ws_id == "expired"
+                )
+            ).one()
+        assert holder is None
+        assert epoch == fence.epoch + 1
+        with pytest.raises(WorkstreamLeaseLostError):
+            backend.update_workstream_state("expired", "running", lease=fence)
+        assert backend.get_workstream("expired")["state"] == "closed"
+
+    def test_combines_lease_and_exclude_ws_ids(self, backend):
+        """Both filters stack as AND clauses on the UPDATE.  Covers the
+        full 2x2 matrix to catch a future edit that replaces an AND with
+        an OR or drops one of the filters: only the unloaded, unleased
+        cell should be reaped."""
+        for ws_id in ("loaded-leased", "loaded-free", "orphan-leased", "orphan-free"):
+            backend.register_workstream(
+                ws_id, kind="interactive", fork_reservation_token=f"tok-{ws_id}"
+            )
+            _force_updated(backend, ws_id, "2020-01-01T00:00:00")
+        _acquire(backend, "loaded-leased", holder="node-a/1")
+        _acquire(backend, "orphan-leased", holder="node-b/1")
+
+        closed = backend.bulk_close_stale_orphans(
+            "interactive",
+            cutoff="2024-01-01T00:00:00",
+            exclude_ws_ids=["loaded-leased", "loaded-free"],
+        )
+
+        assert closed == ["orphan-free"]
+        rows = backend.get_workstreams_batch(
+            ["loaded-leased", "loaded-free", "orphan-leased", "orphan-free"]
+        )
+        assert rows["loaded-leased"]["state"] == "idle"
+        assert rows["loaded-free"]["state"] == "idle"
+        assert rows["orphan-leased"]["state"] == "idle"
+        assert rows["orphan-free"]["state"] == "closed"
+
+
+# -- updated records conversation changes ---------------------------------------
+
+
+class TestUpdatedRecordsConversationChanges:
+    """``updated`` is the last change to a workstream's conversation (#1268):
+    lifecycle and metadata writes leave it alone; saving or removing
+    messages stamps it."""
+
+    STALE = "2020-01-01T00:00:00"
+
+    def _updated(self, backend: Any, ws_id: str) -> str:
+        with backend._engine.connect() as conn:
+            return conn.execute(
+                sa.select(workstreams.c.updated).where(workstreams.c.ws_id == ws_id)
+            ).scalar_one()
+
+    def test_lifecycle_and_metadata_writes_leave_it(self, backend):
+        backend.register_workstream(
+            "ws-meta", kind="interactive", state="creating", fork_reservation_token="tok"
+        )
+        _force_updated(backend, "ws-meta", self.STALE)
+        assert backend.publish_deferred_create("ws-meta", "tok") is True
+        backend.update_workstream_state("ws-meta", "running")
+        backend.update_workstream_state("ws-meta", "closed")
+        backend.update_workstream_name("ws-meta", "renamed")
+        backend.update_workstream_title("ws-meta", "A title")
+        assert backend.set_workstream_alias("ws-meta", "meta-alias")
+        assert self._updated(backend, "ws-meta") == self.STALE
+
+    def test_saving_and_removing_messages_stamps_it(self, backend):
+        backend.register_workstream("ws-chat", kind="interactive")
+        _force_updated(backend, "ws-chat", self.STALE)
+        backend.save_message("ws-chat", "user", "first")
+        assert self._updated(backend, "ws-chat") > self.STALE
+        backend.save_message("ws-chat", "assistant", "second")
+        backend.save_message("ws-chat", "user", "third")
+
+        _force_updated(backend, "ws-chat", self.STALE)
+        assert backend.delete_messages_after("ws-chat", 5) == 0
+        assert self._updated(backend, "ws-chat") == self.STALE, "nothing removed"
+        assert backend.delete_messages_after("ws-chat", 2) == 1
+        assert self._updated(backend, "ws-chat") > self.STALE
+
+        _force_updated(backend, "ws-chat", self.STALE)
+        assert backend.truncate_messages_tail("ws-chat", 1) == 1
+        assert self._updated(backend, "ws-chat") > self.STALE
 
 
 # -- MCP OAuth columns ---------------------------------------------------------

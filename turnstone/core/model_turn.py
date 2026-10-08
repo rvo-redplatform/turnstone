@@ -395,6 +395,21 @@ def resolve_effort_setting(
     return effort or None
 
 
+def resolve_max_tokens_setting(cfg: Any | None, config_store: Any | None) -> int | None:
+    """The operator rungs of the output-cap assignment scheme.
+
+    ``ModelConfig.max_tokens`` (the alias's per-model value) → stored global
+    ``model.max_tokens`` → ``None``.  Unlike the sampling keys, the setting's
+    registered default is a number, so with a store this resolves to a number
+    even when no operator spoke.  A broken store degrades the rung to unset.
+    Callers bound the result by the model's advertised maximum output.
+    """
+    max_tokens = getattr(cfg, "max_tokens", None) if cfg is not None else None
+    if max_tokens is None and config_store is not None:
+        max_tokens = _store_get_or_none(config_store, "model.max_tokens")
+    return max_tokens
+
+
 def resolve_replay_reasoning_to_model(
     registry: ModelRegistry | None,
     alias: str,
@@ -1390,6 +1405,7 @@ def model_turn(
     admit_request: Callable[[ModelLane], None] | None = None,
     validate_wire: Callable[[list[dict[str, Any]], ModelLane], None] | None = None,
     on_chunk: Callable[[StreamChunk], None] | None = None,
+    clean_trailing_info: Callable[[str], str] | None = None,
     product_recovery: bool = False,
     on_completed: Callable[[UsageInfo | None], None] | None = None,
     admit_reissue: Callable[[], None] | None = None,
@@ -1504,6 +1520,14 @@ def model_turn(
     so it can finalize visible attempts before replay. Product callback
     failures become :class:`ModelTurnLocalError`; cancellation exceptions
     pass through unchanged.
+
+    *clean_trailing_info* reaches :func:`drain_stream`, which runs it over a
+    hosted search's citations footer before folding it into the turn's
+    content: the page titles and URLs are text from outside that would
+    otherwise replay as the model's own.  A caller whose result is saved as an
+    assistant turn passes its cleaner for text from outside; one whose result
+    becomes a tool result does not, since the output guard reads that as it
+    came and the fold cleans it on the wire.
 
     Product callers set *product_recovery*: ordinary empty stops and transient
     response failures share two reissues, each requiring the adapter's final
@@ -1692,6 +1716,7 @@ def model_turn(
                         if on_chunk
                         else chunks,
                         scan_inline_reasoning=lane_scans_inline_reasoning(lane),
+                        clean_trailing_info=clean_trailing_info,
                     )
                 except Exception as exc:
                     response_error = exc

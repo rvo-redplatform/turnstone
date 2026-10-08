@@ -20,6 +20,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import mcp.types as mcp_types
 import pytest
 
 from turnstone.core.mcp_client import MCPClientManager, PoolEntryState, _AuthCapture
@@ -88,7 +89,7 @@ def _make_pool_session_mock() -> AsyncMock:
     session.initialize = AsyncMock()
     # None caps → resources/prompts discovery is skipped; only list_tools runs.
     session.get_server_capabilities = MagicMock(return_value=None)
-    session.list_tools = AsyncMock(return_value=MagicMock(tools=[]))
+    session.list_tools = AsyncMock(return_value=mcp_types.ListToolsResult(tools=[]))
     return session
 
 
@@ -197,7 +198,7 @@ class TestPoolTransportOwnerLifecycle:
 
         discovery_parked = asyncio.Event()
 
-        async def _parked_list_tools() -> Any:
+        async def _parked_list_tools(*, params: Any = None) -> Any:
             discovery_parked.set()
             await asyncio.sleep(3600)  # the transport never answers
 
@@ -441,11 +442,8 @@ class TestPoolTransportOwnerLifecycle:
 
 
 class TestPoolOwnerClientKwargs:
-    def test_client_factory_present_iff_auth_capture(self, running_loop_mgr) -> None:
-        """The caller builds ``client_kwargs`` and the owner passes them to
-        ``streamablehttp_client`` verbatim: the auth-capture
-        ``httpx_client_factory`` is present exactly when a carrier is supplied,
-        and the per-user bearer always reaches the wire."""
+    def test_client_factory_present_on_every_connection(self, running_loop_mgr) -> None:
+        """Explicit and entry-owned carriers both install the hook and preserve the bearer."""
         mgr, loop, _ = running_loop_mgr
         key = ("user-1", "pool-srv")
 
@@ -465,7 +463,7 @@ class TestPoolOwnerClientKwargs:
             assert fake_a["kwargs"]["headers"]["Authorization"] == "Bearer tok-aaa"
             _run(loop, mgr._teardown_pool_entry(key))
 
-        # Without auth_capture → factory absent (but bearer still present).
+        # Without an explicit carrier, use the entry's carrier and still install the hook.
         patches_b: dict[str, Any] = {}
         fake_b = _fake_transport_and_session(patches_b)
         with (
@@ -477,6 +475,6 @@ class TestPoolOwnerClientKwargs:
             patch.object(mgr, "_tcp_probe", new=AsyncMock()),
         ):
             _run(loop, _connect_under_lock(mgr, key, _http_cfg()))
-            assert "httpx_client_factory" not in fake_b["kwargs"]
+            assert "httpx_client_factory" in fake_b["kwargs"]
             assert fake_b["kwargs"]["headers"]["Authorization"] == "Bearer tok-aaa"
             _run(loop, mgr._teardown_pool_entry(key))

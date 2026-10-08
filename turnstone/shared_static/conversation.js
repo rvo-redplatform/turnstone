@@ -1088,6 +1088,20 @@ export function buildConvWarning(assessment) {
   if (flags.length) {
     chip.appendChild(document.createTextNode(" " + flags.join(", ")));
   }
+  // An output-guard finding about one of a step's several results names it as
+  // the model's advisory text does: by position, and by tool when the name is
+  // one the session offers.
+  const result = a.result;
+  if (
+    result &&
+    Number.isInteger(result.index) &&
+    Number.isInteger(result.count)
+  ) {
+    let where = " · result " + result.index + " of " + result.count;
+    if (typeof result.tool === "string" && result.tool)
+      where += ", " + result.tool;
+    chip.appendChild(document.createTextNode(where));
+  }
   if (a.redacted) {
     const red = document.createElement("span");
     red.className = "conv-warning-redacted";

@@ -173,6 +173,21 @@ class TestContentAndReasoning:
         assert result.content == "answer\n\nSources:\n- how </think> works"
         assert result.reasoning == "x"
 
+    def test_trailing_footer_is_cleaned_before_it_folds(self):
+        # The footer is text from outside: the caller's cleaner runs over it,
+        # and only over it, before it joins the answer.
+        result = drain_stream(
+            iter(
+                [
+                    StreamChunk(content_delta="answer"),
+                    StreamChunk(finish_reason="stop"),
+                    StreamChunk(info_delta="Sources:\n- [title](https://example.com/a)"),
+                ]
+            ),
+            clean_trailing_info=str.upper,
+        )
+        assert result.content == "answer\n\nSOURCES:\n- [TITLE](HTTPS://EXAMPLE.COM/A)"
+
     def test_tool_call_turn_with_in_think_tail(self):
         # A drained tool-call turn whose trailing content is an
         # unterminated think block: the tail is reasoning, the calls ride.

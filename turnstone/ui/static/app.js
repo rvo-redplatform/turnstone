@@ -994,18 +994,18 @@ function closeWorkstream(wsId) {
       } else if (result.status === 409) {
         showToast(
           "Conversation history is still being saved. Try ending the session again shortly.",
-          "warning",
+          "warn",
         );
       } else if (data.error) {
-        showToast(data.error, "warning");
+        showToast(data.error, "warn");
       } else {
-        showToast("Couldn't end the session. Try again shortly.", "warning");
+        showToast("Couldn't end the session. Try again shortly.", "warn");
       }
     })
     .catch(function () {
       // Transport failure: the close may not have reached the server at
       // all — say so instead of leaving the pane open with no feedback.
-      showToast("Couldn't end the session. Try again shortly.", "warning");
+      showToast("Couldn't end the session. Try again shortly.", "warn");
     });
 }
 
@@ -1034,31 +1034,11 @@ function toggleDashboard() {
   showDashboard();
 }
 
-// Paint a transient message (loading / error) into the saved-workstreams
-// area.  Clears any cards AND hides the pagination control \u2014 it's a sibling
-// of the cards container, so a bare replaceChildren on the cards alone would
-// leave stale Prev/Next visible and still wired to the previous list cache.
-// A successful load re-shows it (and the footer) via _wsTable.setItems.
-function _setSavedWsMessage(text) {
-  document
-    .getElementById("dashboard-saved-cards")
-    .replaceChildren(makeEmptyState(text));
-  const pag = document.getElementById("ws-pagination");
-  if (pag) pag.style.display = "none";
-  const footer = document.getElementById("ws-saved-footer");
-  if (footer) footer.textContent = "";
-}
-
 function loadDashboard() {
   const generation = authGeneration();
   const tableEl = document.getElementById("dash-ws-table");
   tableEl.replaceChildren(makeEmptyState("Loading\u2026"));
-  _setSavedWsMessage("Loading\u2026");
   const dashP = authFetch("/v1/api/dashboard").then(function (r) {
-    return r.json();
-  });
-  const sessP = authFetch("/v1/api/workstreams/saved").then(function (r) {
-    if (!r.ok) throw new Error("Saved sessions unavailable");
     return r.json();
   });
   // Refresh the projects cache alongside the table so the per-row project pills
@@ -1071,27 +1051,28 @@ function loadDashboard() {
   const persP = window.TurnstonePersonas
     ? window.TurnstonePersonas.refreshPersonas()
     : Promise.resolve();
-  Promise.all([dashP, sessP, projP, persP])
+  Promise.all([dashP, projP, persP])
     .then(function (res) {
       if (generation !== authGeneration()) return;
       const dashData = res[0];
-      const wsList = dashData.workstreams || [];
-      const agg = dashData.aggregate || {};
-      renderDashboardTable(wsList, agg);
-      const activeWsIds = {};
-      wsList.forEach(function (ws) {
-        activeWsIds[ws.ws_id] = true;
-      });
-      const savedList = (res[1].workstreams || []).filter(function (s) {
-        return !activeWsIds[s.ws_id];
-      });
-      _wsTable.setItems(savedList);
+      renderDashboardTable(
+        dashData.workstreams || [],
+        dashData.aggregate || {},
+      );
     })
     .catch(function () {
       if (generation !== authGeneration()) return;
       tableEl.replaceChildren(makeEmptyState("Failed to load"));
-      _setSavedWsMessage("Failed to load");
     });
+  // The server leaves out workstreams any node has loaded (they hold an owner
+  // lease), so the active rows above never repeat as saved ones.  The first
+  // page waits for the project and persona names that label its rows.
+  _wsTable.load(Promise.all([projP, persP]));
+}
+
+// Fetch the saved table's page again: Retry, and events that change the list.
+function loadSavedWorkstreams() {
+  _wsTable.load();
 }
 
 function renderDashboardTable(wsList, agg) {
@@ -1264,10 +1245,10 @@ function updateDashFooter(agg) {
 }
 
 // Saved Workstreams table.  The shared createSavedTable (/shared/cards.js)
-// owns filter + sort + render and wraps the multi-select delete controller;
-// the per-app inputs are the column spec, the DOM refs, and the path-keyed
-// delete request.  Coordinators (console/static) use the same helper with a
-// CHILDREN column instead of MSGS.
+// fetches, pages, sorts and renders the server's pages and wraps the
+// multi-select delete controller; the per-app inputs are the column spec,
+// the DOM refs, and the path-keyed delete request.  Coordinators
+// (console/static) use the same helper with a CHILDREN column instead of MSGS.
 let _wsTable = null;
 
 // Built at boot, not parse: the saved-table substrate (/shared/cards.js) is a
@@ -1290,6 +1271,8 @@ function _initSavedWsTable() {
     filterEl: document.getElementById("ws-filter"),
     footerEl: document.getElementById("ws-saved-footer"),
     paginationEl: document.getElementById("ws-pagination"),
+    errorEl: document.getElementById("ws-saved-error"),
+    errorTextEl: document.getElementById("ws-saved-error-text"),
     columns: WS_COLUMNS,
     noun: "workstream",
     emptyText: "No saved workstreams",
@@ -1297,6 +1280,9 @@ function _initSavedWsTable() {
       return hasScope("write");
     },
     canDelete: function () {
+      return hasScope("write");
+    },
+    canDeleteAny: function () {
       return hasScope("write");
     },
     activateLabel: function (s) {
@@ -1313,9 +1299,6 @@ function _initSavedWsTable() {
           url: "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/delete",
           options: { method: "POST" },
         };
-      },
-      onClose: function () {
-        loadDashboard();
       },
     },
   });
@@ -1427,7 +1410,7 @@ function submitEditTitle() {
   const input = document.getElementById("edit-title-input");
   const newTitle = input.value.trim();
   if (!newTitle) {
-    showToast("Title cannot be empty", "warning");
+    showToast("Title cannot be empty", "warn");
     return;
   }
 
@@ -1440,8 +1423,16 @@ function submitEditTitle() {
     body: JSON.stringify({ title: newTitle }),
   })
     .then(function (r) {
-      if (!r.ok) throw new Error("Failed to set title (HTTP " + r.status + ")");
-      return r.json();
+      if (r.ok) return r.json();
+      return readRefusal(r).then(function (refusal) {
+        throw new Error(
+          refusal.where
+            ? "This workstream is open " +
+                refusal.where +
+                ". Rename it there, or retry once it closes."
+            : "Failed to set title (HTTP " + r.status + ")",
+        );
+      });
     })
     .then(function (data) {
       window.TurnstoneHatch.setBusy(dlg, false);
@@ -1507,9 +1498,16 @@ function executeDeleteWs() {
 
   authFetch(url, { method: "POST" })
     .then(function (r) {
-      if (!r.ok)
-        throw new Error("Failed to delete workstream (HTTP " + r.status + ")");
-      return r.json();
+      if (r.ok) return r.json();
+      return readRefusal(r).then(function (refusal) {
+        throw new Error(
+          refusal.where
+            ? "This workstream is open " +
+                refusal.where +
+                ". Delete it there, or retry once it closes."
+            : "Failed to delete workstream (HTTP " + r.status + ")",
+        );
+      });
     })
     .then(function () {
       window.TurnstoneHatch.setBusy(dlg, false);
@@ -1568,6 +1566,18 @@ function dashboardResumeSession(wsId) {
     headers: { "Content-Type": "application/json" },
   })
     .then(function (r) {
+      if (r.status === 409) {
+        return readRefusal(r).then(function (refusal) {
+          showToast(
+            refusal.where
+              ? "This workstream is open " + refusal.where + ". Retry once it closes there."
+              : (typeof refusal.data.error === "string" && refusal.data.error) ||
+                  "Failed to open workstream",
+            "warn",
+          );
+          return {};
+        });
+      }
       if (!r.ok) throw new Error("HTTP " + r.status);
       return r.json();
     })
@@ -2041,6 +2051,12 @@ function connectGlobalSSE() {
       workstreams[data.ws_id].persona = data.persona || "";
       workstreams[data.ws_id].persistence_state = "healthy";
       renderTabBar();
+    } else if (data.type === "ws_unloaded") {
+      // Another process took the workstream over: it did not close, so no
+      // toast and the open pane stays (its own stream says it stopped); the
+      // roster lists only what this node holds.
+      delete workstreams[data.ws_id];
+      fireRender();
     } else if (data.type === "ws_closed") {
       const wsId = data.ws_id;
       delete workstreams[wsId];

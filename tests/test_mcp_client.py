@@ -20,6 +20,7 @@ import pytest
 from tests.conftest import _drain_background, _run_on_loop, _seed_static_state
 from turnstone.core.mcp_client import (
     _MAX_RESOURCES_PER_SERVER,
+    InvalidCatalogError,
     MCPClientManager,
     _db_servers_to_config,
     _is_dead_transport,
@@ -53,17 +54,17 @@ def _dispatch_stub(mock_future: MagicMock) -> Any:
     return _rct
 
 
-def _fake_mcp_tool(name: str = "search", description: str = "Search stuff") -> MagicMock:
-    """Create a mock MCP tool object matching the SDK's Tool type."""
-    tool = MagicMock()
-    tool.name = name
-    tool.description = description
-    tool.inputSchema = {
-        "type": "object",
-        "properties": {"query": {"type": "string"}},
-        "required": ["query"],
-    }
-    return tool
+def _fake_mcp_tool(name: str = "search", description: str = "Search stuff") -> mcp_types.Tool:
+    """Create an SDK tool with a one-argument input schema."""
+    return mcp_types.Tool(
+        name=name,
+        description=description,
+        inputSchema={
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+        },
+    )
 
 
 def _fake_openai_tool(name: str = "mcp__test__search") -> dict[str, Any]:
@@ -87,14 +88,9 @@ def _fake_mcp_resource(
     name: str = "readme",
     description: str = "Project readme",
     mime_type: str = "text/plain",
-) -> MagicMock:
-    """Create a mock MCP Resource object matching the SDK's Resource type."""
-    res = MagicMock()
-    res.uri = uri
-    res.name = name
-    res.description = description
-    res.mimeType = mime_type
-    return res
+) -> mcp_types.Resource:
+    """Create an SDK resource."""
+    return mcp_types.Resource(uri=uri, name=name, description=description, mimeType=mime_type)
 
 
 def _fake_resource_dict(
@@ -118,27 +114,22 @@ def _fake_mcp_prompt(
     name: str = "code_review",
     description: str = "Generate a code review",
     arguments: list[dict[str, Any]] | None = None,
-) -> MagicMock:
-    """Create a mock MCP Prompt object matching the SDK's Prompt type."""
-    prompt = MagicMock()
-    prompt.name = name
-    prompt.description = description
+) -> mcp_types.Prompt:
+    """Create an SDK prompt; it takes one required ``language`` argument by default."""
     if arguments is None:
-        arg = MagicMock()
-        arg.name = "language"
-        arg.description = "Programming language"
-        arg.required = True
-        prompt.arguments = [arg]
-    else:
-        mock_args = []
-        for a in arguments:
-            arg = MagicMock()
-            arg.name = a["name"]
-            arg.description = a.get("description", "")
-            arg.required = a.get("required", False)
-            mock_args.append(arg)
-        prompt.arguments = mock_args
-    return prompt
+        arguments = [{"name": "language", "description": "Programming language", "required": True}]
+    return mcp_types.Prompt(
+        name=name,
+        description=description,
+        arguments=[
+            mcp_types.PromptArgument(
+                name=a["name"],
+                description=a.get("description", ""),
+                required=a.get("required", False),
+            )
+            for a in arguments
+        ],
+    )
 
 
 def _fake_prompt_dict(
@@ -222,19 +213,16 @@ class TestMcpToOpenai:
         result = _mcp_to_openai("fs", tool)
         assert result["function"]["name"] == "mcp__fs__list_files"
 
-    def test_missing_input_schema(self):
-        tool = MagicMock()
-        tool.name = "ping"
-        tool.description = "Ping the server"
-        tool.inputSchema = None
+    def test_empty_input_schema(self):
+        tool = mcp_types.Tool(name="ping", description="Ping the server", inputSchema={})
         result = _mcp_to_openai("test", tool)
         assert result["function"]["parameters"] == {"type": "object", "properties": {}}
 
-    def test_empty_description(self):
-        tool = MagicMock()
-        tool.name = "noop"
-        tool.description = ""
-        tool.inputSchema = {"type": "object", "properties": {}}
+    @pytest.mark.parametrize("description", [None, ""])
+    def test_empty_description(self, description):
+        tool = mcp_types.Tool(
+            name="noop", description=description, inputSchema={"type": "object", "properties": {}}
+        )
         result = _mcp_to_openai("test", tool)
         assert result["function"]["description"] == ""
 
@@ -735,9 +723,11 @@ class TestSessionIntegration:
         }
         prepared = session._prepare_tool(tc)
         assert "error" in prepared
-        assert "Unknown tool" in prepared["error"]
-        # Error lists available tools so the model can self-correct
+        assert "'nonexistent' is not available now" in prepared["error"]
+        # Error lists the offered tools so the model can self-correct...
         assert "bash" in prepared["error"]
+        # ...and only those: an interactive session offers no coordinator tools.
+        assert "spawn_workstream" not in prepared["error"]
         # Surfaces warning to user
         session.ui.on_error.assert_called_once()
         assert "nonexistent" in session.ui.on_error.call_args[0][0]
@@ -902,19 +892,18 @@ class TestSessionIntegration:
         assert registered_cb is removed_cb
 
     def test_session_unknown_tool_lists_user_scoped_catalog(self, tmp_db):
-        """The "Unknown tool" error message lists tools the session can
-        actually invoke — drawn from the merged user-scoped catalog,
-        not the manager's private static-only ``_tool_map``."""
+        """The refusal of a tool dispatch cannot run lists the MCP tools the
+        session offers — drawn from the user's merged catalog, static and
+        pool entries alike."""
         mock_mcp = MagicMock()
-        # Pretend the user's merged view contains a static + pool entry.
-        mock_mcp.get_tools.return_value = [
+        # A static entry everyone sees, plus a pool entry only in user-7's view.
+        mock_mcp.get_tools.side_effect = lambda user_id=None: [
             _fake_openai_tool("mcp__static__list"),
-            _fake_openai_tool("mcp__pool-srv__do"),
+            *([_fake_openai_tool("mcp__pool-srv__do")] if user_id == "user-7" else []),
         ]
         mock_mcp.is_mcp_tool.return_value = False
-        session = self._make_session(mcp_client=mock_mcp, user_id="user-7")
-        # Reset the call counter so we observe only the _prepare_tool call.
-        mock_mcp.get_tools.reset_mock()
+        # Tool search off, so the MCP tools are offered outright, not deferred.
+        session = self._make_session(mcp_client=mock_mcp, user_id="user-7", tool_search="off")
 
         tc = {
             "id": "call_unknown",
@@ -922,14 +911,10 @@ class TestSessionIntegration:
         }
         prepared = session._prepare_tool(tc)
         assert "error" in prepared
-        # The error mentions both static and pool tools — proves we're
-        # consulting the merged catalog rather than ``_tool_map``.
+        # Both entries are listed, and the pool one exists only in user-7's
+        # view: the list is this user's merged catalog.
         assert "mcp__static__list" in prepared["error"]
         assert "mcp__pool-srv__do" in prepared["error"]
-        # And the catalog request was scoped to this session's user.
-        assert any(
-            call.kwargs.get("user_id") == "user-7" for call in mock_mcp.get_tools.call_args_list
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -1060,25 +1045,24 @@ class TestRefreshServer:
     ) -> None:
         """Add empty list_resources/list_prompts mocks so _refresh_server works."""
         _seed_static_state(mgr, server_name, supports_resources=True, supports_prompts=True)
-        empty_res = MagicMock()
-        empty_res.resources = []
-        mock_session.list_resources = AsyncMock(return_value=empty_res)
-        empty_tmpl = MagicMock()
-        empty_tmpl.resourceTemplates = []
-        mock_session.list_resource_templates = AsyncMock(return_value=empty_tmpl)
-        empty_prompts = MagicMock()
-        empty_prompts.prompts = []
-        mock_session.list_prompts = AsyncMock(return_value=empty_prompts)
+        mock_session.list_resources = AsyncMock(
+            return_value=mcp_types.ListResourcesResult(resources=[])
+        )
+        mock_session.list_resource_templates = AsyncMock(
+            return_value=mcp_types.ListResourceTemplatesResult(resourceTemplates=[])
+        )
+        mock_session.list_prompts = AsyncMock(return_value=mcp_types.ListPromptsResult(prompts=[]))
 
     def test_refresh_detects_added_tools(self):
         async def _run() -> None:
             mgr = MCPClientManager({})
             mock_session = MagicMock()
-            mock_result = MagicMock()
-            mock_result.tools = [
-                _fake_mcp_tool("search"),
-                _fake_mcp_tool("create"),  # new tool
-            ]
+            mock_result = mcp_types.ListToolsResult(
+                tools=[
+                    _fake_mcp_tool("search"),
+                    _fake_mcp_tool("create"),  # new tool
+                ]
+            )
             mock_session.list_tools = AsyncMock(return_value=mock_result)
             self._add_empty_resource_prompt_mocks(mgr, "github", mock_session)
             _seed_static_state(
@@ -1100,8 +1084,7 @@ class TestRefreshServer:
         async def _run() -> None:
             mgr = MCPClientManager({})
             mock_session = MagicMock()
-            mock_result = MagicMock()
-            mock_result.tools = []  # all tools removed
+            mock_result = mcp_types.ListToolsResult(tools=[])  # all tools removed
             mock_session.list_tools = AsyncMock(return_value=mock_result)
             self._add_empty_resource_prompt_mocks(mgr, "github", mock_session)
             _seed_static_state(
@@ -1123,8 +1106,7 @@ class TestRefreshServer:
         async def _run() -> None:
             mgr = MCPClientManager({})
             mock_session = MagicMock()
-            mock_result = MagicMock()
-            mock_result.tools = [_fake_mcp_tool("search")]
+            mock_result = mcp_types.ListToolsResult(tools=[_fake_mcp_tool("search")])
             mock_session.list_tools = AsyncMock(return_value=mock_result)
             self._add_empty_resource_prompt_mocks(mgr, "github", mock_session)
             _seed_static_state(
@@ -1159,12 +1141,14 @@ class TestLastRefreshTracking:
     @staticmethod
     def _seed_minimal(mgr: MCPClientManager, name: str = "srv") -> MagicMock:
         mock_session = MagicMock()
-        mock_session.list_tools = AsyncMock(return_value=MagicMock(tools=[]))
-        mock_session.list_resources = AsyncMock(return_value=MagicMock(resources=[]))
-        mock_session.list_resource_templates = AsyncMock(
-            return_value=MagicMock(resourceTemplates=[])
+        mock_session.list_tools = AsyncMock(return_value=mcp_types.ListToolsResult(tools=[]))
+        mock_session.list_resources = AsyncMock(
+            return_value=mcp_types.ListResourcesResult(resources=[])
         )
-        mock_session.list_prompts = AsyncMock(return_value=MagicMock(prompts=[]))
+        mock_session.list_resource_templates = AsyncMock(
+            return_value=mcp_types.ListResourceTemplatesResult(resourceTemplates=[])
+        )
+        mock_session.list_prompts = AsyncMock(return_value=mcp_types.ListPromptsResult(prompts=[]))
         # Config present: outcome writes are config-gated (a removed server
         # must leave no stale row), so the tracked server must be configured.
         mgr._server_configs[name] = {"type": "stdio", "command": "x"}
@@ -1660,38 +1644,6 @@ class TestSessionRefresh:
         self._assert_actor_projection(session, "actor-b", coordinator=False)
         assert not self._mcp_names(session._tools) & {f"mcp__stale__tool{i}" for i in range(25)}
 
-    def test_stalled_refresh_cannot_republish_after_surface_drop(self, tmp_db):
-        started = threading.Event()
-        release = threading.Event()
-        catalog = self._actor_catalog("actor-a")
-
-        def get_tools(*, user_id=None):
-            if threading.current_thread().name == "stale-drop":
-                started.set()
-                assert release.wait(timeout=5)
-            return catalog
-
-        manager = MagicMock()
-        manager.get_tools.side_effect = get_tools
-        session = self._make_session(
-            mcp_client=manager,
-            user_id="actor-a",
-            tool_search="on",
-        )
-        stale = threading.Thread(target=session._on_mcp_tools_changed, name="stale-drop")
-        stale.start()
-        assert started.wait(timeout=5)
-        session._drop_mcp_surface()
-        session._rebuild_tool_search()
-        release.set()
-        stale.join(timeout=5)
-
-        assert not stale.is_alive()
-        assert self._mcp_names(session._tools) == set()
-        assert self._mcp_names(session._task_tools) == set()
-        assert session._tool_search is not None
-        assert session._tool_search.search("alphacatalogtoken") == []
-
     def test_stalled_refresh_cannot_republish_after_surface_replacement(self, tmp_db):
         started = threading.Event()
         release = threading.Event()
@@ -2154,11 +2106,9 @@ class TestMCPResources:
         _seed_static_state(mgr, "fs", session=mock_session)
         mgr._loop = asyncio.new_event_loop()
 
-        # Mock the read_resource result
-        text_content = MagicMock(spec=["text"])
-        text_content.text = "Hello, world!"
-        mock_result = MagicMock()
-        mock_result.contents = [text_content]
+        mock_result = mcp_types.ReadResourceResult(
+            contents=[mcp_types.TextResourceContents(uri="file:///readme", text="Hello, world!")]
+        )
         mock_session.read_resource = AsyncMock(return_value=mock_result)
 
         thread = None
@@ -2182,10 +2132,9 @@ class TestMCPResources:
         _seed_static_state(mgr, "fs", session=mock_session)
         mgr._loop = asyncio.new_event_loop()
 
-        blob_content = MagicMock(spec=["blob"])
-        blob_content.blob = "aGVsbG8="
-        mock_result = MagicMock()
-        mock_result.contents = [blob_content]
+        mock_result = mcp_types.ReadResourceResult(
+            contents=[mcp_types.BlobResourceContents(uri="file:///img.png", blob="aGVsbG8=")]
+        )
         mock_session.read_resource = AsyncMock(return_value=mock_result)
 
         thread = None
@@ -2211,30 +2160,20 @@ class TestMCPResources:
         with pytest.raises(RuntimeError, match="not connected"):
             mgr.read_resource_sync("file:///x")
 
-    def test_read_resource_sync_timeout(self):
+    def test_read_resource_sync_timeout(self, running_loop_mgr):
         """Verify timeout handling."""
-        mgr = MCPClientManager({})
+        mgr, _loop, _thread = running_loop_mgr
         mgr._resource_map = {"file:///x": ("fs", "file:///x")}
         mock_session = MagicMock()
         _seed_static_state(mgr, "fs", session=mock_session)
-        mgr._loop = asyncio.new_event_loop()
 
         async def _slow_read(_uri: str) -> None:
             await asyncio.sleep(10)
 
         mock_session.read_resource = _slow_read
 
-        thread = None
-        try:
-            thread = __import__("threading").Thread(target=mgr._loop.run_forever, daemon=True)
-            thread.start()
-            with pytest.raises(TimeoutError):
-                mgr.read_resource_sync("file:///x", timeout=1)
-        finally:
-            mgr._loop.call_soon_threadsafe(mgr._loop.stop)
-            if thread:
-                thread.join(timeout=5)
-            mgr._loop.close()
+        with pytest.raises(TimeoutError):
+            mgr.read_resource_sync("file:///x", timeout=1)
 
     def test_resource_listener_notification(self):
         """Verify callback fires on rebuild."""
@@ -2277,12 +2216,12 @@ class TestMCPResources:
 
             # Mock the re-fetch returning a new resource
             new_res = _fake_mcp_resource("file:///new", "new")
-            mock_res_result = MagicMock()
-            mock_res_result.resources = [new_res]
-            mock_session.list_resources = AsyncMock(return_value=mock_res_result)
-            mock_tmpl_result = MagicMock()
-            mock_tmpl_result.resourceTemplates = []
-            mock_session.list_resource_templates = AsyncMock(return_value=mock_tmpl_result)
+            mock_session.list_resources = AsyncMock(
+                return_value=mcp_types.ListResourcesResult(resources=[new_res])
+            )
+            mock_session.list_resource_templates = AsyncMock(
+                return_value=mcp_types.ListResourceTemplatesResult(resourceTemplates=[])
+            )
 
             await mgr._refresh_server_resources("fs")
             resources = mgr.get_resources()
@@ -2429,10 +2368,13 @@ class TestMCPResources:
         _seed_static_state(mgr, "db", session=mock_session)
         mgr._loop = asyncio.new_event_loop()
 
-        text_content = MagicMock(spec=["text"])
-        text_content.text = '{"name": "Alice"}'
-        mock_result = MagicMock()
-        mock_result.contents = [text_content]
+        mock_result = mcp_types.ReadResourceResult(
+            contents=[
+                mcp_types.TextResourceContents(
+                    uri="db://tables/users/rows/1", text='{"name": "Alice"}'
+                )
+            ]
+        )
         mock_session.read_resource = AsyncMock(return_value=mock_result)
 
         thread = None
@@ -2504,17 +2446,16 @@ class TestMCPPrompts:
         _seed_static_state(mgr, "tmpl", session=mock_session)
         mgr._loop = asyncio.new_event_loop()
 
-        # Build mock PromptMessage
-        msg1 = MagicMock()
-        msg1.role = "user"
-        msg1.content = MagicMock()
-        msg1.content.text = "Review this code"
-        msg2 = MagicMock()
-        msg2.role = "assistant"
-        msg2.content = MagicMock()
-        msg2.content.text = "Looks good!"
-        mock_result = MagicMock()
-        mock_result.messages = [msg1, msg2]
+        mock_result = mcp_types.GetPromptResult(
+            messages=[
+                mcp_types.PromptMessage(
+                    role="user", content=mcp_types.TextContent(type="text", text="Review this code")
+                ),
+                mcp_types.PromptMessage(
+                    role="assistant", content=mcp_types.TextContent(type="text", text="Looks good!")
+                ),
+            ]
+        )
         mock_session.get_prompt = AsyncMock(return_value=mock_result)
 
         thread = None
@@ -2547,30 +2488,20 @@ class TestMCPPrompts:
         with pytest.raises(RuntimeError, match="not connected"):
             mgr.get_prompt_sync("mcp__dead__p")
 
-    def test_get_prompt_sync_timeout(self):
+    def test_get_prompt_sync_timeout(self, running_loop_mgr):
         """Verify timeout handling."""
-        mgr = MCPClientManager({})
+        mgr, _loop, _thread = running_loop_mgr
         mgr._prompt_map = {"mcp__tmpl__slow": ("tmpl", "slow")}
         mock_session = MagicMock()
         _seed_static_state(mgr, "tmpl", session=mock_session)
-        mgr._loop = asyncio.new_event_loop()
 
         async def _slow_prompt(_name: str, *, arguments: dict[str, str] | None = None) -> None:
             await asyncio.sleep(10)
 
         mock_session.get_prompt = _slow_prompt
 
-        thread = None
-        try:
-            thread = __import__("threading").Thread(target=mgr._loop.run_forever, daemon=True)
-            thread.start()
-            with pytest.raises(TimeoutError):
-                mgr.get_prompt_sync("mcp__tmpl__slow", timeout=1)
-        finally:
-            mgr._loop.call_soon_threadsafe(mgr._loop.stop)
-            if thread:
-                thread.join(timeout=5)
-            mgr._loop.close()
+        with pytest.raises(TimeoutError):
+            mgr.get_prompt_sync("mcp__tmpl__slow", timeout=1)
 
     def test_prompt_listener_notification(self):
         """Verify callback fires on rebuild."""
@@ -2620,9 +2551,9 @@ class TestMCPPrompts:
 
             # Mock re-fetch returning a new prompt
             new_prompt = _fake_mcp_prompt("new_prompt", "A new prompt")
-            mock_prompt_result = MagicMock()
-            mock_prompt_result.prompts = [new_prompt]
-            mock_session.list_prompts = AsyncMock(return_value=mock_prompt_result)
+            mock_session.list_prompts = AsyncMock(
+                return_value=mcp_types.ListPromptsResult(prompts=[new_prompt])
+            )
 
             await mgr._refresh_server_prompts("tmpl")
             prompts = mgr.get_prompts()
@@ -3016,9 +2947,7 @@ class TestCircuitBreaker:
         mgr._tool_map["mcp__test__ping"] = ("test", "ping")
         # Pre-set a failure
         mgr._consecutive_failures["test"] = 2
-        mock_result = MagicMock()
-        mock_result.content = []
-        mock_result.isError = False
+        mock_result = mcp_types.CallToolResult(content=[], isError=False)
         mock_future = MagicMock()
         mock_future.result.return_value = mock_result
         with patch("asyncio.run_coroutine_threadsafe", new=_dispatch_stub(mock_future)):
@@ -3864,7 +3793,7 @@ class TestStaticNotificationRefresh:
         mgr = MCPClientManager({})
         mgr._CONNECT_TIMEOUT = 0.05  # instance override of the class constant
 
-        async def _hang() -> Any:
+        async def _hang(*, params: Any = None) -> Any:
             await asyncio.sleep(30)
 
         session = MagicMock()
@@ -3909,19 +3838,13 @@ class TestStaticNotificationRefresh:
         pool twin — a misbehaving server's push must not balloon the
         shared node's merged catalogs."""
         mgr = MCPClientManager({})
-
-        def _resource(i: int) -> MagicMock:
-            r = MagicMock()
-            r.uri = f"file:///r/{i}"
-            r.name = f"r{i}"
-            r.description = ""
-            r.mimeType = "text/plain"
-            return r
-
-        res_result = MagicMock()
-        res_result.resources = [_resource(i) for i in range(_MAX_RESOURCES_PER_SERVER + 50)]
-        tmpl_result = MagicMock()
-        tmpl_result.resourceTemplates = []
+        res_result = mcp_types.ListResourcesResult(
+            resources=[
+                _fake_mcp_resource(f"file:///r/{i}", f"r{i}", "")
+                for i in range(_MAX_RESOURCES_PER_SERVER + 50)
+            ]
+        )
+        tmpl_result = mcp_types.ListResourceTemplatesResult(resourceTemplates=[])
         session = MagicMock()
         session.list_resources = AsyncMock(return_value=res_result)
         session.list_resource_templates = AsyncMock(return_value=tmpl_result)
@@ -4172,7 +4095,7 @@ class TestStaticNotificationRefresh:
         automatic driver that can converge the catalog afterwards."""
         mgr, loop, _thread = running_loop_mgr
 
-        async def _boom(_name: str) -> tuple[list[str], list[str]]:
+        async def _boom(_name: str, **_kw: Any) -> tuple[list[str], list[str]]:
             raise TimeoutError("slow server")
 
         mgr._refresh_server_tools = _boom  # type: ignore[method-assign]
@@ -4214,7 +4137,7 @@ class TestStaticNotificationRefresh:
         mgr, loop, _thread = running_loop_mgr
         refreshed: list[str] = []
 
-        async def _rec(name: str) -> tuple[list[str], list[str]]:
+        async def _rec(name: str, **_kw: Any) -> tuple[list[str], list[str]]:
             refreshed.append(name)
             return [], []
 
@@ -4549,7 +4472,7 @@ class TestStaticNotificationRefresh:
         mgr = MCPClientManager({})
         sibling_events: list[str] = []
 
-        async def _hanging_resources() -> Any:
+        async def _hanging_resources(*, params: Any = None) -> Any:
             try:
                 await asyncio.sleep(30)  # would mask the real error as TimeoutError
             except asyncio.CancelledError:
@@ -4557,7 +4480,7 @@ class TestStaticNotificationRefresh:
                 raise
             sibling_events.append("completed")
 
-        async def _fast_fail_templates() -> Any:
+        async def _fast_fail_templates(*, params: Any = None) -> Any:
             raise RuntimeError("method not found")
 
         session = MagicMock()
@@ -4697,7 +4620,7 @@ class TestStaticNotificationRefresh:
             refreshed.append(name)
             return [], []
 
-        async def _rec_none(_name: str) -> None:
+        async def _rec_none(_name: str, **_kw: Any) -> None:
             return None
 
         mgr._refresh_server_tools = _rec_tools  # type: ignore[method-assign]
@@ -4817,6 +4740,25 @@ class TestReconnectSync:
             result = mgr.reconnect_sync("srv")
         assert result["connected"] is False
         assert "handshake failed" in result["error"]
+        assert mgr.get_server_status("srv")["error"] == "RuntimeError: handshake failed"
+
+    def test_reconnect_resets_the_health_loop_clock(self, running_loop_mgr):
+        """An operator reconnect that fails for an ordinary reason leaves no earlier
+        schedule (an invalid catalog's 5-minute retry) holding back the health loop."""
+        mgr, _loop, _thread = running_loop_mgr
+        mgr._static_reconnect_next["srv"] = time.monotonic() + 300.0
+        mgr._static_reconnect_attempt["srv"] = 10
+
+        async def _connect_one_locked(name: str, _cfg: dict[str, Any]) -> None:
+            raise ConnectionError("still restarting")
+
+        with (
+            patch.object(mgr, "_connect_one_locked", side_effect=_connect_one_locked),
+            patch.object(mgr, "_pre_close_streams", new=AsyncMock()),
+        ):
+            mgr.reconnect_sync("srv")
+        assert "srv" not in mgr._static_reconnect_next
+        assert "srv" not in mgr._static_reconnect_attempt
 
     def test_reconnect_failure_clears_stale_catalog(self, running_loop_mgr):
         # bug-2: when _connect_one fails mid-reconnect, the per-server
@@ -4852,6 +4794,31 @@ class TestReconnectSync:
         assert srv_state.resources == []
         assert srv_state.prompts == []
         assert "mcp__srv__t" not in mgr._tool_map
+
+    def test_invalid_catalog_withdraws_kept_catalog_and_syncs_prompts(self) -> None:
+        """An invalid catalog withdraws the last good catalog and syncs the prompt
+        templates at once (#1224); any other connect failure keeps both, so a
+        dispatch can still trigger the reconnect."""
+        mgr = MCPClientManager({"srv": {"type": "stdio", "command": "echo"}})
+        _seed_static_state(
+            mgr,
+            "srv",
+            tools=[_fake_openai_tool("mcp__srv__t")],
+            prompts=[_fake_prompt_dict(server="srv")],
+        )
+        mgr._rebuild_tools()
+        mgr._rebuild_prompts()
+
+        with patch.object(mgr, "sync_prompts_to_storage") as sync:
+            mgr._record_connect_failure("srv", ConnectionError("refused"), breaker=True)
+            kept = (mgr.is_mcp_tool("mcp__srv__t"), len(mgr._static_servers["srv"].prompts))
+            mgr._record_connect_failure("srv", InvalidCatalogError("bad tool"), breaker=True)
+
+        assert kept == (True, 1)
+        assert not mgr.is_mcp_tool("mcp__srv__t")
+        assert mgr._static_servers["srv"].prompts == []
+        sync.assert_called_once_with()
+        assert mgr._consecutive_failures.get("srv") == 1  # the ConnectionError only
 
     def test_reconnect_preserves_static_state_identity(self, running_loop_mgr):
         # q-3: PR #296 invariant 5 — _static_servers[name] must be the SAME
@@ -5706,7 +5673,9 @@ class TestStaticHealthLoop:
     def test_dispatch_reconnect_real_failure_records_breaker_once(self, running_loop_mgr) -> None:
         """A REAL connect failure through the dispatch path advances the breaker
         exactly ONCE — recorded inside _ensure_static_connected; the sync
-        boundary must not double-record the same outcome."""
+        boundary must not double-record the same outcome. The failure also
+        reaches the server's status, which a reconnect after a healthy start
+        once left empty."""
         mgr, loop, _ = running_loop_mgr
         _seed_static_state(mgr, "srv", session=None)
 
@@ -5719,6 +5688,7 @@ class TestStaticHealthLoop:
         ):
             mgr._cb_auto_reconnect("srv")
         assert mgr._consecutive_failures.get("srv") == 1
+        assert mgr.get_server_status("srv")["error"] == "ConnectionError: refused"
 
     def test_dispatch_reconnect_does_not_resurrect_removed_server(self, running_loop_mgr) -> None:
         """Review finding [2]: a dispatch racing remove_server_sync must not

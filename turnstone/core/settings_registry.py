@@ -663,7 +663,9 @@ def _build_registry() -> dict[str, SettingDef]:
             "Specify a registered alias from the Models tab, or leave empty to use the "
             "same model as the session (self-consistency). Values that aren’t "
             "registered aliases inherit the session model and log a warning — "
-            "register the model in the Models tab and reference it by alias.",
+            "register the model in the Models tab and reference it by alias. "
+            "The output guard's LLM stage uses this model too unless "
+            "judge.output_guard_model names its own.",
         ),
         SettingDef(
             "judge.smart_approvals",
@@ -777,7 +779,10 @@ def _build_registry() -> dict[str, SettingDef]:
             "Model alias for the output-guard LLM judge",
             "judge",
             help="Model alias used for the LLM stage when output_guard_llm is enabled. "
-            "Empty inherits the session model (same fallback shape as judge.model). "
+            "Empty uses judge.model, and the session's model when that is empty too. "
+            "Set it to give the guard a model of its own: the guard judges every tool "
+            "result, so on judge.model it shares that alias's admission limit with the "
+            "intent judge, and long tool output needs a context window to match. "
             "Point at a small/fast alias (e.g. gpt-5-mini, claude-haiku-4-5) so the "
             "per-tool-result latency stays bounded.",
         ),

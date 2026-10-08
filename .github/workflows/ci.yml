@@ -58,7 +58,7 @@ jobs:
       # logstart), so a hang names the culprit on the last line instead of
       # riding the job timeout with only a trail of "..." dots.
       - run: pytest tests/ -m "not live and not e2e_recovery" --cov=turnstone --cov-report=term-missing --cov-report=xml -v
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: always()
         with:
           name: coverage-${{ matrix.python-version }}

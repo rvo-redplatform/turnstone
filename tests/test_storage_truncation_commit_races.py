@@ -14,6 +14,7 @@ from sqlalchemy.dialects import postgresql
 from tests._storage_fakes import (
     ScriptedPostgresConnection,
     ScriptedPostgresResult,
+    lease_row,
     make_attachment,
     save_keyed,
 )
@@ -303,9 +304,10 @@ def test_postgresql_tail_truncation_locks_parent_and_releases_returned_refs() ->
     repeated = "e" * 64
     conn = ScriptedPostgresConnection(
         [
-            ScriptedPostgresResult(row=("postgres-truncate",)),
+            ScriptedPostgresResult(row=lease_row("postgres-truncate")),
             ScriptedPostgresResult(row=(42,)),
             ScriptedPostgresResult(rows=[(json.dumps([first, repeated, repeated]),), (None,)]),
+            ScriptedPostgresResult(),
             ScriptedPostgresResult(),
             ScriptedPostgresResult(),
         ]
@@ -325,6 +327,9 @@ def test_postgresql_tail_truncation_locks_parent_and_releases_returned_refs() ->
     assert all("SELECT conversations.attachments" not in statement for statement in sql)
     assert "UPDATE workstream_attachments" in sql[3]
     assert "DELETE FROM workstream_attachments" in sql[4]
+    # The conversation changed, so the parent row's ``updated`` is stamped
+    # inside the same locked transaction.
+    assert "UPDATE workstreams SET updated" in sql[5]
     assert conn.commits == 1
     assert conn.rollbacks == 0
     assert conn._results == []
@@ -335,12 +340,13 @@ def test_postgresql_atomic_tail_truncation_computes_floor_under_parent_lock() ->
     repeated = "2" * 64
     conn = ScriptedPostgresConnection(
         [
-            ScriptedPostgresResult(row=("postgres-atomic-truncate",)),
+            ScriptedPostgresResult(row=lease_row("postgres-atomic-truncate")),
             ScriptedPostgresResult(scalar_value=6),
             ScriptedPostgresResult(scalar_value=14),
             ScriptedPostgresResult(scalar_value=4),
             ScriptedPostgresResult(row=(15,)),
             ScriptedPostgresResult(rows=[(json.dumps([first, repeated, repeated]),), (None,)]),
+            ScriptedPostgresResult(),
             ScriptedPostgresResult(),
             ScriptedPostgresResult(),
         ]
@@ -365,6 +371,7 @@ def test_postgresql_atomic_tail_truncation_computes_floor_under_parent_lock() ->
     assert all("SELECT conversations.attachments" not in statement for statement in sql)
     assert "UPDATE workstream_attachments" in sql[6]
     assert "DELETE FROM workstream_attachments" in sql[7]
+    assert "UPDATE workstreams SET updated" in sql[8]
     assert conn.commits == 1
     assert conn.rollbacks == 0
     assert conn._results == []

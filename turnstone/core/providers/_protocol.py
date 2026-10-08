@@ -41,8 +41,8 @@ class UsageInfo:
     ``total_tokens`` and the cache fields as reported.  Three more fields say
     what those counters mean for the CONTEXT, resolved in one place for every
     lane and consumer (:func:`turnstone.core.compaction.resolve_context_usage`):
-    a server-side tool loop samples several times inside one response and
-    reports billing totals, not the size of the next request.
+    hosted tools can add transient input or sample several times inside one
+    response, so billing totals need not describe the replayed request.
     """
 
     prompt_tokens: int
@@ -59,8 +59,8 @@ class UsageInfo:
     # the NEXT request will carry (server-side search results replayed as
     # native blocks).  0 when nothing was appended or nothing is replayed.
     appended_prompt_tokens: int = 0
-    # ``prompt_tokens`` sums the input of every server-side sampling pass and
-    # must not anchor the context estimate.  Set when a server tool ran.
+    # ``prompt_tokens`` includes transient server-tool input or sums repeated
+    # sampling passes, so it must not anchor the replay context estimate.
     prompt_tokens_cumulative: bool = False
 
 
@@ -392,8 +392,9 @@ def transport_guarded(chunks: Iterator[StreamChunk]) -> Iterator[StreamChunk]:
 
 # The trailing-citations fold rule in one place: post-finish info
 # (web-search source footers) folds onto a non-blank answer only, joined
-# by this separator.  The interactive display consumer and the drain
-# share both pieces, so a footer cannot render two ways.
+# by this separator, after the caller's cleaner for text from outside has
+# run over it.  The interactive display consumer and the drain share all
+# three pieces, so a footer cannot render two ways.
 TRAILING_INFO_SEPARATOR = "\n\n"
 
 
@@ -403,7 +404,10 @@ def folds_trailing_info(content: str) -> bool:
 
 
 def drain_stream(
-    chunks: Iterator[StreamChunk], *, scan_inline_reasoning: bool = True
+    chunks: Iterator[StreamChunk],
+    *,
+    scan_inline_reasoning: bool = True,
+    clean_trailing_info: Callable[[str], str] | None = None,
 ) -> CompletionResult:
     """Drain a ``create_streaming`` iterator into a ``CompletionResult``.
 
@@ -411,6 +415,10 @@ def drain_stream(
     — the backend puts reasoning in its own channel) skips the inline
     split: there is none to find, and the scan could only misroute prose
     that quotes a tag.
+
+    *clean_trailing_info* cleans each citations footer before it folds in
+    (the ``info_delta`` bullet below): its page titles and URLs are text from
+    outside, and the folded footer replays as part of the assistant turn.
 
     The ONE non-streaming transport: single-shot callers (``model_turn``)
     sample through the provider's streaming entry and accumulate here, so
@@ -575,6 +583,8 @@ def drain_stream(
     # the strip scan shouldn't tax every drained completion).
     if trailing_info_parts and folds_trailing_info(content):
         for info in trailing_info_parts:
+            if clean_trailing_info is not None:
+                info = clean_trailing_info(info)
             content += TRAILING_INFO_SEPARATOR + info
 
     tool_calls = [tool_calls_acc[i] for i in sorted(tool_calls_acc)]
@@ -747,6 +757,10 @@ class ModelCapabilities:
     # ``test_real_sdk_puts_control_on_the_wire`` pins that wire shape
     # through the real SDK.  Never set on a compat lane.
     thinking_prefix_bound: bool = False
+    # Responses input configuration updates preserve the request-level effort and
+    # cached prefix when effort changes. Standard single-agent requests only;
+    # pro mode and requests with sampling parameters retain request-level reasoning.
+    supports_reasoning_config_updates: bool = False
 
 
 # The session effort knob is ORDINAL — snapping must respect this order.

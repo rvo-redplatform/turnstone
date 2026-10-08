@@ -18,10 +18,26 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Iterator, Sequence
 
     from turnstone.core.storage._notify import Notify, NotifyStream
+    from turnstone.core.storage._protocol import SavedWorkstreamPage
     from turnstone.core.trajectory import Turn
 
 from turnstone.core.log import get_logger
 from turnstone.core.project_access import fold_role_permissions
+from turnstone.core.storage._lease import (
+    acquire_lease_on_connection,
+    admit_offline_writes_on_connection,
+    admit_workstream_write_on_connection,
+    close_stale_orphans_on_connection,
+    end_foreign_node_watches_on_connection,
+    enforce_workstream_lease,
+    live_lease_node_id,
+    lock_workstream_lease_row,
+    release_lease_on_connection,
+    renew_lease_batch_on_connection,
+    renewal_batches,
+    unleased_predicate,
+    update_workstream_row_on_connection,
+)
 from turnstone.core.storage._protocol import (
     FORK_RESERVATION_CONFIG_KEY,
     USER_SCOPED_AUTH_TYPES,
@@ -29,6 +45,8 @@ from turnstone.core.storage._protocol import (
     ConversationCommitWorkstreamGoneError,
     ForkCloneExpectation,
     ForkCloneSnapshot,
+    LeaseFence,
+    LeaseGrant,
     MCPOAuthPendingState,
     MCPPendingConsentRow,
     OAuthToken,
@@ -36,6 +54,12 @@ from turnstone.core.storage._protocol import (
     OIDCIdentity,
     OIDCPendingState,
     OIDCUserCredential,
+    WorkstreamLeaseLostError,
+)
+from turnstone.core.storage._saved import (
+    SQLITE_FOLD_FUNCTION,
+    fold_text,
+    query_saved_workstreams,
 )
 from turnstone.core.storage._schema import (
     api_tokens,
@@ -150,6 +174,8 @@ from turnstone.core.storage._utils import (
     build_memory_scope_or_clause,
     clone_workstream_transaction,
     find_orphan_conversations,
+    get_watch_snapshot_on_connection,
+    listed_project_predicate,
     memory_index_health_inputs_on_connection,
     parse_checkpoint_watermark,
     prepare_attachment_commit,
@@ -164,6 +190,7 @@ from turnstone.core.storage._utils import (
     sanitize_text,
     save_attachment_commit_transaction,
     senders_from_user_meta,
+    stamp_conversation_change,
     structured_memory_exact_scope_predicate,
     structured_memory_filter_scope_predicate,
 )
@@ -224,7 +251,10 @@ from turnstone.core.storage._utils import (
 from turnstone.core.storage._utils import (
     validate_and_clear_default_persona as _validate_and_clear_default_persona,
 )
-from turnstone.core.workstream import BULK_CLOSE_STATE_VALUES, WorkstreamKind
+from turnstone.core.workstream import (
+    SAVED_PAGE_DEFAULT_LIMIT,
+    WorkstreamKind,
+)
 
 log = get_logger(__name__)
 
@@ -346,6 +376,11 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
             except Exception:
                 log.warning("Failed to set SQLite WAL mode", exc_info=True)
 
+        # Unicode case folding for the saved-session search and sort.
+        @sa.event.listens_for(self._engine, "connect")
+        def _register_fold(dbapi_conn: Any, _rec: Any) -> None:
+            dbapi_conn.create_function(SQLITE_FOLD_FUNCTION, 1, fold_text, deterministic=True)
+
         self._fts5_available = False
         self._db_unavailable = False
         self._db_unavailable_lock = threading.Lock()
@@ -444,6 +479,8 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
         producer: str | None = None,
         meta: str | None = None,
         commit_key: str | None = None,
+        *,
+        lease: LeaseFence | None = None,
     ) -> int:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         values = prepare_conversation_row_values(
@@ -464,22 +501,25 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
         )
         with self._conn() as conn:
             inserted = True
+            # Acquire the same writer reservation hard delete uses before
+            # checking the durable parent and its owner lease, so delete, lease
+            # changes and save have a total order: save first is removed by
+            # delete; delete first makes a keyed attempt fail.
+            conn.execute(sa.text("BEGIN IMMEDIATE"))
+            parent = admit_workstream_write_on_connection(conn, ws_id, lease)
             if commit_key is None:
+                # The legacy append-without-parent path, unless the caller
+                # presented a lease that a missing parent can no longer honor.
+                if parent is None and lease is not None:
+                    raise WorkstreamLeaseLostError(ws_id)
                 result = conn.execute(sa.insert(conversations), values)
                 if result.lastrowid is None:
                     # Should be unreachable under SQLite + autoincrement PKs.
                     raise RuntimeError("save_message: lastrowid missing after insert")
                 rowid = int(result.lastrowid)
             else:
-                # Keyed commits are live-session writes, not the legacy
-                # append-without-parent path.  Acquire the same writer
-                # reservation hard delete uses before checking the durable
-                # parent, so delete and save have a total order: save first is
-                # removed by delete; delete first makes this attempt fail.
-                conn.execute(sa.text("BEGIN IMMEDIATE"))
-                parent = conn.execute(
-                    sa.select(workstreams.c.ws_id).where(workstreams.c.ws_id == ws_id)
-                ).fetchone()
+                # Keyed commits are live-session writes and never recreate a
+                # deleted parent.
                 if parent is None:
                     raise ConversationCommitWorkstreamGoneError(
                         "keyed conversation commit workstream no longer exists"
@@ -504,10 +544,7 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
                     rowid = int(resolved)
             if inserted:
                 self._index_conversation_fts(conn, rowid, values["content"])
-                # Bump workstream updated timestamp
-                conn.execute(
-                    sa.update(workstreams).where(workstreams.c.ws_id == ws_id).values(updated=now)
-                )
+                stamp_conversation_change(conn, ws_id, now=now)
             conn.commit()
             return rowid
 
@@ -527,6 +564,7 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
         commit_key: str,
         origin: str,
         exact_blob_metadata: bool,
+        lease: LeaseFence | None = None,
     ) -> int:
         """Dialect-local transaction shared by keyed USER and TOOL rows."""
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
@@ -551,9 +589,7 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
                 # shared body below are therefore one indivisible SQLite
                 # writer transaction.
                 conn.execute(sa.text("BEGIN IMMEDIATE"))
-                parent = conn.execute(
-                    sa.select(workstreams.c.ws_id).where(workstreams.c.ws_id == ws_id)
-                ).fetchone()
+                parent = admit_workstream_write_on_connection(conn, ws_id, lease)
                 if parent is None:
                     raise ConversationCommitWorkstreamGoneError(
                         "keyed conversation commit workstream no longer exists"
@@ -631,12 +667,14 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
                 }
             )
         with self._conn() as conn:
+            # An offline import: every existing parent is admitted as an
+            # unfenced write, so a workstream with a live owner lease refuses
+            # the whole batch. Missing parents keep the historical behavior.
+            conn.execute(sa.text("BEGIN IMMEDIATE"))
+            admit_offline_writes_on_connection(conn, ws_ids)
             retain_attachment_refs(conn, attachment_ids)
             conn.execute(sa.insert(conversations), insert_rows)
-            for wid in ws_ids:
-                conn.execute(
-                    sa.update(workstreams).where(workstreams.c.ws_id == wid).values(updated=now)
-                )
+            stamp_conversation_change(conn, ws_ids, now=now)
             # Rebuild FTS5 index so bulk-inserted messages are searchable.
             if self._fts5_available:
                 try:
@@ -907,17 +945,24 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
         except Exception:
             self._fts5_available = False
 
-    def delete_messages_after(self, ws_id: str, keep_count: int) -> int:
+    def delete_messages_after(
+        self, ws_id: str, keep_count: int, *, lease: LeaseFence | None = None
+    ) -> int:
         with self._conn() as conn:
             # Share the keyed-commit / hard-delete writer boundary. BEGIN
             # IMMEDIATE orders the complete cutoff + delete + ref-release
             # transaction before or after every keyed commit.
             conn.execute(sa.text("BEGIN IMMEDIATE"))
+            parent = admit_workstream_write_on_connection(conn, ws_id, lease)
+            if parent is None and lease is not None:
+                raise WorkstreamLeaseLostError(ws_id)
             deleted = self._delete_messages_after_on_connection(conn, ws_id, keep_count)
             conn.commit()
             return deleted
 
-    def truncate_messages_tail(self, ws_id: str, remove_count: int) -> int:
+    def truncate_messages_tail(
+        self, ws_id: str, remove_count: int, *, lease: LeaseFence | None = None
+    ) -> int:
         """Atomically remove a compaction-floored number of newest rows."""
         if remove_count < 0:
             raise ValueError("remove_count must be non-negative")
@@ -928,9 +973,7 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
                 # the deletion commits; it cannot inflate ``total`` and then be
                 # included in a stale caller-computed keep count.
                 conn.execute(sa.text("BEGIN IMMEDIATE"))
-                parent = conn.execute(
-                    sa.select(workstreams.c.ws_id).where(workstreams.c.ws_id == ws_id)
-                ).fetchone()
+                parent = admit_workstream_write_on_connection(conn, ws_id, lease)
                 if parent is None:
                     raise RuntimeError("tail truncation workstream no longer exists")
 
@@ -948,72 +991,48 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
 
     # -- Workstream management -------------------------------------------------
 
-    def list_workstreams_with_history(
-        self,
-        limit: int = 20,
-        *,
-        kind: WorkstreamKind | str | None = None,
-        user_id: str | None = None,
-        state: str | None = None,
-        offset: int = 0,
-    ) -> list[Any]:
-        # ``kind`` filter applied at the SQL layer so coordinator rows
-        # (which persist conversation history the same way interactive
-        # workstreams do) don't leak into the interactive UI's "saved
-        # workstreams" sidebar.  Default None preserves legacy
-        # all-kinds behaviour for callers that want both.
-        # ``user_id`` pushes tenancy into SQL so the "saved" endpoint
-        # can't accidentally leak another tenant's workstreams.  None
-        # = cluster-wide (service callers); empty string is a separate
-        # filter value the caller chose deliberately.
-        # ``state`` filter — coordinator-saved surface passes "closed"
-        # so deleted / currently-active rows don't end up in the saved
-        # cards (which would 404 on click or duplicate the active list).
-        params: dict[str, Any] = {"limit": limit, "offset": max(0, offset)}
-        kind_clause = ""
-        user_clause = ""
-        state_clause = ""
-        if kind is not None:
-            params["kind"] = WorkstreamKind(kind).value
-            kind_clause = "AND w.kind = :kind "
-        if user_id is not None:
-            params["user_id"] = user_id
-            user_clause = "AND w.user_id = :user_id "
-        if state is not None:
-            params["state"] = state
-            state_clause = "AND w.state = :state "
+    def list_workstreams_with_history(self, limit: int = 20) -> list[Any]:
         with self._conn() as conn:
             return list(
                 conn.execute(
                     sa.text(
                         "SELECT w.ws_id, w.alias, w.title, w.name, w.created, w.updated, "
                         "(SELECT COUNT(*) FROM conversations c "
-                        " WHERE c.ws_id = w.ws_id), "
-                        "w.node_id, w.state, w.kind, "
-                        "wcm.value, wcs.value, "
-                        "(SELECT COUNT(*) FROM workstreams ch "
-                        " WHERE ch.parent_ws_id = w.ws_id "
-                        " AND ch.state != 'creating'), "
-                        "(SELECT ue.prompt_tokens FROM usage_events ue "
-                        " WHERE ue.ws_id = w.ws_id "
-                        " ORDER BY ue.timestamp DESC LIMIT 1), "
-                        "md.context_window, w.project_id, w.user_id, w.persona "
+                        " WHERE c.ws_id = w.ws_id) "
                         "FROM workstreams w "
-                        "LEFT JOIN workstream_config wcm "
-                        "  ON wcm.ws_id = w.ws_id AND wcm.key = 'model_alias' "
-                        "LEFT JOIN workstream_config wcs "
-                        "  ON wcs.ws_id = w.ws_id AND wcs.key = 'skill' "
-                        "LEFT JOIN model_definitions md ON md.alias = wcm.value "
                         "WHERE EXISTS "
                         "  (SELECT 1 FROM conversations c WHERE c.ws_id = w.ws_id) "
                         "AND w.state != 'creating' "
-                        f"{kind_clause}"
-                        f"{user_clause}"
-                        f"{state_clause}"
-                        "ORDER BY w.updated DESC LIMIT :limit OFFSET :offset"
+                        "ORDER BY w.updated DESC LIMIT :limit"
                     ),
-                    params,
+                    {"limit": limit},
                 ).fetchall()
+            )
+
+    def list_saved_workstreams(
+        self,
+        *,
+        kinds: Sequence[WorkstreamKind | str],
+        viewer: str | None,
+        project_names: bool = False,
+        search: str = "",
+        sort: str = "updated",
+        descending: bool = True,
+        limit: int = SAVED_PAGE_DEFAULT_LIMIT,
+        offset: int = 0,
+    ) -> SavedWorkstreamPage:
+        with self._conn() as conn:
+            return query_saved_workstreams(
+                conn,
+                dialect_name="sqlite",
+                kinds=kinds,
+                viewer=viewer,
+                project_names=project_names,
+                search=search,
+                sort=sort,
+                descending=descending,
+                limit=limit,
+                offset=offset,
             )
 
     def _delete_prune_candidate(
@@ -1063,6 +1082,7 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
 
         return _prune_workstreams_shared(
             retention_days,
+            dialect_name="sqlite",
             select_ids=_select_ids,
             delete_candidate=self._delete_prune_candidate,
         )
@@ -1100,13 +1120,19 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
 
     # -- Workstream config -----------------------------------------------------
 
-    def save_workstream_config(self, ws_id: str, config: dict[str, str]) -> None:
+    def save_workstream_config(
+        self, ws_id: str, config: dict[str, str], *, lease: LeaseFence | None = None
+    ) -> None:
         public_config = {
             key: value for key, value in config.items() if key != FORK_RESERVATION_CONFIG_KEY
         }
         if not public_config:
             return
         with self._conn() as conn:
+            conn.execute(sa.text("BEGIN IMMEDIATE"))
+            parent = admit_workstream_write_on_connection(conn, ws_id, lease)
+            if parent is None and lease is not None:
+                raise WorkstreamLeaseLostError(ws_id)
             conn.execute(
                 sa.text(
                     "INSERT OR REPLACE INTO workstream_config "
@@ -1138,6 +1164,7 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
         config: dict[str, str] | None = None,
         node_id: str | None = None,
         override_reason: str = "local",
+        lease: LeaseFence | None = None,
     ) -> bool:
         """Apply private prepublication writes to exactly one fork row."""
         from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -1153,23 +1180,15 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
             # Reserve the writer before validating the incarnation. No other
             # writer can delete/re-register or claim the alias mid-finalize.
             conn.execute(sa.text("BEGIN IMMEDIATE"))
-            row = conn.execute(
-                sa.select(workstreams.c.state).where(workstreams.c.ws_id == ws_id)
-            ).fetchone()
-            reservation = conn.execute(
-                sa.select(workstream_config.c.value).where(
-                    workstream_config.c.ws_id == ws_id,
-                    workstream_config.c.key == FORK_RESERVATION_CONFIG_KEY,
-                )
-            ).fetchone()
+            row = lock_workstream_lease_row(conn, ws_id)
             if (
                 row is None
-                or str(row[0] or "") != "creating"
-                or reservation is None
-                or str(reservation[0] or "") != fork_reservation_token
+                or str(row.state or "") != "creating"
+                or str(row.incarnation_token or "") != fork_reservation_token
             ):
                 conn.rollback()
                 return False
+            enforce_workstream_lease(conn, ws_id, row, lease)
             if alias is not None:
                 incumbent = conn.execute(
                     sa.select(workstreams.c.ws_id).where(workstreams.c.alias == alias)
@@ -1227,37 +1246,30 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
         self,
         ws_id: str,
         fork_reservation_token: str,
+        *,
+        lease: LeaseFence | None = None,
     ) -> bool:
         """CAS one exact durable reservation from creating to idle."""
         if not ws_id or not fork_reservation_token:
             return False
-        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._conn() as conn:
             conn.execute(sa.text("BEGIN IMMEDIATE"))
-            row = conn.execute(
-                sa.select(workstreams.c.state).where(workstreams.c.ws_id == ws_id)
-            ).fetchone()
-            reservation = conn.execute(
-                sa.select(workstream_config.c.value).where(
-                    workstream_config.c.ws_id == ws_id,
-                    workstream_config.c.key == FORK_RESERVATION_CONFIG_KEY,
-                )
-            ).fetchone()
+            row = lock_workstream_lease_row(conn, ws_id)
             if (
                 row is None
-                or str(row[0] or "") != "creating"
-                or reservation is None
-                or str(reservation[0] or "") != fork_reservation_token
+                or str(row.state or "") != "creating"
+                or str(row.incarnation_token or "") != fork_reservation_token
             ):
                 conn.rollback()
                 return False
+            enforce_workstream_lease(conn, ws_id, row, lease)
             result = conn.execute(
                 sa.update(workstreams)
                 .where(
                     workstreams.c.ws_id == ws_id,
                     workstreams.c.state == "creating",
                 )
-                .values(state="idle", updated=now)
+                .values(state="idle")
             )
             if result.rowcount != 1:
                 conn.rollback()
@@ -1279,8 +1291,12 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
 
     # -- Workstream metadata ---------------------------------------------------
 
-    def set_workstream_alias(self, ws_id: str, alias: str) -> bool:
+    def set_workstream_alias(
+        self, ws_id: str, alias: str, *, lease: LeaseFence | None = None
+    ) -> bool:
         with self._conn() as conn:
+            conn.execute(sa.text("BEGIN IMMEDIATE"))
+            admit_workstream_write_on_connection(conn, ws_id, lease)
             existing = conn.execute(
                 sa.select(workstreams.c.ws_id).where(workstreams.c.alias == alias)
             ).fetchone()
@@ -1359,9 +1375,9 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
             return None
 
     def get_workstream(self, ws_id: str) -> dict[str, Any] | None:
-        """Return the full workstreams row as a dict, or None if missing.
+        """Return the workstreams row as a dict (see the protocol), or None if missing.
 
-        Delegates to ``get_workstreams_batch`` so the 13-column projection
+        Delegates to ``get_workstreams_batch`` so the column projection
         + row→dict mapping live in one place — a future migration
         adding/renaming a column only has to be applied once per
         backend instead of in two parallel selects that can drift.
@@ -1415,11 +1431,12 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
             snapshot["fork_reservation_token"] = token
             return snapshot
 
-    def update_workstream_title(self, ws_id: str, title: str) -> None:
+    def update_workstream_title(
+        self, ws_id: str, title: str, *, lease: LeaseFence | None = None
+    ) -> None:
         with self._conn() as conn:
-            conn.execute(
-                sa.update(workstreams).where(workstreams.c.ws_id == ws_id).values(title=title)
-            )
+            conn.execute(sa.text("BEGIN IMMEDIATE"))
+            update_workstream_row_on_connection(conn, ws_id, lease, {"title": title})
             conn.commit()
 
     # -- Workstream operations -------------------------------------------------
@@ -1520,14 +1537,12 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
             conn.commit()
             return inserted
 
-    def update_workstream_state(self, ws_id: str, state: str) -> None:
-        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+    def update_workstream_state(
+        self, ws_id: str, state: str, *, lease: LeaseFence | None = None
+    ) -> None:
         with self._conn() as conn:
-            conn.execute(
-                sa.update(workstreams)
-                .where(workstreams.c.ws_id == ws_id)
-                .values(state=state, updated=now)
-            )
+            conn.execute(sa.text("BEGIN IMMEDIATE"))
+            update_workstream_row_on_connection(conn, ws_id, lease, {"state": state})
             conn.commit()
 
     def bulk_close_stale_orphans(
@@ -1535,71 +1550,9 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
         kind: WorkstreamKind | str,
         cutoff: str,
         exclude_ws_ids: list[str],
-        live_node_ids: list[str] | None = None,
     ) -> list[str]:
-        norm_kind = WorkstreamKind(kind).value
-        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
-        # SQLite has no RETURNING precedent in this file — do SELECT-then-
-        # UPDATE in one transaction, with the SAME WHERE predicates re-applied
-        # to the UPDATE.  Re-application defends against a same-process race:
-        # ``SessionManager.open()`` calls ``touch_workstream`` between the
-        # SELECT and the UPDATE could have bumped a row's ``updated`` past
-        # ``cutoff`` (or ``set_state`` could have flipped its state out of
-        # the bulk-close set).  Without the re-applied WHERE the UPDATE
-        # closes those rows anyway; with it, the UPDATE skips rows that
-        # became ineligible after the SELECT and the row stays open.
-        # Chunked through ``_in_chunks`` so the ``IN`` clause never exceeds
-        # SQLite's bind-parameter limit (default 999) on a large reap.
-        candidate_conditions = [
-            workstreams.c.kind == norm_kind,
-            workstreams.c.state.in_(BULK_CLOSE_STATE_VALUES),
-            workstreams.c.updated < cutoff,
-        ]
-        if live_node_ids is not None and live_node_ids:
-            # Protect rows owned by heartbeating services.  NULL node_id is
-            # always eligible.  Empty list means "no nodes alive" — every
-            # row is unprotected; the absence of this predicate is
-            # equivalent to "match all," so we just skip it.
-            candidate_conditions.append(
-                sa.or_(
-                    workstreams.c.node_id.is_(None),
-                    ~workstreams.c.node_id.in_(live_node_ids),
-                )
-            )
-        if exclude_ws_ids:
-            candidate_conditions.append(~workstreams.c.ws_id.in_(exclude_ws_ids))
-        select_stmt = sa.select(workstreams.c.ws_id).where(*candidate_conditions)
-        closed: list[str] = []
-        # Match the chunk size used by ``prune_workstreams`` (line 453) — keeps
-        # ``IN`` clauses well below SQLite's default 999-bind-param limit even
-        # on very large reaps.
-        chunk_size = 500
         with self._conn() as conn:
-            candidate_ids = [row[0] for row in conn.execute(select_stmt)]
-            for i in range(0, len(candidate_ids), chunk_size):
-                chunk = candidate_ids[i : i + chunk_size]
-                # Re-apply the eligibility predicates on the UPDATE so a row
-                # that became fresh between the SELECT and the UPDATE is not
-                # clobbered.  Then SELECT back by ``state='closed' AND updated=now``
-                # to determine which rows actually transitioned this commit —
-                # the returned list reflects reality even when re-application
-                # filters out some candidates.
-                conn.execute(
-                    sa.update(workstreams)
-                    .where(workstreams.c.ws_id.in_(chunk), *candidate_conditions)
-                    .values(state="closed", updated=now)
-                )
-                actually_closed = [
-                    row[0]
-                    for row in conn.execute(
-                        sa.select(workstreams.c.ws_id).where(
-                            workstreams.c.ws_id.in_(chunk),
-                            workstreams.c.state == "closed",
-                            workstreams.c.updated == now,
-                        )
-                    )
-                ]
-                closed.extend(actually_closed)
+            closed = close_stale_orphans_on_connection(conn, kind, cutoff, exclude_ws_ids)
             conn.commit()
             return closed
 
@@ -1608,34 +1561,18 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
         kind: WorkstreamKind | str,
         cutoff: str,
         exclude_ws_ids: list[str],
-        *,
-        live_node_ids: list[str],
-        local_node_id: str | None,
     ) -> list[str]:
         """Hard-delete stale hidden creates under one SQLite writer lock."""
-        if live_node_ids is None:
-            # Liveness uncertainty is never permission to reap.
-            return []
         norm_kind = WorkstreamKind(kind).value
         excluded = set(exclude_ws_ids)
-        local_owner = local_node_id or None
-        protected_live_nodes = {
-            node_id for node_id in live_node_ids if node_id and node_id != local_owner
-        }
         conditions: list[Any] = [
             workstreams.c.kind == norm_kind,
             workstreams.c.state == "creating",
             workstreams.c.updated < cutoff,
+            unleased_predicate("sqlite"),
         ]
         if excluded:
             conditions.append(~workstreams.c.ws_id.in_(excluded))
-        if protected_live_nodes:
-            conditions.append(
-                sa.or_(
-                    workstreams.c.node_id.is_(None),
-                    ~workstreams.c.node_id.in_(protected_live_nodes),
-                )
-            )
 
         deleted: list[str] = []
         tokenless_deleted = 0
@@ -1661,6 +1598,7 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
                     workstreams.c.kind == norm_kind,
                     workstreams.c.state == "creating",
                     workstreams.c.updated < cutoff,
+                    unleased_predicate("sqlite"),
                 ]
                 if token:
                     exact_conditions.append(
@@ -1689,22 +1627,12 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
             )
         return deleted
 
-    def touch_workstream(self, ws_id: str) -> None:
-        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+    def update_workstream_name(
+        self, ws_id: str, name: str, *, lease: LeaseFence | None = None
+    ) -> None:
         with self._conn() as conn:
-            conn.execute(
-                sa.update(workstreams).where(workstreams.c.ws_id == ws_id).values(updated=now)
-            )
-            conn.commit()
-
-    def update_workstream_name(self, ws_id: str, name: str) -> None:
-        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
-        with self._conn() as conn:
-            conn.execute(
-                sa.update(workstreams)
-                .where(workstreams.c.ws_id == ws_id)
-                .values(name=name, updated=now)
-            )
+            conn.execute(sa.text("BEGIN IMMEDIATE"))
+            update_workstream_row_on_connection(conn, ws_id, lease, {"name": name})
             conn.commit()
 
     def _delete_workstream_on_connection(self, conn: Any, ws_id: str) -> bool:
@@ -1751,9 +1679,10 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
         result = conn.execute(sa.delete(workstreams).where(workstreams.c.ws_id == ws_id))
         return bool(result.rowcount > 0)
 
-    def delete_workstream(self, ws_id: str) -> bool:
+    def delete_workstream(self, ws_id: str, *, lease: LeaseFence | None = None) -> bool:
         with self._conn() as conn:
             conn.execute(sa.text("BEGIN IMMEDIATE"))
+            admit_workstream_write_on_connection(conn, ws_id, lease)
             deleted = self._delete_workstream_on_connection(conn, ws_id)
             conn.commit()
             return deleted
@@ -1762,6 +1691,8 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
         self,
         ws_id: str,
         fork_reservation_token: str,
+        *,
+        lease: LeaseFence | None = None,
     ) -> bool:
         if not fork_reservation_token:
             return False
@@ -1769,24 +1700,71 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
             # Acquire SQLite's writer reservation before reading the fence so
             # no delete/re-register can change the row between check and GC.
             conn.execute(sa.text("BEGIN IMMEDIATE"))
-            workstream_row = conn.execute(
-                sa.select(workstreams.c.ws_id).where(workstreams.c.ws_id == ws_id)
-            ).fetchone()
-            if workstream_row is None:
+            row = lock_workstream_lease_row(conn, ws_id)
+            if row is None or str(row.incarnation_token or "") != fork_reservation_token:
                 conn.rollback()
                 return False
-            row = conn.execute(
-                sa.select(workstream_config.c.value).where(
-                    workstream_config.c.ws_id == ws_id,
-                    workstream_config.c.key == FORK_RESERVATION_CONFIG_KEY,
-                )
-            ).fetchone()
-            if row is None or str(row[0] or "") != fork_reservation_token:
-                conn.rollback()
-                return False
+            enforce_workstream_lease(conn, ws_id, row, lease)
             deleted = self._delete_workstream_on_connection(conn, ws_id)
             conn.commit()
             return deleted
+
+    # -- Workstream owner lease ------------------------------------------------
+
+    def acquire_workstream_lease(
+        self,
+        ws_id: str,
+        *,
+        incarnation_token: str,
+        holder: str,
+        node_id: str | None,
+        ttl_seconds: float,
+        allow_creating: bool = False,
+    ) -> LeaseGrant | None:
+        # SQLite serves one process, so a live lease is taken over rather than
+        # refused: a crash restart must not wait out its predecessor's lease.
+        with self._conn() as conn:
+            try:
+                conn.execute(sa.text("BEGIN IMMEDIATE"))
+                grant = acquire_lease_on_connection(
+                    conn,
+                    ws_id=ws_id,
+                    incarnation_token=incarnation_token,
+                    holder=holder,
+                    node_id=node_id,
+                    ttl_ms=int(ttl_seconds * 1000),
+                    allow_creating=allow_creating,
+                    allow_live_takeover=True,
+                )
+                conn.commit()
+                return grant
+            except Exception:
+                conn.rollback()
+                raise
+
+    def renew_workstream_leases(
+        self,
+        holder: str,
+        fences: Sequence[LeaseFence],
+        *,
+        ttl_seconds: float,
+    ) -> set[str]:
+        owned: set[str] = set()
+        for batch in renewal_batches(holder, fences):
+            with self._conn() as conn:
+                conn.execute(sa.text("BEGIN IMMEDIATE"))
+                owned |= renew_lease_batch_on_connection(
+                    conn, holder=holder, batch=batch, ttl_ms=int(ttl_seconds * 1000)
+                )
+                conn.commit()
+        return owned
+
+    def release_workstream_lease(self, fence: LeaseFence) -> bool:
+        with self._conn() as conn:
+            conn.execute(sa.text("BEGIN IMMEDIATE"))
+            released = release_lease_on_connection(conn, fence)
+            conn.commit()
+            return released
 
     def list_orphan_conversations(self) -> list[dict[str, Any]]:
         with self._conn() as conn:
@@ -1847,7 +1825,12 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
             conn.commit()
 
     def set_message_attachments(
-        self, ws_id: str, message_id: int, attachment_ids: list[str]
+        self,
+        ws_id: str,
+        message_id: int,
+        attachment_ids: list[str],
+        *,
+        lease: LeaseFence | None = None,
     ) -> None:
         """Record a turn's ordered content-addressed ref-list on its row.
 
@@ -1859,6 +1842,8 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
         if not attachment_ids or not message_id:
             return
         with self._conn() as conn:
+            conn.execute(sa.text("BEGIN IMMEDIATE"))
+            admit_workstream_write_on_connection(conn, ws_id, lease)
             conn.execute(
                 sa.update(conversations)
                 .where(
@@ -2794,6 +2779,10 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
                 return None
             return dict(row._mapping)
 
+    def get_watch_snapshot(self, ws_id: str, watch_id: str) -> dict[str, Any] | None:
+        with self._conn() as conn:
+            return get_watch_snapshot_on_connection(conn, ws_id, watch_id)
+
     def is_watch_active(self, watch_id: str) -> bool:
 
         with self._conn() as conn:
@@ -2891,6 +2880,15 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
             )
             conn.commit()
             return result.rowcount > 0
+
+    def end_foreign_node_watches(
+        self, ws_id: str, node_id: str, *, lease: LeaseFence | None = None
+    ) -> list[dict[str, Any]]:
+        with self._conn() as conn:
+            conn.execute(sa.text("BEGIN IMMEDIATE"))
+            ended = end_foreign_node_watches_on_connection(conn, ws_id, node_id, lease)
+            conn.commit()
+        return ended
 
     def delete_watch(self, watch_id: str) -> bool:
 
@@ -4544,6 +4542,7 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
                     workstreams.c.project_id,
                     workstreams.c.persona,
                     workstreams.c.required_node_id,
+                    live_lease_node_id("sqlite"),
                 ).where(workstreams.c.ws_id.in_(clean))
             ).fetchall()
         for r in rows:
@@ -4564,6 +4563,8 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
                 "project_id": r[13],
                 "persona": r[14],
                 "required_node_id": r[15],
+                # Owner-lease routing hint: the live holder's node, or None.
+                "lease_node_id": r[16],
             }
             out[r[0]] = item
         return out
@@ -6399,17 +6400,9 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
         self, user_id: str, include_archived: bool = False
     ) -> list[dict[str, Any]]:
         with self._conn() as conn:
-            member_subq = sa.select(project_members.c.project_id).where(
-                project_members.c.user_id == user_id
+            q = sa.select(projects).where(
+                listed_project_predicate(projects, user_id, include_archived=include_archived)
             )
-            cond = sa.or_(
-                projects.c.owner_id == user_id,
-                projects.c.visibility == "public",
-                projects.c.project_id.in_(member_subq),
-            )
-            q = sa.select(projects).where(cond)
-            if not include_archived:
-                q = q.where(projects.c.state == "active")
             rows = conn.execute(q.order_by(projects.c.name)).fetchall()
             return [_row_to_dict(r) for r in rows]
 

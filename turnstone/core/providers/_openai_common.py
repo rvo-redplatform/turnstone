@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import json
 import uuid
+from contextlib import suppress
 from dataclasses import replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
@@ -27,6 +28,23 @@ from turnstone.core.providers._protocol import (
 )
 
 log = structlog.get_logger(__name__)
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+    from turnstone.core.providers._protocol import StreamChunk
+
+
+def iter_with_cleanup(chunks: Iterator[StreamChunk], stream: Any) -> Iterator[StreamChunk]:
+    """Close the SDK stream when normalized iteration ends or is interrupted."""
+    try:
+        yield from chunks
+    finally:
+        close = getattr(stream, "close", None)
+        if callable(close):
+            # Cleanup must preserve the original stream or callback failure.
+            with suppress(Exception):
+                close()
 
 
 def format_refusal(text: str) -> str:
@@ -356,6 +374,8 @@ OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
         max_output_tokens=128000,
         supports_temperature=False,
         reasoning_effort_values=("low", "medium", "high", "xhigh", "max"),
+        supports_reasoning_config_updates=True,
+        supports_web_search=True,
         supports_tool_search=True,
         supports_vision=True,
         supports_pdf=True,
@@ -375,6 +395,7 @@ OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
         max_output_tokens=128000,
         reasoning_effort_values=("none", "low", "medium", "high", "xhigh", "max"),
         default_reasoning_effort="medium",
+        supports_reasoning_config_updates=True,
         supports_tool_search=True,
         supports_vision=True,
         supports_pdf=True,
@@ -388,6 +409,7 @@ OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
         max_output_tokens=128000,
         reasoning_effort_values=("none", "low", "medium", "high", "xhigh", "max"),
         default_reasoning_effort="medium",
+        supports_reasoning_config_updates=True,
         supports_tool_search=True,
         supports_vision=True,
         supports_pdf=True,
@@ -407,6 +429,7 @@ OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
         supports_temperature=False,
         reasoning_effort_values=("low", "medium", "high", "xhigh", "max"),
         default_reasoning_effort="medium",
+        supports_reasoning_config_updates=True,
         supports_tool_search=True,
         supports_vision=True,
         supports_pdf=True,

@@ -119,13 +119,19 @@ def _rasterized_pdf_parts(
 
 
 def _materialization(content: PdfContent, mode: PdfMode) -> PdfMaterialization:
-    safe = cast("PdfContent", neutralize_attachment_part(content))
+    # The caller removes the session's tokens: the resolver from a stored
+    # attachment's part; web_fetch's extraction call declares no fence.
+    safe = cast("PdfContent", neutralize_attachment_part(content, tokens=()))
     return PdfMaterialization(content=safe, mode=mode)
 
 
-def _bounded_extracted_text(text: str, prefix_cap: int) -> str:
-    """Neutralize and cap the exact model-visible extracted representation."""
-    safe = neutralize_untrusted_fences(text)
+def _bounded_extracted_text(text: str, prefix_cap: int, *, tokens: tuple[str, ...]) -> str:
+    """Neutralize and cap the exact model-visible extracted representation.
+
+    *tokens* are removed before the cap, so their placeholders cannot carry the
+    text past it.
+    """
+    safe = neutralize_untrusted_fences(text, tokens=tokens)
     final_cap = prefix_cap + PDF_EXTRACTED_TEXT_DATA_OVERHEAD_CHARS
     if len(safe) <= final_cap:
         return safe
@@ -138,9 +144,10 @@ def _extracted_or_unreadable(
     *,
     max_extracted_chars: int | None,
     check_cancelled: Callable[[], None] | None,
+    tokens: tuple[str, ...],
 ) -> PdfMaterialization:
     raw_name = source.filename or "document.pdf"
-    name = neutralize_untrusted_fences(raw_name)[:_PDF_EXTRACTED_TEXT_NAME_MAX_CHARS]
+    name = neutralize_untrusted_fences(raw_name, tokens=tokens)[:_PDF_EXTRACTED_TEXT_NAME_MAX_CHARS]
     prefix_cap = (
         pdf_ops.PDF_TEXT_CHAR_CAP
         if max_extracted_chars is None
@@ -169,7 +176,7 @@ def _extracted_or_unreadable(
             "document": {
                 "name": f"{name}{_PDF_EXTRACTED_TEXT_NAME_SUFFIX}",
                 "media_type": _PDF_EXTRACTED_TEXT_MEDIA_TYPE,
-                "data": _bounded_extracted_text(text, prefix_cap),
+                "data": _bounded_extracted_text(text, prefix_cap, tokens=tokens),
             },
         },
         "extracted_text",
@@ -195,6 +202,7 @@ def materialize_pdf(
     capabilities: ModelCapabilities,
     *,
     perceive: PdfPerceiver,
+    tokens: tuple[str, ...],
     max_extracted_chars: int | None = None,
     check_cancelled: Callable[[], None] | None = None,
 ) -> PdfMaterialization:
@@ -208,6 +216,10 @@ def materialize_pdf(
     The perception callback owns backend-error normalization: ``None`` means
     fall through. Exceptions, including cancellation, propagate unchanged.
     Every returned content part has passed attachment trust neutralization.
+    *tokens*, the session's fence tokens, are removed from extracted text before
+    its cap; a caller whose content reaches no request that declares a fence
+    passes none (web_fetch, whose extraction call declares none and whose answer
+    the fold cleans as a tool result).
     """
     if capabilities.supports_pdf:
         return _materialization(native_pdf_part(source.data, source.filename), "native")
@@ -247,6 +259,7 @@ def materialize_pdf(
             source,
             max_extracted_chars=max_extracted_chars,
             check_cancelled=check_cancelled,
+            tokens=tokens,
         )
     except pdf_ops.PdfWorkLimitError:
         # Resource exhaustion is terminal for this request. Retrying another

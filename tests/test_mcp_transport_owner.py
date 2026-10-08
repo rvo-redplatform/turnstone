@@ -86,7 +86,11 @@ def _make_session_mock() -> AsyncMock:
     session = AsyncMock()
     session.initialize = AsyncMock()
     session.get_server_capabilities = MagicMock(return_value=None)
-    session.list_tools = AsyncMock(return_value=MagicMock(tools=[]))
+    session.list_tools = AsyncMock(return_value=mcp_types.ListToolsResult(tools=[]))
+    session.list_resources = AsyncMock(return_value=mcp_types.ListResourcesResult(resources=[]))
+    session.list_resource_templates = AsyncMock(
+        return_value=mcp_types.ListResourceTemplatesResult(resourceTemplates=[])
+    )
     return session
 
 
@@ -125,6 +129,45 @@ def _fake_transport_and_session(mgr_module_patches: dict[str, Any]) -> dict[str,
 
 
 class TestTransportOwnerLifecycle:
+    @pytest.mark.parametrize("kind", ["tools", "resources", "prompts"])
+    @pytest.mark.parametrize("list_changed", [None, False, True])
+    def test_sdk_capabilities_control_discovery_and_push(
+        self, running_loop_mgr, kind: str, list_changed: bool | None
+    ) -> None:
+        mgr, loop, _ = running_loop_mgr
+        patches: dict[str, Any] = {}
+        fake = _fake_transport_and_session(patches)
+        session = fake["session"]
+        session.get_server_capabilities.return_value = mcp_types.ServerCapabilities(
+            tools=mcp_types.ToolsCapability(listChanged=list_changed) if kind == "tools" else None,
+            resources=(
+                mcp_types.ResourcesCapability(listChanged=list_changed)
+                if kind == "resources"
+                else None
+            ),
+            prompts=(
+                mcp_types.PromptsCapability(listChanged=list_changed) if kind == "prompts" else None
+            ),
+        )
+        session.list_prompts = AsyncMock(return_value=mcp_types.ListPromptsResult(prompts=[]))
+
+        with (
+            patch("turnstone.core.mcp_client.stdio_client", patches["stdio_client"]),
+            patch("turnstone.core.mcp_client.ClientSession", patches["ClientSession"]),
+        ):
+            _run(loop, mgr._connect_one_locked("srv", mgr._server_configs["srv"]))
+            state = mgr._static_servers["srv"]
+            assert state.supports_list_changed is (kind == "tools" and bool(list_changed))
+            assert state.supports_resources is (kind == "resources")
+            assert state.supports_resource_list_changed is (
+                kind == "resources" and bool(list_changed)
+            )
+            assert state.supports_prompts is (kind == "prompts")
+            assert state.supports_prompt_list_changed is (kind == "prompts" and bool(list_changed))
+            assert session.list_resources.await_count == int(kind == "resources")
+            assert session.list_prompts.await_count == int(kind == "prompts")
+            _run(loop, mgr._teardown_static_session("srv"))
+
     def test_connect_installs_owner_and_teardown_closes_gracefully(self, running_loop_mgr) -> None:
         mgr, loop, _ = running_loop_mgr
         patches: dict[str, Any] = {}
@@ -350,6 +393,97 @@ class TestTransportOwnerLifecycle:
             "transport_exit",
         ]
 
+    @pytest.mark.parametrize("failure", ["resources", "templates", "timeout", "owner", "caller"])
+    def test_resource_discovery_failure_reaps_both_walks(
+        self, running_loop_mgr, failure: str
+    ) -> None:
+        """Failed discovery drains both walks and leaves no session or published catalog."""
+        mgr, loop, _ = running_loop_mgr
+        patches: dict[str, Any] = {}
+        fake = _fake_transport_and_session(patches)
+        session = fake["session"]
+        session.get_server_capabilities = MagicMock(
+            return_value=mcp_types.ServerCapabilities(resources=mcp_types.ResourcesCapability())
+        )
+        session.list_tools = AsyncMock(
+            return_value=mcp_types.ListToolsResult(
+                tools=[mcp_types.Tool(name="ghost", inputSchema={"type": "object"})]
+            )
+        )
+        started: set[str] = set()
+        finished: set[str] = set()
+        both_started = asyncio.Event()
+        catalog_error = McpError(
+            mcp_types.ErrorData(code=mcp_types.INVALID_PARAMS, message="invalid resource catalog")
+        )
+
+        async def _list(kind: str) -> Any:
+            started.add(kind)
+            if len(started) == 2:
+                both_started.set()
+            try:
+                if failure == kind:
+                    await both_started.wait()
+                    raise catalog_error
+                await asyncio.Event().wait()
+            finally:
+                finished.add(kind)
+                fake["events"].append(f"{kind}_exit")
+
+        async def _resources(*, params: Any = None) -> Any:
+            return await _list("resources")
+
+        async def _templates(*, params: Any = None) -> Any:
+            return await _list("templates")
+
+        session.list_resources = _resources
+        session.list_resource_templates = _templates
+        expected = {
+            "resources": McpError,
+            "templates": McpError,
+            "timeout": TimeoutError,
+            "owner": ConnectionError,
+            "caller": asyncio.CancelledError,
+        }[failure]
+
+        async def _drive() -> None:
+            connect = asyncio.create_task(mgr._connect_one("srv", mgr._server_configs["srv"]))
+            try:
+                async with asyncio.timeout(5):
+                    await both_started.wait()
+                    if failure == "owner":
+                        owner = mgr._static_servers["srv"].owner_task
+                        assert owner is not None
+                        owner.cancel()
+                    elif failure == "caller":
+                        connect.cancel()
+                    with pytest.raises(expected) as caught:
+                        await connect
+                    if failure in ("resources", "templates"):
+                        assert caught.value is catalog_error
+            finally:
+                if not connect.done():
+                    connect.cancel()
+                await asyncio.gather(connect, return_exceptions=True)
+
+        with (
+            patch("turnstone.core.mcp_client.stdio_client", patches["stdio_client"]),
+            patch("turnstone.core.mcp_client.ClientSession", patches["ClientSession"]),
+            patch.object(mgr, "_CONNECT_TIMEOUT", 0.2 if failure == "timeout" else 30),
+        ):
+            _run(loop, _drive(), timeout=10)
+
+        assert started == finished == {"resources", "templates"}
+        state = mgr._static_servers["srv"]
+        assert state.session is None
+        assert state.owner_task is None
+        assert state.close_requested is None
+        assert state.tools == state.resources == state.prompts == []
+        assert mgr.get_tools() == mgr.get_resources() == mgr.get_prompts() == []
+        assert not mgr._static_connect_locks["srv"].locked()
+        if failure != "owner":
+            assert fake["events"][-2:] == ["session_exit", "transport_exit"]
+
     def test_timed_out_add_waits_for_atomic_rollback(self, running_loop_mgr) -> None:
         """Returning timeout must not strand an unconfigured live transport."""
         mgr, _loop, _ = running_loop_mgr
@@ -374,7 +508,7 @@ class TestTransportOwnerLifecycle:
             )
         )
 
-        async def _park_resources() -> Any:
+        async def _park_resources(*, params: Any = None) -> Any:
             await asyncio.sleep(3600)
 
         session.list_resources = _park_resources
@@ -542,7 +676,7 @@ class TestTransportOwnerLifecycle:
 
         discovery_parked = asyncio.Event()
 
-        async def _parked_list_tools() -> Any:
+        async def _parked_list_tools(*, params: Any = None) -> Any:
             discovery_parked.set()
             await asyncio.sleep(3600)  # the transport never answers
 
@@ -588,7 +722,7 @@ class TestTransportOwnerLifecycle:
         patches: dict[str, Any] = {}
         fake = _fake_transport_and_session(patches)
 
-        async def _cancel_owner_and_return_tool() -> mcp_types.ListToolsResult:
+        async def _cancel_owner_and_return_tool(*, params: Any = None) -> mcp_types.ListToolsResult:
             owner = mgr._static_servers["new"].owner_task
             assert owner is not None
             owner.cancel()
@@ -767,7 +901,9 @@ class TestBaseExceptionGroupHardening:
         async def _exploding_connect(name: str, _cfg: dict[str, Any]) -> None:
             raise BaseExceptionGroup("transport collapsed", [asyncio.CancelledError()])
 
-        with patch.object(mgr, "_connect_one", side_effect=_exploding_connect):
+        # Below ``_connect_one``, which records the failure under the connect lock
+        # and re-raises it into ``_connect_all``.
+        with patch.object(mgr, "_connect_one_locked", side_effect=_exploding_connect):
             _run(loop, mgr._connect_all())
 
         assert mgr._connected.is_set()

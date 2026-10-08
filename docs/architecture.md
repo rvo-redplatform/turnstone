@@ -103,9 +103,10 @@ turnstone/
     discord/          Discord adapter (bot, cog, views, streaming, config)
     slack/            Slack adapter (Socket Mode bot, DM routing, approval buttons)
   shared_static/      Shared design system (base.css, auth.js, theme.js, toast.js, utils.js, kb.js)
-    katex-0.18.10/    Vendored KaTeX math rendering library (MIT, woff2 fonts)
-    inter-4.001/     Vendored UI typeface (SIL OFL 1.1, woff2 subsets)
-    jetbrains-mono-2.211/  Vendored monospace typeface (SIL OFL 1.1, woff2 subsets)
+    katex-0.19.0/    Vendored KaTeX math rendering library (MIT, woff2 fonts)
+    inter-4.001.1/   Vendored UI typeface (SIL OFL 1.1, upright/italic woff2 subsets)
+    jetbrains-mono-2.304/  Vendored monospace typeface (SIL OFL 1.1, upright/italic woff2 subsets)
+    dejavu-sans-2.37/  Vendored UI symbol fallback (font license, woff2 subset)
   ui/
     colors.py         ANSI color constants with NO_COLOR support
     markdown.py       Streaming terminal markdown renderer (line-buffered)
@@ -382,7 +383,7 @@ agree. Task-targeted compaction also receives an SSE ID for stream ordering but
 has no durable row. The `judge_event` argument is the intent-judge generation
 identity used to reject stale verdicts from a prior approval round.
 
-`on_rename` is called by the `/name` command (on success) and after a successful `/resume` (if the resumed session has an alias or title). `WebUI.on_rename` broadcasts a `ws_rename` event on the global SSE channel and updates the in-memory `Workstream.name`; `TerminalUI.on_rename` is a no-op.
+`on_rename` is called by the `/name` command (on success) and by auto-titling: with the new title once it is stored, or with the current name when a title refresh produces nothing it could store. `WebUI.on_rename` broadcasts a `ws_rename` event on the global SSE channel and updates the in-memory `Workstream.name`; `TerminalUI.on_rename` is a no-op.
 
 ### Implementations
 
@@ -479,7 +480,7 @@ class SessionManager:
     def discard(self, ws_id: str, *, expected: Workstream | None = None, ...) -> bool: ...
     def open(self, ws_id: str) -> Workstream | None: ...
     def close(self, ws_id: str) -> bool: ...
-    def delete_persisted(self, ws_id: str, *, delete_fn: Callable[[], bool], ...) -> bool: ...
+    def delete_persisted(self, ws_id: str, *, delete_fn: ExactDeleteFn, ...) -> bool: ...
     def close_idle(
         self, max_age_seconds: float
     ) -> list[str]: ...  # auto-close stale IDLE workstreams
@@ -492,6 +493,9 @@ class SessionManager:
     def switch_by_index(self, index: int) -> Workstream | None: ...
     def set_state(self, ws_id, state, error_msg=""): ...
     def set_state_deferred(self, ws_id, state, *, deferred_persistence, ...): ...
+    def lease_fence(self, ws_id: str) -> LeaseFence | None: ...  # owner-lease fence held here
+    def start_lease_keeper(self) -> None: ...  # hosts: renew leases in the background
+    def release_leases(self) -> None: ...  # hosts: stop renewing, release every lease
 ```
 
 `SessionKindAdapter` decouples kind-specific UI/session construction from lifecycle
@@ -533,9 +537,17 @@ attachment reference, or destination race aborts the whole transaction. Only
 after the committed snapshot is adopted in memory does the normal
 `creating -> idle -> ws_created` publication run.
 
-Rehydration binds the private token before constructing the session, then
-rechecks it after configuration and history are loaded; a concurrent lifecycle
-change retires the hybrid candidate and retries from a fresh snapshot.
+For a compacted source, the transaction also copies the latest delivered watch
+snapshot for each watch omitted from the active transcript. These rows precede
+the destination checkpoint, keeping model context bounded while preserving
+inherited results for the watch read action. Each fork owns its copied snapshots.
+
+Rehydration binds the private token before constructing the session: the
+owner lease is acquired for the snapshot's incarnation token, so a snapshot of a
+replaced incarnation is refused and the open retries from a fresh snapshot
+before anything is built. The token is rechecked after configuration and
+history are loaded as a defensive witness; a mismatch retires the candidate and
+retries the same way.
 Loaded hard-delete similarly compares the endpoint's authorized token with
 both the local and current durable incarnations before making any terminal
 mutation. It closes generation publication, drains every already-admitted
@@ -545,10 +557,10 @@ untouched; a stale local object or failed delete is retired without publishing
 a false `ws_closed` event.
 
 That drain covers manager-owned session durability admitted through the ticket
-lane. Direct legacy storage helpers that mutate only by `ws_id` are not made
-token-conditional by this refactor. The reservation token guarantees exact
-create/fork/delete target selection during provisional lifecycle races; the
-primary key separately prevents reuse while the durable row exists.
+lane. The reservation token guarantees exact create/fork/delete target
+selection during provisional lifecycle races; the primary key separately
+prevents reuse while the durable row exists. Across processes, every
+session-owned write is additionally fenced by the owner lease described below.
 
 #### Crash-Abandoned Create Recovery
 
@@ -560,21 +572,160 @@ considers rows still in `state='creating'` whose `updated` timestamp is more tha
 two hours old, and excludes every ID in the manager's loaded snapshot, including
 pending creates.
 
-Service liveness is fetched before deletion. A row owned by a live remote node
-is protected, while the current process's stable node ID deliberately does not
-self-protect: after a restart, a predecessor's abandoned row can carry the same
-ID. The manager snapshot and two-hour grace protect the current process's own
-work. If liveness cannot be established, the pass deletes nothing.
+A creator leases its reservation as soon as it registers it, so a reservation
+whose creator is alive anywhere holds a live owner lease and is never eligible.
+A crashed creator stops renewing; its lease expires and the row becomes
+reclaimable whatever node ID the restarted process carries. The manager
+snapshot and two-hour grace protect the current process's own work.
 
 For each eligible row, the storage backend atomically locks and rechecks state,
-age, and the private incarnation token before using the complete hard-delete
-path. Conversations, configuration, overrides, and attachment references and
-refcounts are cleaned in the same transaction. An eligible legacy or corrupt
-reservation without a token is still recoverable: the locked durable row is its
-incarnation fence, and the backend logs a warning. Storage uncertainty rolls the
-attempt back and is reported as no reaped IDs. The recovery path emits no
-lifecycle event and never converts an unpublished reservation into a closed,
-reopenable workstream.
+age, lease, and the private incarnation token before using the complete
+hard-delete path. Conversations, configuration, overrides, and attachment
+references and refcounts are cleaned in the same transaction. An eligible legacy
+or corrupt reservation without a token is still recoverable: the locked durable
+row is its incarnation fence, and the backend logs a warning. Storage
+uncertainty rolls the attempt back and is reported as no reaped IDs. The
+recovery path emits no lifecycle event and never converts an unpublished
+reservation into a closed, reopenable workstream.
+
+### Workstream Owner Lease
+
+Every loaded workstream incarnation has exactly one live writer. The
+`workstreams` row carries an owner lease (migration 078): `lease_holder` (one
+ID per `SessionManager` instance and process boot, `{node_id}/{random}`, so two
+processes configured with the same node ID still conflict), `lease_node_id`
+(the holder's node, a routing hint), `lease_epoch` (advanced by every
+acquisition and every offline fence-out; it only grows within one incarnation
+and restarts at 0 when an ID is registered again, which is why a fence also
+carries the incarnation token) and `lease_expires_ms` (milliseconds on the
+database clock, against which expiry is always judged).
+
+- **Acquire.** `create` leases its hidden reservation right after registering
+  it, before the session is built. `open` leases the snapshot's incarnation
+  before reserving a slot, so a workstream another process owns raises
+  `WorkstreamLeaseHeldError` (HTTP 409 `workstream_lease_held`) without
+  evicting anyone, and history loads only after the grant. Acquisition is
+  bound to the private incarnation token and grants a new epoch when the row
+  is unheld, expired, or already held by the same manager. Every slot exit
+  releases its handle, so a manager tracks at most one per workstream (a test
+  guard checks that every tracked handle belongs to a slot). PostgreSQL refuses
+  a live lease of another holder,
+  so a crashed holder's workstreams reopen elsewhere after at most the 30 s
+  TTL. SQLite serves one process and takes a live lease over instead, so a
+  restart never waits to open a workstream; until a crashed process's leases
+  expire (up to 30 s), unfenced deletes, renames and imports of its rows are
+  refused.
+- **Fence.** Every session-owned write presents the `LeaseFence` (workstream ID,
+  holder, epoch, incarnation token) it snapshotted at admission, the same way it
+  snapshots the workstream ID: conversation rows and attachments, truncation,
+  configuration and `last_error`, state, title, alias, name, create
+  finalize/publish, and hard delete. Storage checks it under the parent row's
+  lock (PostgreSQL row lock, SQLite `BEGIN IMMEDIATE`). A fence that no longer
+  matches raises `WorkstreamLeaseLostError` (a title write that is refused or
+  fails keeps the pane's current name). An unfenced write is offline
+  maintenance: it is refused
+  with `WorkstreamLeaseHeldError` while a lease is live, and on an expired lease
+  it clears the holder and advances the epoch in the same transaction, so a
+  paused former holder can never write after it. Usage, intent verdicts, output
+  assessments, audit, watches, structured memories, the memory-index snapshot,
+  channel routes and overrides are not session-owned and stay unfenced, except
+  that the new holder ends another node's watches with a fenced write
+  (`end_foreign_node_watches`, below).
+- **Renew and release.** Each manager's `LeaseKeeper` renews all of its leases
+  every 10 s (TTL 30 s), in batches of 450 leases, each one UPDATE in its own
+  transaction (plus a read of skipped rows on PostgreSQL). A renewal that no
+  longer matches (taken over, released, fenced out, deleted) reports the lease
+  lost; a storage error does not. On PostgreSQL a renewal skips a row another
+  transaction holds instead of waiting behind it; that lease stays owned and is
+  extended on a later tick once the lock is gone. The bound this accepts: a row
+  lock held past the lease's remaining TTL (as little as about 20 s, when the
+  lock starts just before a renewal tick) lets the lease lapse, and another
+  process may then take the workstream over; the former holder's writes are
+  refused. A fork locks its source row, so a user who can fork a workstream can
+  hold that lock by forking it repeatedly; that is accepted within the same
+  bound. Renewal shares the storage connection pool with requests, so a pool
+  kept exhausted for that long has the same effect. Close, idle close, eviction,
+  delete and host shutdown release the lease after the last durable write. A
+  hard delete whose outcome is ambiguous while the session still holds
+  unresolved rows keeps it, with the workstream's routing to this node, in the
+  retained tombstone until the delete is retried or the tombstone retires; other
+  failed deletes release it. Discard releases just before its caller's unfenced
+  delete of the unpublished `creating` row, which no other holder can lease. At
+  shutdown every hosted session first stops admitting durable writes, then each
+  drains those already admitted (one bounded wait); a session that does not
+  drain keeps its lease, which expires, and the first storage failure stops the
+  release.
+- **Loss.** A lost lease retires the local copy. The session latches
+  publication shutdown and cancels its generation, discards rows it can no
+  longer write, and tells live viewers why, before the manager unloads it
+  (so the CLI prints the notice while the workstream is still the one in
+  front; the CLI then brings the next workstream forward, or says none is
+  open, and drops input typed for the closed one). Losses found together stop
+  every copy before any is torn down. The manager unloads it without writing
+  state or announcing a close, because the workstream lives on elsewhere: the
+  node announces `ws_unloaded` instead, its own dashboard drops the row, and
+  the console drops it from that node's list only; a console still closes a
+  coordinator's row on its own pseudo-node, which nothing else would remove.
+  Close, idle close and eviction that find the row no longer theirs (taken
+  over, or closed and fenced out by a maintenance pass after the lease lapsed)
+  announce the same. Open panes receive the per-workstream closed sentinel and
+  reconnect through the router. When a holder's `ws_created` reaches the
+  console first, the console drops the row from every other node, and the
+  same goes for a node snapshot that no longer lists a workstream another
+  node holds.
+- **Routing.** The console router prefers the node holding the workstream's
+  lease, after any durable node requirement. Row reads report that node only
+  while the lease is live by the database clock, so a crashed holder stops
+  attracting requests once its lease expires and the usual placement picks a
+  node that can take it over. A node asked to open or delete a workstream
+  another node owns answers 409 `workstream_lease_held`: the console follows
+  a refused open to the holder and its delete proxy re-routes once, while the
+  node UI and the standalone shell say which node holds the workstream. Verbs
+  on a loaded workstream answer 404 on any other node and keep their existing
+  re-route. The console deletes coordinators itself, through its coordinator
+  manager, because it holds their leases.
+- **One workstream per session.** A session's workstream ID never changes after
+  construction, and a slot holds one lease handle, for its own row, from its
+  create or open to its terminal release. Every load goes through the manager:
+  `open` builds a session for the saved workstream under the lease it took and
+  loads that workstream's history into it (`ChatSession.rehydrate`), and
+  `create` builds one for a fresh row. Panes, `--resume`, watch restore and the
+  CLI's `/resume` all open; the CLI's `/new` creates. A session built under
+  another persona than the stored one is refused. Loading reads the history
+  with a call that raises on a storage error, so a workstream whose history
+  cannot be read is refused (HTTP 503, retry later) rather than served empty,
+  while one that has no turns opens with its saved settings (a configuration
+  that cannot be read is refused the same way as a history). Every `open` ends
+  that workstream's watches bound to another node, in one write admitted under
+  the new lease, and tells the model, once per watch on a best-effort basis: a
+  watch runs only on the node that created it, and only the owner may write the
+  conversation. A workstream with no turns ends them untold, so it stays empty
+  for a watch restore to treat as such. A copy whose lease lapsed while it
+  loaded ends nothing and is refused (HTTP 409, so the console follows the
+  holder), unless the workstream was deleted or registered again meanwhile:
+  the incarnation check runs first, and the open then answers 404 or opens the
+  new incarnation. A host without a node (the CLI) ends none. Watch reads skip
+  these notices, which are not results.
+- **Watch restore.** A watch fire for a workstream that is not loaded opens it
+  like a pane does, after the persona and owner checks; a workstream another
+  process has open, or that cannot be opened now, is retried within the watch's
+  delivery and poll budget (a few minutes), so a fire can lapse while another
+  process such as the CLI holds it; a missing row or one with no turns ends the
+  watch. A workstream the restore loaded itself runs unattended: its UI approves
+  tool batches without prompting (audited as `unattended_watch`, apart from
+  skip-permissions) until the first client reaches it, except calls an admin
+  `ask` policy matches, which take the normal flow as in an attended session:
+  the smart-approval judge, when on, judges the whole batch, and otherwise they
+  wait for a person (`deny` still blocks, and a policy read that fails refuses
+  the batch's calls needing approval, as in every session). Opening or viewing it,
+  approving in it, sending to it, stopping it or attaching to its event stream
+  ends that approval for good, and a client that got there before the restore
+  finished leaves it ungranted; the wake that delivers queued notices is not a
+  client. A workstream already loaded keeps its own approval state.
+- **Observability.** `turnstone_workstream_lease_events_total{event}` counts
+  `acquired`, `takeover`, `conflict`, `renewed`, `renew_failed`, `lost` and
+  `released`. Takeovers, losses and retirements log at warning,
+  and a renewal outage logs once when it starts and once when it ends.
 
 ### Idle Workstream Lifecycle
 
@@ -582,12 +733,16 @@ The web server's background lifecycle-maintenance thread calls
 `SessionManager.close_idle()` when ordinary idle eviction is enabled (every
 `timeout / 4`, max 5 min). Any loaded IDLE workstream whose `last_active` is
 older than the configured timeout is closed; non-IDLE loaded workstreams are
-not. A second storage pass closes old, unloaded rows left by dead process
-incarnations. It protects rows whose `node_id` belongs to a currently
-heartbeating peer and skips the pass entirely if service-liveness lookup fails.
-On close, a `ws_closed` event is broadcast so browser clients remove the tab.
-`--workstream-idle-timeout` controls this path (default: 120 minutes, 0 =
-disable); the separate stale-create recovery above keeps running when it is 0.
+not. A second storage pass closes unloaded rows left by dead process
+incarnations whose conversation has not changed for the timeout. A workstream
+any live process has loaded renews its owner lease, so the pass skips rows
+with a live lease and fences out expired ones in the same statement; the row's
+`node_id` grants no protection of its own. It also leaves a row whose lease
+expired less than the timeout ago, since a holder whose renewals are failing
+may still have it open. On close, a `ws_closed` event is broadcast so browser
+clients remove the tab. `--workstream-idle-timeout` controls this path
+(default: 120 minutes, 0 = disable); the separate stale-create recovery above
+keeps running when it is 0.
 
 **Workstream eviction at capacity:** When `SessionManager.create()` would
 exceed `max_workstreams` (configurable via `[server].max_workstreams`, default
@@ -826,17 +981,22 @@ at connection time (server names with `__` are rejected).
 after 3 consecutive transport failures (timeouts, broken pipes, connection
 resets). Cooldown uses capped exponential backoff (30 s base, 5 min max) with
 per-server jitter to avoid thundering herd. Protocol-level errors (`McpError`)
-from a healthy connection do not trip the breaker. When the cooldown expires
-(half-open), the next operation attempt triggers automatic reconnection. Manual
-`/mcp refresh` also clears the circuit on success. All sync bridge methods
-(`call_tool_sync`, `read_resource_sync`, `get_prompt_sync`, `refresh_sync`)
-cancel orphaned futures on timeout to prevent coroutine accumulation on the
-background event loop. Push notification refreshes are debounced (5 s per
-server) to protect against notification storms. Operators can force a
-catalog refresh or full reconnect from the admin panel; reconnects clear
-the circuit breaker and run a fresh handshake. Transport stream references
-are pre-closed before stack teardown to work around the MCP SDK's anyio
-cancel-scope CPU busy-loop (SDK #2147).
+from a healthy connection do not trip the breaker, and neither does a result
+that does not match the protocol's schema. One malformed entry fails its whole
+catalog list, so the connect publishes nothing and the server's status names
+the entry and the field. A static server also withdraws the tools, resources
+and prompts kept from its last good connect (syncing its prompt templates), and
+is retried every 5 min rather than on the health loop's reconnect backoff. When
+the cooldown expires (half-open), the next operation attempt triggers automatic
+reconnection. Manual `/mcp refresh` also clears the circuit on success. All
+sync bridge methods (`call_tool_sync`, `read_resource_sync`, `get_prompt_sync`,
+`refresh_sync`) cancel orphaned futures on timeout to prevent coroutine
+accumulation on the background event loop. Push notification refreshes are
+debounced (5 s per server) to protect against notification storms. Operators
+can force a catalog refresh or full reconnect from the admin panel; reconnects
+clear the circuit breaker and run a fresh handshake. Transport stream
+references are pre-closed before stack teardown to work around the MCP SDK's
+anyio cancel-scope CPU busy-loop (SDK #2147).
 
 **Error isolation:** Per-server connection/refresh failures are caught and logged; other
 servers are unaffected. Tool execution errors return error strings to the LLM
@@ -941,9 +1101,14 @@ client-side web search.
 
 Responses replay preserves native assistant message boundaries, `commentary` / `final_answer`
 phases, and their order among tool calls. Phase preservation does not depend on reasoning replay;
-when reasoning replay is enabled, those items retain their native positions too. The provider
-matches stored message text and call IDs against the lowered canonical history before restoring
-that layout; repaired call arguments come from canonical fields. Generated citation footers remain
+when reasoning replay is enabled, those items retain their native positions too. Hosted web search
+and tool search items keep their native positions whatever the reasoning setting, for a model whose
+capability row runs that tool; compatible endpoints and xAI leave them out. They go back without
+their ids, which the API rejects when another endpoint minted them, and an item the API cannot
+take back is left out and logged. A call to a tool that an earlier tool search loaded carries the
+tool's namespace, which the API requires once the load is in the input. The provider matches
+stored message text and call IDs against the lowered canonical history before restoring that
+layout; repaired call arguments come from canonical fields. Generated citation footers remain
 attached once to the last message. If edits make the layout ambiguous, replay uses current text
 without guessing a phase. Explicitly foreign producer metadata is excluded; legacy untagged blocks
 remain readable. See the [Responses input schema][responses-input-schema].
@@ -1473,12 +1638,14 @@ The output guard scans a bounded window of a task-agent child result that
 reaches past the child's clip, so a credential straddling the clip boundary is
 seen whole and redacted while a tool server never controls how much text the
 guard scans; a capture's window is rendered from its source in the head mode
-the clip uses, so the guard scans exactly the text the agent will receive. The
-window is itself clipped
-with the result's true size before the guard runs, so a redaction that shrinks
-it below the clip still leaves the result marked as cut, and the recall
-projection of the step carries that same size. Provider tool names are
-normalized before any of these policies are looked up.
+the clip uses, so the text the agent receives is a prefix of the text the guard
+scanned. The window is itself clipped with the result's true size before the
+guard runs, so a redaction that shrinks it below the clip still leaves the
+result marked as cut, and the recall projection of the step carries that same
+size. Because the guard reads past the clip, a finding on a result the clip
+then cuts may concern text the agent never receives, and the agent's advisory
+says so. Provider tool names are normalized before any of these policies are
+looked up.
 
 #### Surface-specific policies
 
@@ -1544,10 +1711,14 @@ wire-invisible `TurnMeta`.
 `ProviderNative` is the one opaque lane for reasoning and server-side tool
 blocks that cannot be normalized safely. It replays only to its producing
 provider; another provider rebuilds the request from neutral fields. Signed,
-encrypted, and structured blocks remain opaque, while trust-boundary lowering
-copies and defangs editable top-level text so native replay cannot resurrect a
-forged session marker. Attachment bytes never ride in a `Turn`; each output
-boundary resolves its ordered references from the blob store.
+encrypted, and structured blocks remain opaque. Only assistant turns carry the
+lane, and trust-boundary lowering never edits it: it replays as the provider
+returned it, which on a hosted-search turn includes the search results and
+citations (page titles, quoted text, encrypted page content), text from outside
+that no text pass reaches; the operator declaration says a block inside the
+model's own turns, these included, is never the operator's. Attachment bytes
+never ride in a `Turn`; each output boundary resolves its ordered references
+from the blob store.
 
 Storage rehydrates canonical Turns, and `model_turn()` is the sole lowering and
 re-ingest boundary. OpenAI-like dict adapters remain a compatibility bridge for
@@ -1596,7 +1767,7 @@ structured_memories
 
 workstreams
   ws_id       TEXT PRIMARY KEY        -- logical workstream identity
-  node_id     TEXT                    -- owning service cache / routing hint
+  node_id     TEXT                    -- node that created the row
   user_id     TEXT                    -- owner
   alias       TEXT UNIQUE
   title       TEXT
@@ -1605,6 +1776,10 @@ workstreams
   kind        TEXT NOT NULL           -- interactive | coordinator
   parent_ws_id, project_id, persona, skill_id, skill_version
   created, updated
+  lease_holder      TEXT              -- owner-lease holder (manager instance + boot)
+  lease_node_id     TEXT              -- holder's node; routing hint
+  lease_epoch       BIGINT NOT NULL   -- fencing epoch, grows within one incarnation
+  lease_expires_ms  BIGINT            -- expiry on the database clock
 
 conversations
   id            INTEGER PRIMARY KEY AUTOINCREMENT
@@ -1656,7 +1831,10 @@ keep the two definitions aligned.
 | `finalize_deferred_create(...)` | Apply alias/config/node writes only if row and token still match |
 | `publish_deferred_create(ws_id, token)` | Compare-and-swap the exact reservation from `creating` to `idle` |
 | `delete_workstream_if_fork_reserved(ws_id, token)` | Hard-delete only the exact durable incarnation that owns the token |
-| `delete_stale_creating_reservations(...)` | Atomically reap eligible crash-abandoned reservations with complete dependent and attachment-refcount cleanup |
+| `delete_stale_creating_reservations(...)` | Atomically reap eligible crash-abandoned reservations (no live lease) with complete dependent and attachment-refcount cleanup |
+| `acquire_workstream_lease(ws_id, *, incarnation_token, holder, ...)` | Grant one exact incarnation's owner lease at a new epoch, or refuse a live lease another holder owns (PostgreSQL) |
+| `renew_workstream_leases(holder, fences, *, ttl_seconds)` | Extend every listed lease the holder still owns (in batches of 450, each in its own transaction, skipping rows another transaction holds on PostgreSQL); return the IDs it still owns |
+| `release_workstream_lease(fence)` | Clear one exact acquisition, keeping its epoch |
 | `save_message(ws_id, role, content, ...)` | Persist one canonical-turn row and its side channels |
 | `load_message_turns(ws_id, checkpointed=True)` | Rehydrate canonical `Turn` objects, bounded by the latest valid compaction checkpoint |
 | `load_messages(ws_id, include_compaction=...)` | Materialized display/export projection; optionally surface compaction cards |
@@ -1668,6 +1846,11 @@ keep the two definitions aligned.
 | `resolve_workstream(alias_or_id)` | Resolve alias, exact ID, or ID prefix |
 | `search_history(...)` | Full-text search (FTS5 on SQLite, tsvector on PostgreSQL) |
 | `close()` | Release resources (connection pool, engine) |
+
+Every session-owned write also accepts `lease: LeaseFence | None`; see
+[Workstream Owner Lease](#workstream-owner-lease) for the admission rule.
+`clone_workstream` is guarded by the destination's reservation token
+instead: the fork's row is provisional and leased by its creator.
 
 ### Database Configuration
 
@@ -1702,13 +1885,13 @@ executor. The requirement survives residency changes and close. Ordinary
 operations cannot alter it in place; an explicitly targeted fork creates a new
 identity with its own requirement. Legacy rows remain unbound.
 
-Affinity does not establish exclusive live ownership. A future same-ID
-migration still needs a fenced ownership handoff; neither a registry heartbeat
-nor an affinity check supplies that lease. The router reads requirements from
-storage on every resolution, so future authorized changes need no permanent
-policy-cache invalidation. A handoff must report temporary unavailability to
-channel recovery, rather than a clean absent-workstream result that starts a
-new fork.
+Affinity does not establish exclusive live ownership; the
+[owner lease](#workstream-owner-lease) does. A future same-ID live migration
+would still need a handoff that asks the current holder to release. The router
+reads requirements from storage on every resolution, so future authorized
+changes need no permanent policy-cache invalidation. A handoff must report
+temporary unavailability to channel recovery, rather than a clean
+absent-workstream result that starts a new fork.
 
 `ChatSession.messages` is `list[Turn]`. Persistence serializes the neutral
 fields, opaque provider-native lane, attachment references, SSE cursor, and
@@ -1722,10 +1905,12 @@ have acted.” The prose result remains what the model sees.
 **Auto-titling:** After the first complete exchange, auxiliary model work
 generates a bounded title and stores it in `workstreams.title`. It runs through
 the same immutable lane/`model_turn()` seam as other model-backed roles and is
-cancelled or discarded if its workstream identity changes before publication.
+cancelled or discarded if the session's generation ends or its publication
+shuts down first.
 
-**Resume flow:** `ChatSession.resume(ws_id)` calls
-`load_message_turns(checkpointed=True)` and adopts canonical Turns:
+**Load flow:** `SessionManager.open` builds the session for a saved workstream,
+and `ChatSession.rehydrate()` (or `adopt_fork_snapshot()` for a committed fork)
+calls `load_message_turns(checkpointed=True)` and adopts canonical Turns:
 
 - Current `user`, `assistant`, `tool`, and `system` rows map directly; legacy
   split tool-call/result rows are normalized by the reconstruction boundary.
@@ -1741,15 +1926,13 @@ cancelled or discarded if its workstream identity changes before publication.
   watermark]` view. A missing or
   corrupt watermark fails safe to the full transcript. Export/audit callers
   request `checkpointed=False`, so compaction never erases source history.
-- The `ChatSession` adopts the resumed `_ws_id`, so new messages continue
-  in the same workstream.
 
 **Config persistence:** LLM-affecting parameters (`temperature`,
 `reasoning_effort`, `max_tokens`, `instructions`, and the persona
 snapshot — see `docs/personas.md`) are persisted to the
 `workstream_config` table on creation and whenever changed via slash
-commands. `resume()` restores these values so resumed workstreams
-behave identically to the original.
+commands. `rehydrate()` restores these values, with or without stored turns, so
+reopened workstreams behave identically to the original.
 
 **`/clear` vs `/new`:** `/clear` wipes in-memory context but preserves
 messages in the database for future resume. `/new` starts a fresh workstream
@@ -1772,11 +1955,14 @@ reservations, which belong to the crash-recovery path above. It removes:
   workstream is a user mid-first-turn (its first rows may still be held in a
   serving node's in-memory commit journal, invisible to other nodes), never
   housekeeping debris
-- Unnamed workstreams (`alias IS NULL`) older than `retention_days` days (default 90)
+- Unnamed workstreams (`alias IS NULL`) whose conversation last changed more than
+  `retention_days` days ago (default 90)
 
-Named (aliased) workstreams are never pruned by either category. Configure
-with `--retention-days N` (0 = disable age pruning; the orphan sweep still
-runs, grace-gated).
+Named (aliased) workstreams are never pruned by either category, nor is a row
+with a live owner lease or one whose lease expired within the category's
+window (the grace, or `retention_days`): a holder whose renewals are failing
+may still have it open. Configure with `--retention-days N` (0 = disable age
+pruning; the orphan sweep still runs, grace-gated).
 
 ---
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import re
 import shutil
 import subprocess
 import threading
@@ -386,3 +387,53 @@ def test_installer_upgrades_legacy_node_override(tmp_path):
     result = run_installer_functions(tmp_path, "NODE_COUNT=3; write_compose_override")
     assert result.returncode == 0, result.stderr
     assert len(yaml.safe_load(path.read_text())["services"]) == 7
+
+
+@pytest.mark.parametrize("restarted", [True, False])
+def test_installer_restarts_caddy_to_load_pulled_caddyfile(tmp_path, restarted):
+    # `up -d` leaves an unchanged caddy container on the Caddyfile it started with.
+    status = 0 if restarted else 1
+    result = run_installer_functions(
+        tmp_path,
+        f'docker_mock() {{ echo "$PWD|$*" >>calls.log; return {status}; }}; restart_caddy',
+    )
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "calls.log").read_text().splitlines() == [
+        f"{tmp_path}|compose restart caddy"
+    ]
+    assert ("compose restart caddy" in result.stderr) is not restarted
+
+
+def caddyfile_blocks(text):
+    """Map each top-level Caddyfile block's header ('' for global options) to its lines."""
+    blocks, depth, header, body = {}, 0, "", []
+    for raw in text.splitlines():
+        line = re.sub(r"(^|\s)#.*", "", raw).strip()
+        if not line:
+            continue
+        if depth == 0:
+            header, body = line.rstrip("{").strip(), []
+        else:
+            body.append(line)
+        depth += line.count("{") - line.count("}")
+        if depth == 0:
+            blocks[header] = body[:-1]
+    return blocks
+
+
+def test_caddyfile_issues_every_site_a_year_long_cert():
+    blocks = caddyfile_blocks((ROOT / "turnstone/deploy/Caddyfile").read_text())
+    options = blocks.pop("")
+    # An IP-address visitor sends no SNI; without a fixed name the cert follows
+    # the container's Docker IP and changes on every recreate.
+    assert "default_sni 127.0.0.1" in options
+    # Without sign_with_root, certs are cut to the intermediate's 7 days.
+    assert "cert_issuer internal {" in options and "sign_with_root" in options
+    days = [int(m[1]) for line in options if (m := re.fullmatch(r"lifetime (\d+)d", line))]
+    assert len(days) == 1 and 300 <= days[0] < 825  # some clients reject certs over 825 days
+    grace = [int(m[1]) for line in options if (m := re.fullmatch(r"grace_period (\d+)s", line))]
+    assert len(grace) == 1 and grace[0] < 10  # under Docker's stop timeout
+    assert ":443" in blocks
+    for body in blocks.values():
+        assert "on_demand" in body
+        assert not any("issuer" in line or "lifetime" in line for line in body)

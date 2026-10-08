@@ -230,7 +230,8 @@ class CreateWorkstreamRequest(BaseModel):
         default="",
         description=(
             "Optional judge model alias for this workstream. Empty uses the "
-            "server's configured judge model."
+            "server's configured judge model. The output guard's LLM stage "
+            "runs on it too unless judge.output_guard_model is set."
         ),
     )
     auto_approve: bool = Field(default=False, description="Auto-approve all tool calls")
@@ -471,8 +472,9 @@ class RecentAutoApproval(BaseModel):
             "click), ``policy`` (admin tool-policy ``allow`` rule), "
             "``blanket`` (workstream-level ``auto_approve=True``), "
             "``smart_approval`` (Smart Approvals: high-confidence LLM "
-            "judge ``approve`` verdict), or ``auto_approve_tools`` "
-            "(legacy / unknown writer)."
+            "judge ``approve`` verdict), ``unattended_watch`` (a watch "
+            "restore loaded the workstream and no client had reached it "
+            "yet), or ``auto_approve_tools`` (legacy / unknown writer)."
         ),
     )
     ts: float = Field(
@@ -606,6 +608,7 @@ class SavedWorkstreamInfo(BaseModel):
     ws_id: str
     alias: str | None = None
     title: str | None = None
+    name: str = ""
     created: str
     updated: str
     message_count: int
@@ -624,7 +627,18 @@ class SavedWorkstreamInfo(BaseModel):
 
 
 class ListSavedWorkstreamsResponse(BaseModel):
+    """One page of saved workstreams.
+
+    ``total`` counts every row matching the request's search, across all
+    pages; ``limit`` and ``offset`` echo the page the server applied. A server
+    older than paging sends only ``workstreams``; the defaults keep a newer
+    SDK reading it.
+    """
+
     workstreams: list[SavedWorkstreamInfo]
+    total: int = 0
+    limit: int = 0
+    offset: int = 0
 
 
 # ---------------------------------------------------------------------------

@@ -139,6 +139,107 @@ def _run_nudges_cli(args: argparse.Namespace, model: str, api_key: str) -> None:
     print(f"\n  results -> {args.output}")
 
 
+# The environment variable each output-guard provider's key is read from; its
+# keys are the providers ``--provider`` and ``--judge-provider`` accept.
+_KEY_VARIABLES = {
+    "openai-compatible": "OPENAI_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+    "anthropic-compatible": "ANTHROPIC_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "google": "GEMINI_API_KEY",
+    "xai": "XAI_API_KEY",
+}
+_OUTPUT_GUARD_PROVIDERS = tuple(_KEY_VARIABLES)
+# Where an output-guard endpoint is when no base URL is given: the local server
+# for a compatible provider, the provider's own default ("") for a hosted one.
+_LOCAL_BASE_URLS = {
+    "openai-compatible": "http://localhost:8000/v1",
+    "anthropic-compatible": "http://localhost:8000",
+}
+
+
+class _StoreGiven(argparse.Action):
+    """Store the value and record that the option was given on the command line,
+    which a default set from ``config.toml`` is not."""
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: Any,
+        option_string: str | None = None,
+    ) -> None:
+        setattr(namespace, self.dest, values)
+        setattr(namespace, f"{self.dest}_given", True)
+
+
+def _output_guard_endpoint(provider: str, base_url: str | None) -> tuple[str, str]:
+    """An output-guard endpoint's base URL and key for *provider*.
+
+    A given *base_url* wins; otherwise a compatible provider reaches the local
+    server and a hosted one its own default.  The key is the provider's
+    variable (:data:`_KEY_VARIABLES`); a local server takes any, so it falls
+    back to a placeholder there and stays empty for a hosted provider.
+    """
+    url = base_url or _LOCAL_BASE_URLS.get(provider, "")
+    key = os.environ.get(_KEY_VARIABLES[provider], "")
+    if not key and provider in _LOCAL_BASE_URLS:
+        key = "dummy"
+    return url, key
+
+
+def _run_output_guard_cli(
+    args: argparse.Namespace, model: str, api_key: str, base_url: str
+) -> None:
+    """Drive one :mod:`turnstone.eval.output_guard` measurement, or grade a
+    subagent run's results, and write rows and summary to ``--output``."""
+    from turnstone.eval.output_guard import (
+        EvalSettings,
+        grade_subagent_results,
+        run_output_guard_eval,
+    )
+
+    optional: dict[str, Any] = {}
+    if args.n_runs is not None:
+        optional["n_runs"] = args.n_runs
+    if args.judge_model:
+        judge_url, judge_key = _output_guard_endpoint(args.judge_provider, args.judge_base_url)
+        if not judge_key:
+            raise SystemExit(
+                f"--judge-provider {args.judge_provider} reads its key from "
+                f"{_KEY_VARIABLES[args.judge_provider]}, which is not set"
+            )
+        optional.update(
+            judge_model=args.judge_model,
+            judge_provider=args.judge_provider,
+            judge_base_url=judge_url,
+            judge_api_key=judge_key,
+            judge_context_window=args.judge_context_window,
+        )
+    settings = EvalSettings(
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        provider=args.provider,
+        parallel=args.parallel if args.parallel != 0 else (os.cpu_count() or 4),
+        context_window=args.context_window,
+        max_tokens=args.max_tokens,
+        reasoning_effort=args.reasoning_effort,
+        temperature=args.temperature,
+        timeout=float(args.test_timeout),
+        **optional,
+    )
+    if args.output_guard == "grade":
+        with open(args.grade_input) as f:
+            result = grade_subagent_results(json.load(f), settings)
+    else:
+        result = run_output_guard_eval(args.output_guard, settings)
+    with open(args.output, "w") as f:
+        json.dump(result, f, indent=2)
+    print(json.dumps(result["summary"], indent=2))
+    print(f"\n  results -> {args.output}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Headless measurement for turnstone (scores tool use against expected actions)",
@@ -158,10 +259,14 @@ def main() -> None:
         "test_file",
         nargs="?",
         default=None,
-        help="Path to test cases JSON file (not used by --nudges, which carries its own cells)",
+        help=(
+            "Path to test cases JSON file (not used by --nudges or --output-guard, which "
+            "carry their own cases)"
+        ),
     )
     parser.add_argument(
         "--base-url",
+        action=_StoreGiven,
         default="http://localhost:8000/v1",
         help="API base URL (default: http://localhost:8000/v1)",
     )
@@ -235,7 +340,9 @@ def main() -> None:
         default=1,
         help="Parallel workers (default: 1=serial, 0=auto)",
     )
-    parser.add_argument(
+    # One measurement per invocation: a second mode flag would be ignored.
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument(
         "--skill-adherence",
         action="store_true",
         help=(
@@ -244,7 +351,7 @@ def main() -> None:
             "path) vs a control arm (no skill) and report the pass-rate lift"
         ),
     )
-    parser.add_argument(
+    modes.add_argument(
         "--nudges",
         action="store_true",
         help=(
@@ -252,6 +359,64 @@ def main() -> None:
             "stimulus arms, state-first scoring.  Cells ship in "
             "turnstone.eval.scenarios.nudges; test_file is not used"
         ),
+    )
+    modes.add_argument(
+        "--output-guard",
+        choices=("judge", "locate", "subagent", "grade"),
+        default=None,
+        help=(
+            "Measure the output guard's model-facing advisory: 'judge' scores the LLM "
+            "stage's symbols and line citations on planted directives, 'locate' whether a "
+            "model finds the lines an advisory cites, 'subagent' whether a task agent acts "
+            "on a planted directive with and without the advisory, keeping each run's "
+            "transcript.  'grade' asks the endpoint's model to grade the transcripts of a "
+            "subagent run's results (--grade-input).  Cases ship in "
+            "turnstone.eval.scenarios.output_guard; test_file is not used"
+        ),
+    )
+    parser.add_argument(
+        "--provider",
+        choices=_OUTPUT_GUARD_PROVIDERS,
+        default="openai-compatible",
+        help=(
+            "--output-guard: the provider adapter the endpoint is reached through, as a "
+            "model definition's provider (default: openai-compatible).  Any other needs "
+            "--model.  Without --base-url, anthropic-compatible reaches "
+            "http://localhost:8000 and a hosted provider its own API.  Keys: "
+            "OPENAI_API_KEY (openai-compatible, openai), ANTHROPIC_API_KEY (anthropic, "
+            "anthropic-compatible), GEMINI_API_KEY (google), XAI_API_KEY (xai)"
+        ),
+    )
+    parser.add_argument(
+        "--judge-model",
+        default=None,
+        help=(
+            "--output-guard subagent: run the guard's LLM judge on this model instead of "
+            "the agent's, selected the way production selects one "
+            "(judge.output_guard_model)"
+        ),
+    )
+    parser.add_argument(
+        "--judge-provider",
+        choices=_OUTPUT_GUARD_PROVIDERS,
+        default="openai-compatible",
+        help="--judge-model: its provider, keys as for --provider (default: openai-compatible)",
+    )
+    parser.add_argument(
+        "--judge-base-url",
+        default=None,
+        help="--judge-model: its endpoint (default: as for --provider)",
+    )
+    parser.add_argument(
+        "--judge-context-window",
+        type=int,
+        default=0,
+        help="--judge-model: its context window (default: --context-window)",
+    )
+    parser.add_argument(
+        "--grade-input",
+        default=None,
+        help="--output-guard grade: the results file of a subagent run",
     )
     parser.add_argument(
         "--cells",
@@ -286,6 +451,36 @@ def main() -> None:
     add_config_arg(parser)
     apply_config(parser, ["api", "model"])
     args = parser.parse_args()
+    if args.provider != "openai-compatible" and not args.output_guard:
+        parser.error("--provider applies only to --output-guard")
+    if args.judge_model and args.output_guard != "subagent":
+        parser.error("--judge-model applies only to --output-guard subagent")
+    judge_options = [
+        f"--{dest.replace('_', '-')}"
+        for dest in ("judge_provider", "judge_base_url", "judge_context_window")
+        if getattr(args, dest) != parser.get_default(dest)
+    ]
+    if judge_options and not args.judge_model:
+        parser.error(f"{', '.join(judge_options)} applies only with --judge-model")
+    if args.output_guard == "grade" and not args.grade_input:
+        parser.error("--output-guard grade needs --grade-input")
+    if args.grade_input and args.output_guard != "grade":
+        parser.error("--grade-input applies only to --output-guard grade")
+    if args.grade_input and os.path.realpath(args.output) == os.path.realpath(args.grade_input):
+        parser.error("--output names the --grade-input file, which grading would overwrite")
+    if args.provider != "openai-compatible":
+        if not args.model:
+            parser.error(f"--provider {args.provider} needs --model")
+        # The local default (or config.toml's [api] base_url) is not this provider's.
+        given = args.base_url if getattr(args, "base_url_given", False) else None
+        base_url, key = _output_guard_endpoint(args.provider, given)
+        if not key:
+            parser.error(
+                f"--provider {args.provider} reads its key from "
+                f"{_KEY_VARIABLES[args.provider]}, which is not set"
+            )
+        _run_output_guard_cli(args, args.model, key, base_url)
+        return
 
     api_key = os.environ.get("OPENAI_API_KEY", "dummy")
     client = OpenAI(
@@ -306,8 +501,11 @@ def main() -> None:
     if args.nudges:
         _run_nudges_cli(args, model, api_key)
         return
+    if args.output_guard:
+        _run_output_guard_cli(args, model, api_key, args.base_url)
+        return
     if args.test_file is None:
-        parser.error("test_file is required unless --nudges is given")
+        parser.error("test_file is required unless --nudges or --output-guard is given")
 
     # Skill-adherence mode is a distinct two-arm measurement — it uses natural
     # prompt composition (no --prompt), so branch before the initial-prompt path.

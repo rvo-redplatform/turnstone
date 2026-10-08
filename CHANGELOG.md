@@ -19,8 +19,89 @@ frozen.
 > running older code cannot use this OAuth storage until their code is upgraded; OAuth operations
 > on those processes can fail between migration and replacement. MCP API fields and token-keyring
 > configuration names are unchanged. See [Shared OAuth storage](docs/oauth-storage.md).
+>
+> **Before upgrading:** migration 078 adds the workstream owner lease to `workstreams`. Upgrade
+> every node, console and CLI that shares the database together: a process running older code
+> ignores the lease, so while versions are mixed two processes can write the same workstream.
+> Custom session factories must accept the new `workstream_lease` keyword argument and pass it
+> to the `ChatSession` they build; creating or opening a workstream fails when they do not.
+> `ChatSession.resume()` is removed: a session's workstream never changes after construction, so
+> hosts reopen a workstream with `SessionManager.open`, which builds its session and loads it with
+> `ChatSession.rehydrate()`. A host that embeds a `SessionManager` must call `start_lease_keeper()`
+> once it is built and `release_leases()` at shutdown, or its leases lapse after 30 seconds; a
+> custom `SessionEventEmitter` implements `on_lease_retired`, which announces a workstream another
+> process took over.
+> Custom storage backends must implement the lease methods (`acquire_workstream_lease`,
+> `renew_workstream_leases`, `release_workstream_lease`), `end_foreign_node_watches` and
+> `ensure_workstream_incarnation_snapshot` (which `open` now requires), and accept the `lease`
+> keyword on every session-owned write; `bulk_close_stale_orphans` and
+> `delete_stale_creating_reservations` no longer take `live_node_ids` (nor the latter
+> `local_node_id`), because liveness is now the lease.
+> `turnstone.core.policy.evaluate_tool_policy` and `evaluate_tool_policies_batch` are removed:
+> `evaluate_loaded_tool_policies` returns `None` when the policies cannot be read, and a caller
+> must then fail closed (see Security).
+>
+> **Before upgrading:** migration 079 replaces the `usage_events` `ws_id` index with a
+> `(ws_id, timestamp)` index, built concurrently on PostgreSQL. Custom storage backends must
+> implement `list_saved_workstreams`; `list_workstreams_with_history` takes only `limit` (no
+> `kind`, `user_id`, `state` or `offset`) and returns only `(ws_id, alias, title, name, created,
+> updated, message_count)`;
+> `touch_workstream` is removed, and only conversation writes may change `updated`:
+> `update_workstream_state`, `update_workstream_name`, `publish_deferred_create` and
+> `bulk_close_stale_orphans` leave it unchanged, while `delete_messages_after` and
+> `truncate_messages_tail` stamp it when they remove rows. `SessionEndpointConfig` drops
+> `saved_state_filter` and `saved_loaded_lookup`, and `make_unified_saved_handler` its unused
+> `permission_gate`.
 
 ### Added
+
+- **Output-guard evals in `turnstone-eval` (#1291).** `--output-guard judge` scores the LLM stage on
+  tool outputs with directives planted at known lines: detection, false positives, whether its flags
+  stay inside the fixed vocabulary, citation precision and recall, and failed verdicts.
+  `--output-guard locate` checks that a model finds the lines an advisory cites, alone and as the
+  first of two results, and `--output-guard subagent` whether production's task agent acts on a
+  planted directive with and without the advisory, counting only calls that carry it out (a command
+  by the program it runs, a write by its path, a fetch by its URL), retrying a run that fails before
+  it acts and keeping the error of one that fails after. Each subagent run keeps the agent's
+  transcript, with the reasoning its provider returned, and `--output-guard grade` reads those
+  transcripts back to a grader model: whether the agent noticed the planted instruction, what it did
+  about it, whether it mentioned the guard's warning, and how it read the instruction, so a paid run
+  is graded without being repeated. `--judge-model` runs the guard's judge on a model of its own,
+  selected through `judge.output_guard_model`. `--provider` reaches the endpoint through the named
+  adapter, so a model that takes mid-conversation system messages receives the advisory as one; a
+  hosted provider reaches its own API and reads its own key variable. Cases ship in
+  `turnstone/eval/scenarios/output_guard.py`. The mode flags `--nudges`, `--skill-adherence` and
+  `--output-guard` are now mutually exclusive; given together, one ran and the other was silently
+  dropped.
+- **One live owner per workstream.** A process that loads a workstream holds a time-bounded owner
+  lease on it, renewed every 10 seconds and judged against the database clock, and every write the
+  session makes presents the lease's fencing epoch. Two servers sharing PostgreSQL can no longer
+  both open the same workstream: the second answers 409 with code `workstream_lease_held` and the
+  holder's node; the console follows a refused open to the holder and its delete proxy retries there
+  once, while the node UI and the standalone shell say which node holds it. Concurrent opens of one
+  workstream load it once and report `already_loaded` to the others. A paused or partitioned former
+  holder cannot write history, state, configuration, attachments or lifecycle changes after another
+  process took over; its copy stops generating, tells open panes why, and is unloaded. A non-holder
+  cannot close or hard-delete a workstream another live process owns. SQLite keeps its
+  single-process behavior: a new process takes the lease over when it opens a workstream, though
+  until a crashed process's leases expire (up to 30 seconds), deleting, renaming or importing those
+  workstreams without opening them is refused, and the refusal names the crashed process's node,
+  which can be the restarted one. In the CLI, `/resume` and `/new` open the workstream
+  in a tab of their own, carrying the current tab's approvals (and `/new` its model, persona and
+  settings), and `/resume` of a workstream another tab has switches to that tab; one that fails
+  says why and stays on the current tab (or, when that tab was a stopped copy of the workstream it
+  named, brings the next one forward). The tab left closes once its messages are saved, retrying
+  any that are not; one whose background programs still run stays open until `/ws close`. A
+  workstream another process took over closes with a notice, the next one comes forward, and input
+  typed for the closed one is dropped; `/resume` of such a tab opens it again, `/ws close` says
+  whether a tab closed, moved elsewhere or is still saving, `/exit` works with none open, and a
+  slash command that fails or is interrupted reports why and returns to the prompt instead of
+  ending the CLI. A node that loses a workstream to another process announces `ws_unloaded` on its
+  event stream (not `ws_closed`: it may live on elsewhere), its own dashboard drops the row,
+  and the console's cluster stream forwards it with the node's ID, so dashboards list the
+  workstream under its holder only.
+  `turnstone_workstream_lease_events_total{event}` counts acquisitions, takeovers, conflicts,
+  renewals and losses. See [Workstream Owner Lease](docs/architecture.md#workstream-owner-lease).
 
 - **Attachment cases in `turnstone-eval`.** A case can attach text files (`attachments` entries
   with `filename`, `content` and an optional `mime_type`); each is classified like an upload and
@@ -36,8 +117,73 @@ frozen.
   on the alias's client so model turns, the Detect probe, the doctor check, and delegated-credential
   calls all carry it. Values must be visible ASCII of at most 128 characters; the console refuses
   anything else, or a value on a provider that does not speak the Anthropic protocol.
+- **`turnstone-doctor` flags a Caddy running an outdated Caddyfile.** On a Docker install, the
+  report compares the config Caddy loaded with the Caddyfile on disk and, when they differ, gives
+  the `docker compose restart caddy` command that applies it.
 
 ### Changed
+
+- **Saved sessions page, search and sort on the server (#1268).** `GET /v1/api/workstreams/saved`
+  on nodes and the console takes `limit` (default 50, at most 200; `0` returns only the total),
+  `offset`, `q` (a case-insensitive substring of at most 256 characters), `sort` and `order`, and
+  its response adds `total`, `limit` and `offset`; a malformed parameter answers 400. Search folds
+  letters beyond ASCII on SQLite, and on PostgreSQL as far as the database's locale does. Project
+  names count for search and the project sort only for callers with `project.read`, who are the
+  ones the dashboards can show them to.
+  A saved session is now one with history that no process has loaded (no live owner lease), for
+  both kinds: a node's list no longer includes workstreams loaded on it or on any other node, and
+  the console's no longer includes interactive sessions that nodes have loaded. The dashboards'
+  saved tables fetch each page, search and sort from the server, so they reach every stored
+  session; sorting and searching pause while rows are selected for deletion, as paging already
+  did. While a page loads its rows dim and keyboard focus stays on the control that asked for it,
+  and a failed load on a node's dashboard shows the error with a Retry button, as the console's
+  already did. Each dashboard keeps one request for the list in flight and asks once more after it,
+  however many refreshes arrive meanwhile. The Python and TypeScript SDKs'
+  `list_saved_workstreams` / `listSavedWorkstreams` take the same options and still read an older
+  server's unpaged answer.
+- **A workstream's `updated` is the last change to its conversation (#1268).** Saving or removing
+  messages (rewind, retry) sets it; state changes, renames, opening, closing and cleanup no longer
+  do. Lists ordered by `updated` (the saved sessions, the CLI's `/workstreams`, a project's
+  workstreams, the console cluster view's stored coordinators and a coordinator's children) now
+  order by real use, so a coordinator closed today but last used long ago no longer jumps into the
+  cluster view's 200 most recent. `session.retention_days` ages an unnamed workstream from its last
+  conversation change, so opening an old unnamed workstream no longer restarts its clock; naming it
+  still keeps it. Cleanup of a workstream no process holds now waits for the idle timeout from its
+  last conversation change rather than from its last state change, and orphan close and retention
+  also leave a workstream whose owner lease ran out within their window, since a holder whose
+  renewals are failing may still have it open.
+- **Routing prefers a workstream's owner, and cleanup keys on leases.** The console router sends a
+  workstream to the live node holding its owner lease (after any required node). Orphan close and
+  stale-create recovery skip workstreams with a live lease instead of trusting node heartbeats, and
+  boot prune, which had no liveness check, now skips them too, so a crashed process's workstreams
+  are reclaimed whatever node id the next process carries, and orphaned coordinators are now reaped.
+  On PostgreSQL, a workstream whose holder crashed can be reopened elsewhere after at most 30
+  seconds, and the router stops sending requests to it once its lease expires. `turnstone-server
+  --resume` waits once, up to that TTL, when its own previous process still holds the workstream,
+  and it and the CLI's `--resume` report any failure to resume as a one-line error; resuming a
+  workstream with no stored turns now opens it, with its saved settings, and resuming a
+  coordinator from the CLI or server startup is refused. Coordinator deletes now run on the
+  console. A watch is ended when another node opens its workstream, because a watch runs only on
+  the node that created it, and the model is told why unless the workstream has no messages.
+  Opening a workstream whose history or saved settings cannot be read answers 503 and can be
+  retried, instead of opening it empty or on default settings, and opening one (or viewing it
+  with write scope) on a node whose session slots are all busy answers 429, as a create does.
+- **Watch delivery reopens the workstream like a pane.** A watch fire for a workstream that is not
+  loaded now opens it through the session manager instead of building a separate session that
+  switched to it, so a pane opened meanwhile joins the same session and no empty workstream is left
+  behind. While nobody else is in it, a workstream opened this way approves its own tool calls,
+  audited as `unattended_watch` rather than as skip-permissions, until the first client opens it,
+  views it, sends to it, approves in it, stops it or attaches to its stream; a call an admin `ask`
+  policy matches takes the normal approval flow instead, as in an attended session (the
+  smart-approval judge, if enabled, or a person; the old restore approved it). A workstream with no
+  stored turns ends the watch.
+- **Containers run Turnstone under an init process.** The image's entrypoint is now `tini`, and
+  the Helm chart's server and console pods set `shareProcessNamespace: true`, so the pod's
+  pause container is PID 1. Either one reaps orphaned processes, such as the helpers stdio MCP
+  servers leave behind, which Turnstone as PID 1 left as zombies. Turnstone now handles
+  SIGTERM in containers as it already does elsewhere: it shuts down as before, but the
+  container's exit code on `docker stop` or pod termination is 143 rather than 0. Overriding
+  the image entrypoint (`docker run --entrypoint ...`) bypasses `tini`.
 
 - **Shared model completion recovery.** Conversations, task agents, summaries, utilities,
   judges, and perception share a bounded retry allowance for empty responses and transient
@@ -101,9 +247,175 @@ frozen.
   negotiates content may now return HTML where it previously returned JSON or CSV, and some image
   hosts (for example `i.imgur.com`, `i.redd.it`) redirect a direct image link to their HTML page,
   which a preview shows without its scripts.
+- **The output guard judges on `judge.model` when it has no model of its own (#1291).** With
+  `judge.output_guard_model` empty, the guard's LLM stage ran on the session's model, the model
+  whose tool output it judges. It now uses `judge.model`, and the session's model only when that is
+  empty too; a set alias that is not registered is passed over with a warning. Installs that set
+  `judge.model` but not `judge.output_guard_model` switch the guard's model on upgrade: the guard
+  then shares that alias's `max_concurrency` with the intent judge, and long tool output may exceed
+  a small judge's context window, which skips the LLM stage for that result. Set
+  `judge.output_guard_model` to keep a separate model for the guard. A workstream's own judge model
+  (the launcher's judge picker, the create API's `judge_model`, the CLI's `--judge-model`) is that
+  workstream's `judge.model`, so it runs the guard too unless `judge.output_guard_model` is set.
 
 ### Fixed
 
+- **Saved sessions list all stored history (#1268).** The saved list returned at most the 50 newest
+  sessions of each kind that the caller could see, without a total, so the dashboard's pager and
+  search never reached older sessions. It now pages through every session the caller may see, with
+  an exact total. A coordinator left behind by a console that crashed or restarted appears once its
+  owner lease expires (within 30 seconds), instead of only after the idle timeout closed it, or
+  never when the idle timeout is 0. Closing a session, by hand, at its idle timeout or in cleanup,
+  no longer stamps it as just updated, so it keeps its place in the list instead of jumping to the
+  top (see the change to `updated`); sessions closed before this release keep the time stamped
+  then. On PostgreSQL the list's latest-usage lookup could scan every newer usage event for each
+  session (over a second for a few hundred sessions); migration 079's index makes it a short index
+  scan.
+- **Saved lists keep their NAME column, and empty states are legible (#1268).** The dashboards'
+  saved tables dropped columns by the window's width, so beside the side rail or in a split pane
+  NAME could shrink to nothing (at a 1024-pixel window on the console); they now go by their own
+  width and drop one lower-value column at a time until NAME has 200 pixels: ID first (whenever
+  NAME would have less than 280), then the message or children count, PERSONA, PROJECT, MODEL and
+  the console's KIND, keeping the sorted column for last; if even that one goes, the footer names
+  the order. A long name and its skill chip share the cell, the chip names its skill on hover and
+  the row's accessible name includes it, and cut-off text keeps a gap before the next column. The
+  header's search box and Delete move to their own row when they no longer fit beside the title,
+  the search box narrowing as far as it must so Delete is never pushed out of view; in a narrow
+  pane the pager drops below the count instead of squeezing it; Retry says so while it works; and
+  the CTX column no longer goes blank on phones. Empty and error messages in both apps lost an
+  extra opacity that put them below WCAG AA contrast.
+- **The output-guard judge gets its model's output budget (#1291).** The LLM stage capped every
+  verdict at 512 tokens, and the cap counts reasoning as well as the answer, so a thinking model
+  could spend it before writing the verdict; the verdict was then dropped and only the regex stage
+  stood. The cap is now the guard model's own: the alias's `max_tokens`, else the `model.max_tokens`
+  setting (32,768 by default), never above the model's advertised maximum output, and fitted to the
+  context window the prompt leaves. A change to `model.max_tokens` reaches the judge without a
+  restart. To size its prompt against the window, the judge now counts each ASCII digit as a token,
+  text outside ASCII by its UTF-8 length and a dense base64-like run (mixed case, with a digit) at
+  0.6 tokens a character, then allows for up to 1.4 times that count: numeric output such as JSON,
+  CSV or logs ran up to 3.5 times the old character estimate, Chinese, Japanese, Korean and base64
+  text up to 2.4 times, and a server such as vLLM refuses a request whose prompt and cap together
+  exceed the window. With an effort resolved for the guard, a model that takes a fixed thinking
+  budget, as some of Anthropic's do, now thinks on every judged result, at temperature 1.0; the 512
+  cap left it no room to. A judged result can now use up to the cap and take up to
+  `judge.output_guard_llm_timeout`; a smaller `max_tokens` or a lower effort on the guard's alias
+  bounds both.
+- **A failed request no longer strands a web search (Anthropic).** When the model called web
+  search alongside another tool, the API held the search back until the next request. If that
+  request failed (an exhausted credit balance, say) and a new message followed, every later request
+  was rejected (`web_search tool use with id ... was found without a corresponding
+  web_search_tool_result block`) and the workstream could not continue. Such a search is now sent
+  back with the API's own `unavailable` error, so the model sees that it failed and can search
+  again in a later turn. A mid-turn compaction that kept a reply opening with a search result, but
+  summarized away the search that produced it, no longer breaks the workstream either.
+- **Native tool search keeps working after its first round (Anthropic).** The search's result was
+  left out when the conversation was sent back, so the API rejected every request from the second
+  one after a search onward and the workstream could not continue. The result is now passed back
+  unchanged, and workstreams already stuck this way continue. A tool that a search found but a
+  later request no longer offers, for example because its MCP server is offline, is offered as no
+  longer available, since the API rejects a request whose history names a tool it does not have.
+- **A saved workstream with no messages keeps its settings.** Opening one (from a pane, and now
+  also `--resume` and `/resume`) applied the constructor's defaults instead of its saved model,
+  sampling, instructions and skill, and the next settings change wrote those defaults over the
+  saved ones. It now opens with its saved settings.
+- **The model keeps its own searches in its history (OpenAI).** Replayed history left out the web
+  searches and tool searches the model ran itself, so it searched again for tools it had already
+  found. Both now replay where they ran, and a call to a tool that a search loaded carries the
+  namespace the API requires for it. A replayed web search shows the model its query or the page
+  it opened, not the results, which the API does not take back. Compatible endpoints and xAI
+  replay as before. A workstream that searched misses the prompt cache once, on its first request
+  after the update. One that searched again for tools it had already found resends each of those
+  searches, with the definitions it loaded, until it compacts.
+- **A refused tool call says the tool is not available, not "Unknown tool" (#1287).** Tools can
+  leave a session mid-conversation: an MCP server drops one or goes away, or another user sends on
+  a shared workstream, whose tools follow the sender. When the model called one, it was told
+  "Unknown tool" and to use a listed name exactly, and the operator saw "Model called unknown
+  tool", as if the model had made the name up. Both now say the tool is not available now, and the
+  model is told it may have been removed or be misspelled, or, on a shared workstream, belong to
+  another user. The tools that reply lists are the ones the request offers, where it used to name
+  every built-in tool, including coordinator tools in a regular session, tools a persona hides and
+  tools an operator revoked. With tool search on, it lists the tools offered outright and says more
+  may be found by searching, and a task agent sees its own tools.
+- **A storage error while opening a workstream no longer replaces its saved settings.** Building the
+  session saves its defaults when no settings are saved, and a read that failed counted as none
+  saved, so one failed read could overwrite the saved model, sampling, instructions and skill. That
+  open, or a create that hits the same failure, now answers 503 and can be retried.
+- **Warning toasts look like warnings.** Ten warning toasts in the shell, the node UI and judge
+  verdicts asked for a style the toast component does not have and fell back to the neutral one;
+  they now use the warning style.
+- **Hosted search for Astra (#1191).** The capability table now enables native web search
+  when the session offers `web_search`, without requiring a model capability override.
+- **Chat search usage no longer inflates replay context (#1191).** Requests with hosted search
+  use the local context estimate instead of anchoring on billed input that includes search
+  results, including automatic search without explicit search options. Raw usage still charges
+  the token budget, and text calibration remains unchanged. Automatic search also marks the
+  request as using native tools, preventing an automatic replay of an accepted response.
+
+- **Stream cleanup after callback failures.** Chat and Responses adapters close the underlying
+  SDK response when a local chunk callback interrupts generation, preserving the original error.
+
+- **MCP catalogs are read past their first page (#1225).** A server that paginates its tools,
+  prompts, resources or resource templates had only its first page published, on connect and on
+  refresh, for shared and per-user servers alike. Each list is now followed to its last page,
+  within the existing per-server cap of 1,000 entries, which still truncates with a warning. An
+  entry listed twice is published once. Empty pages that still point onward are read past. The
+  walk also stops, with a warning, when the server repeats a cursor, sends ten pages in a row
+  with nothing new, or answers a later page with a JSON-RPC error; it keeps the pages already
+  read, so a catalog is never published shorter than its first page.
+
+- **MCP HTTP failures release waiting calls promptly (#1223).** Shared and per-user connections
+  capture upstream HTTP status before the SDK loses it. A 5xx counts against the circuit breaker;
+  a 404 on a held session causes reconnection on the next call. HTTP 401/403 failures remain
+  breaker-neutral, including shared connections, and per-user auth refresh and consent handling
+  are preserved. Tools, resources, and prompts also stop waiting when their transport owner exits.
+  Caller deadlines and protocol errors returned with HTTP 200 remain breaker-neutral.
+
+- **A malformed MCP tool no longer sets off a reconnect loop (#1224).** The MCP SDK rejects a
+  server's whole tool list when one entry fails its validation, such as a tool with no
+  `inputSchema`, so that server publishes no tools; keeping the valid ones would need SDK
+  internals. The server's status now names the entry and the field (`InvalidCatalogError: MCP
+  server 'docs' lists an invalid tool 'search' at tools[1].inputSchema: Field required`), and so
+  does each user's status for a per-user server. The failure no longer counts against the circuit
+  breaker. A shared server stops offering the tools, resources and prompts from its last good
+  connect (its prompts' templates are removed until it recovers), and is retried every five
+  minutes instead of on the reconnect backoff of up to a minute; an operator reconnect still
+  retries at once. A refresh that meets a malformed entry keeps the last good catalog and is
+  retried like any failed refresh. A malformed entry on a later page fails the same way instead
+  of cutting the catalog short, and a tool result that does not match the protocol's schema no
+  longer counts against the breaker either. A shared server's status also shows why a reconnect
+  failed, where before it showed only a failure at startup.
+
+- **Processes started by a stdio MCP server no longer outlive it (#1226).** A server that
+  started a helper process and then exited cleanly when its stdin closed left the helper
+  running, so every reconnect, reload, removal or shutdown leaked another. Once a stdio
+  server's connection has closed, whatever remains of its process group gets SIGTERM, then
+  SIGKILL after one second; the server itself keeps its usual window to shut down. Containers
+  now reap the stopped helpers; see the container init change above.
+
+- **Shutdown no longer deletes MCP prompt templates (#1146).** A catalog refresh still waiting
+  on a reconnecting server when Turnstone shut down could finish during cleanup, after shutdown
+  had emptied the prompt catalog, and delete every MCP-sourced prompt template; the next sync
+  recreated them as new rows. A refresh abandoned at shutdown no longer syncs when cleanup
+  finishes it, and no prompt-template sync runs once shutdown starts emptying the catalog.
+
+- **Watch output is delivered as tool data (#1235).** Watch notices carry metadata and a
+  `watch(action="read", name="<watch id>")` hint. Command output and condition exception details
+  are returned through the normal tool-result path and its configured output guard, rather
+  than entering model context with operator authority. The watch-result card still shows the
+  output, and completed watches remain readable by name or ID. Delivered snapshots remain
+  readable in forks and after compaction or checkpointed resume, even if the terminal poll
+  update failed or the source was compacted before forking.
+
+- **Web UI typography.** Locally served font subsets retain the requested stylistic
+  features, real italics and the 800 weight used by attention chips. Bundled symbol
+  fallback and information icons give interface marks consistent shapes across platforms (#1231).
+
+- **GPT-6 effort changes preserve the cached prompt prefix (#1246).** Supported standard
+  Responses requests keep request-level effort at its initial value and replay later changes
+  as `configuration_update` input items. Accepted turns record their resolved effort, so
+  resume and fork preserve update positions; compaction starts a new baseline. Pro mode,
+  requests with sampling parameters, compatible endpoints, and a return to an unknown server
+  default retain request-level effort.
 - **`THIRD-PARTY-NOTICES` lists the versions the package ships.** Its KaTeX, highlight.js, Mermaid
   and hls.js sections named older versions than the vendored files, because the update script
   rewrote version references only in source files and every bump left the notices behind. The
@@ -227,9 +539,107 @@ frozen.
   node token metrics. Both judges now record every completed model call under the judge's own
   model, which is the configured judge alias's model when one is set. Like the other auxiliary
   calls, judge calls do not move the live context gauge of the workstream they run for.
+- **The dashboard keeps one HTTPS certificate across restarts.** A browser sends no server name
+  when it dials an IP address, so Caddy named the certificate after its container's Docker
+  address, which changes whenever compose recreates the container, and issued a new one each
+  time; every certificate also expired after 12 hours. Such connections now get one certificate
+  for `127.0.0.1`, and each certificate Caddy issues for the dashboard and the SearxNG UI is valid
+  for a year and kept in the `caddy-data` volume, so the certificate a browser accepted stays the
+  same. Caddy reads its Caddyfile only when it starts: re-running `run.sh` now restarts it, and
+  otherwise run `docker compose restart caddy`. Certificates already issued are replaced as they
+  come due. Caddy also closes open dashboard streams within 5 seconds when it stops; before, a
+  restart with the dashboard open waited out Docker's 10-second stop timeout and was killed.
 
 ### Security
 
+- **The model reads only framework-written output-guard findings (#1291).** With the LLM stage on
+  (`judge.output_guard_llm`), the advisory after a flagged tool result carried the judge's
+  reasoning and its free-form flags: text the judge wrote after reading the attacker-controlled
+  output, delivered with operator-level trust. The advisory now names what the judge found with
+  symbols from a fixed vocabulary, each with one fixed sentence, and a flag outside the vocabulary
+  shows as `unclassified`; the judge's prompt lists the same vocabulary. The chip and the audit
+  rows keep the judge's reasoning and flags as it wrote them, and findings from the regex stage
+  read as before. Workstreams created before the upgrade keep the advisories already stored in
+  them, judge prose included.
+- **The model's own words replay as written (#1291).** The fold of operator turns, the shared
+  workstream's sender-label pass and the reasoning replayed to a vLLM model defanged fence markers
+  in the model's own text and reasoning, so the model read its history rewritten. They now clean
+  only what comes in (tool results, attachments, other participants' messages) and replay the
+  model's text, reasoning and tool-call arguments as it wrote them. The summarizer that writes a
+  compaction summary reads every turn with fence markers defanged and the session's tokens removed,
+  the model's own included, since another model reads them and nothing it reads is replayed; its
+  summary is kept as it wrote it. What the framework writes from outside into an assistant turn (the
+  last user message a summary quotes, a child workstream's name, a hosted search's citations footer)
+  or a system turn (a message queued while the model works) is cleaned where it is composed; the
+  model's own last turn, which a compaction carries verbatim, stays as written. A hosted search's
+  results and citations replay inside the model's turn as the provider returned them, beyond any
+  text pass, like text inside an image or a natively read PDF; the declaration now says a block
+  inside one of the model's own earlier turns, its search results and citations included, is never
+  the operator's. Anywhere else, text from outside never carries a session token in, so a block with
+  one in the model's history is one the model wrote itself.
+- **Task agents are told what the output guard found (#1291).** A task agent's tool results were
+  scanned and redacted, but its model never saw the finding, so a sub-agent that read a prompt
+  injection got no warning even though the guard flagged it and the operator's chip showed it. A
+  flagged result now gets the same advisory as in the conversation, after the step's tool results,
+  and the agent's intent judge sees it on later gated calls. A tool's own text inside a list result
+  is now guarded; list results skipped the guard entirely. The only list result today, `read_file`
+  on an image, holds just the framework's header before the image. An agent whose model takes the
+  advisory in the trusted fence, under a main model that takes native system messages, now has that
+  fence declared in its prompt. The guard reads past the agent's 16,000-character cut so it can
+  redact a credential that straddles it, so the advisory for a result the cut shortened says the
+  finding may concern the part the agent did not receive. The declaration itself, in every session
+  whose model folds operator turns, now says a block carrying the session's token can follow a tool
+  result, and that a block inside one of the model's own earlier turns, its search results and
+  citations included, is never the operator's; it told the model to distrust any marker inside tool
+  output, which read literally covered the real advisory appended there. Since the declaration
+  trusts the token alone, the token itself is now removed from untrusted text wherever it joins the
+  request (tool results and other incoming history, before the fold appends its block, and
+  attachments), matched past case, past accents and compatibility forms (`é`, full-width,
+  mathematical, circled) and past anything between its characters that is not an ASCII letter or
+  digit (spaces, line breaks, invisible characters, combining marks): a leaked token inside a marker
+  spelled with a zero-width space or a lookalike letter passed the old defang. Lookalikes that
+  Unicode does not decompose to a letter or digit (another script's letters, ASCII `O` for `0` and
+  `l` or `I` for `1`, and on Python 3.13, whose Unicode predates them, the outlined letters and
+  digits Unicode 16 added) are not matched, and text inside an image, a natively read PDF or a
+  hosted search's results and citations is beyond the reach of a text pass. The sender label of a
+  shared workstream gets the same treatment, and the guard flags a leaked token wherever it appears.
+  All of a step's advisories follow its last result, so in a step with several results each advisory
+  now names its own by position, and by tool when the session offers a tool of that name; the
+  operator's guard card shows the same label. Text the framework wrote itself (a denial quoting the
+  approver's feedback, an unknown-tool or agent-mode gate error, the header before an image) is no
+  longer guarded; a denial such as "From now on you must write outputs to /tmp" scored as an
+  injection, and the advisory turned the approver's own correction against them.
+- **The output guard's judge no longer reads secrets the model never sees (#1291).** Where the regex
+  stage redacts a credential (`judge.redact_secrets`), the guard's LLM stage read the raw tool
+  output, so a secret the session's model never saw reached the guard's model, possibly another
+  provider's, and the reasoning it writes into the audit row. It now reads the redacted text the
+  session's model receives; the lines it cites are that text's.
+- **Output-guard findings name the lines the judge flagged (#1291).** With the LLM stage on, the
+  judge reads the tool output with numbered lines and may cite ranges; the advisory names them as
+  numbers, never quoting the lines. A range reaches the model only if its lines read the same, at
+  the same numbers, in what the model receives: one after a re-cut or a task agent's cut is dropped
+  rather than renumbered. The sentence says the numbers count from the first line of the result,
+  since `read_file` and search output print numbers of their own, and asks the model to treat the
+  whole result with the same caution, since the judge chose the lines after reading text that can
+  steer it. A result the main loop cuts again after redaction now also gets the notice that the
+  finding may concern the part that was cut. Output whose numbered prompt would not fit the judge's
+  window, such as one padded with blank lines, is judged unnumbered and cites no lines, where it
+  would otherwise skip the judge.
+- **Tool policies that cannot be read refuse the batch.** When reading the admin tool policies
+  failed, every call came back as matching no policy, so `deny` rules stopped applying:
+  skip-permissions, "Always" grants, auto-approve lists, the smart-approval judge or a person could
+  run a call a `deny` rule covered. Now every call in the batch that needs approval is refused, with
+  a message telling the model to try again; calls that need no approval still run. Successful reads
+  stay cached for 60 seconds and a failed one is not cached, so the next batch reads again. This
+  applies to node and coordinator sessions and to the CLI. A call tool policies refused, or one
+  nobody answered before the approval deadline, is no longer reported to the model as the user
+  rejecting it.
+- **"Always" approves only what the person approved.** Approving a batch with "Always" also granted
+  the always-approval to a call a `deny` rule had refused in that batch, so the call ran without a
+  prompt if the rule was later removed or relaxed to `ask`. Refused calls now get no grant.
+- **The CLI's token-budget prompt always asks.** It crashed on every exhausted budget (the budget
+  item has no header), so a CLI session past its token budget could not continue; it now asks, and,
+  as on a node, neither skip-permissions, an auto-approve list nor a tool policy settles it.
 - **URL tools look up a hostname only after approval.** `web_fetch` and `open_preview` screened
   their target while preparing the call, and the screen resolved the hostname. A denied or
   cancelled call had already sent that name to DNS, and a private or unresolvable answer was

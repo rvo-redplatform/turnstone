@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 from turnstone.core.attachments import AUDIO_MIME_TO_FORMAT, unreadable_placeholder
 from turnstone.core.log import get_logger
 from turnstone.core.project_access import decide_project_access, fold_role_permissions
+from turnstone.core.storage._lease import unheld_since_predicate, unleased_predicate
 from turnstone.core.storage._protocol import (
     FORK_RESERVATION_CONFIG_KEY,
     AttachmentWrite,
@@ -25,6 +26,7 @@ from turnstone.core.storage._protocol import (
     ForkCloneSnapshot,
     ForkDestinationConflictError,
     ForkSourceUnavailableError,
+    LeaseFence,
 )
 from turnstone.core.storage._schema import (
     conversations,
@@ -98,6 +100,28 @@ def build_memory_scope_or_clause(
         parts = [f"scope = :sc{i}", f"scope_id = :sid{i}"]
         clauses.append("(" + " AND ".join(parts) + ")")
     return " OR ".join(clauses), params
+
+
+def listed_project_predicate(
+    project: sa.FromClause, user_id: str, *, include_archived: bool = False
+) -> sa.ColumnElement[bool]:
+    """Projects in *user_id*'s project list: owned, public or joined.
+
+    ``list_projects_for_user`` lists these, and the saved-session search and sort read a
+    project's name only where that list would show it, so both use this one predicate.
+    *project* is the ``projects`` table or an alias of it. Archived projects are left out
+    unless *include_archived*.
+    """
+    listed = sa.or_(
+        project.c.owner_id == user_id,
+        project.c.visibility == "public",
+        project.c.project_id.in_(
+            sa.select(project_members.c.project_id).where(project_members.c.user_id == user_id)
+        ),
+    )
+    if include_archived:
+        return listed
+    return sa.and_(listed, project.c.state == "active")
 
 
 def memory_index_health_inputs_on_connection(
@@ -733,6 +757,7 @@ class KeyedAttachmentSaveWrappers:
         event_id: int | None = None,
         meta: str | None = None,
         commit_key: str,
+        lease: LeaseFence | None = None,
     ) -> int:
         """Commit a keyed USER row and all attachment ownership atomically."""
         return self._save_message_with_attachments(
@@ -746,6 +771,7 @@ class KeyedAttachmentSaveWrappers:
             commit_key=commit_key,
             origin="upload",
             exact_blob_metadata=False,
+            lease=lease,
         )
 
     def save_tool_message_with_attachments(
@@ -760,6 +786,7 @@ class KeyedAttachmentSaveWrappers:
         is_error: bool = False,
         meta: str | None = None,
         commit_key: str,
+        lease: LeaseFence | None = None,
     ) -> int:
         """Commit a keyed TOOL row and all attachment ownership atomically."""
         return self._save_message_with_attachments(
@@ -775,6 +802,7 @@ class KeyedAttachmentSaveWrappers:
             commit_key=commit_key,
             origin="tool",
             exact_blob_metadata=True,
+            lease=lease,
         )
 
 
@@ -1121,8 +1149,30 @@ def save_attachment_commit_transaction(
     retain_attachment_refs(conn, attachment_ids)
     if index_content is not None:
         index_content(row_id)
-    conn.execute(sa.update(workstreams).where(workstreams.c.ws_id == ws_id).values(updated=now))
+    stamp_conversation_change(conn, ws_id, now=now)
     return row_id
+
+
+def stamp_conversation_change(
+    conn: Any, ws_ids: str | Iterable[str], *, now: str | None = None
+) -> None:
+    """Record that a workstream's conversation changed: set its ``updated``.
+
+    ``updated`` is the last change to the conversation (messages saved,
+    removed or cloned in). Every write that changes conversation rows calls
+    this inside its own transaction; lifecycle and metadata writes (state,
+    name, publication, open, close, cleanup) never do. *now* lets a caller
+    reuse the timestamp it gave the rows it wrote.
+    """
+    ids = [ws_ids] if isinstance(ws_ids, str) else sorted(set(ws_ids))
+    stamp = now or datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+    # Chunked under SQLite's bind-parameter limit for large imports.
+    for start in range(0, len(ids), 500):
+        chunk = ids[start : start + 500]
+        match = (
+            workstreams.c.ws_id == chunk[0] if len(chunk) == 1 else workstreams.c.ws_id.in_(chunk)
+        )
+        conn.execute(sa.update(workstreams).where(match).values(updated=stamp))
 
 
 def find_orphan_conversations(conn: Any) -> list[dict[str, Any]]:
@@ -1901,7 +1951,7 @@ def reconstruct_messages(
     send-time repair (:func:`turnstone.core.lowering.repair_wire_messages`), the
     single place the wire path synthesizes cancellation results.  Callers that
     consume the messages as LLM context via the session send path
-    (``session.resume``) get that repair for free; a consumer that bypasses it
+    (``ChatSession.rehydrate``) get that repair for free; a consumer that bypasses it
     (``export``) runs ``repair_wire_messages`` itself.  Callers reading for
     *display* (the ``/history`` REST endpoint) should pass ``repair=False`` so
     the user sees the actual partial state — refreshing during tool execution
@@ -2320,6 +2370,7 @@ ORPHAN_PRUNE_GRACE_SECONDS = 2 * 60 * 60
 def prune_workstreams_shared(
     retention_days: int,
     *,
+    dialect_name: str,
     select_ids: Callable[[tuple[Any, ...]], list[str]],
     delete_candidate: Callable[[str, tuple[Any, ...]], bool],
 ) -> tuple[int, int]:
@@ -2331,6 +2382,13 @@ def prune_workstreams_shared(
     separate-statement recheck; SQLite: ``BEGIN IMMEDIATE`` recheck).  The
     same predicate tuple drives discovery AND recheck, so every conjunct
     must be a pure SQLAlchemy expression with no per-call state.
+
+    Both categories exclude rows with a live owner lease (``dialect_name``
+    selects the database-clock expression): a process that has the
+    workstream loaded renews its lease, so an empty or old row it is using is
+    never pruned from under it. The recheck re-reads the clock under the row
+    lock, and an acquisition needs that lock, so no lease can appear between
+    the recheck and the delete.
 
     Orphan category — zero conversation rows — carries two guards beyond
     ``state != 'creating'``:
@@ -2355,13 +2413,20 @@ def prune_workstreams_shared(
     orphan_cutoff = (datetime.now(UTC) - timedelta(seconds=ORPHAN_PRUNE_GRACE_SECONDS)).strftime(
         "%Y-%m-%dT%H:%M:%S"
     )
+    unleased = unleased_predicate(dialect_name)
     orphan_predicate = (
         workstreams.c.state != "creating",
+        unleased,
         ~sa.exists(
             sa.select(conversations.c.id).where(conversations.c.ws_id == workstreams.c.ws_id)
         ),
         workstreams.c.alias.is_(None),
         workstreams.c.updated < orphan_cutoff,
+        # A holder that stopped renewing within the window may still have the
+        # row open. This boundary is measured on the database clock at each
+        # statement; the recheck only re-tests discovered ids, and a renewal
+        # in between only removes a candidate.
+        unheld_since_predicate(dialect_name, orphan_cutoff),
     )
     for ws_id in select_ids(orphan_predicate):
         if delete_candidate(ws_id, orphan_predicate):
@@ -2375,13 +2440,61 @@ def prune_workstreams_shared(
         )
         stale_predicate = (
             workstreams.c.state != "creating",
+            unleased,
             workstreams.c.alias.is_(None),
             workstreams.c.updated < stale_cutoff,
+            unheld_since_predicate(dialect_name, stale_cutoff),
         )
         for ws_id in select_ids(stale_predicate):
             if delete_candidate(ws_id, stale_predicate):
                 stale += 1
     return (orphans, stale)
+
+
+#: ``reason`` of the system turn that tells the model a watch ended because its
+#: workstream moved to another node. It is a notice, not a watch result:
+#: snapshot readers skip it.
+WATCH_OWNERSHIP_CHANGED_REASON = "ownership_changed"
+
+
+def watch_snapshot_meta(raw_meta: Any) -> dict[str, Any] | None:
+    """Validate watch metadata from a Turn or stored JSON, ignoring malformed data."""
+    try:
+        meta = json.loads(raw_meta) if isinstance(raw_meta, str) else raw_meta
+    except (TypeError, ValueError):
+        return None
+    if (
+        isinstance(meta, dict)
+        and isinstance(meta.get("watch_id"), str)
+        and meta["watch_id"]
+        and meta.get("reason") != WATCH_OWNERSHIP_CHANGED_REASON
+        and all(
+            key in meta for key in ("watch_name", "command", "output", "poll_count", "max_polls")
+        )
+    ):
+        return meta
+    return None
+
+
+def get_watch_snapshot_on_connection(conn: Any, ws_id: str, watch_id: str) -> dict[str, Any] | None:
+    """Return the latest delivered snapshot from this workstream's own history."""
+    if not watch_id:
+        return None
+    rows = conn.execute(
+        sa.select(conversations.c.meta)
+        .where(
+            conversations.c.ws_id == ws_id,
+            conversations.c.role == "system",
+            conversations.c._source == "watch_triggered",
+            conversations.c.meta.contains(json.dumps(watch_id)[1:-1], autoescape=True),
+        )
+        .order_by(conversations.c.id.desc())
+    )
+    for (raw_meta,) in rows:
+        meta = watch_snapshot_meta(raw_meta)
+        if meta is not None and meta["watch_id"] == watch_id:
+            return meta
+    return None
 
 
 def get_compaction_floor_on_connection(conn: Any, ws_id: str) -> int:
@@ -2486,6 +2599,8 @@ def delete_messages_after_core(
     for (refs,) in deleted:
         doomed_ids.extend(parse_attachment_refs(refs))
     release_attachment_refs(conn, doomed_ids)
+    if deleted:
+        stamp_conversation_change(conn, ws_id)
     return len(deleted)
 
 
@@ -2678,6 +2793,26 @@ def _fork_turn_insert_row(
         "meta": meta_json,
     }
     return insert_row, attachment_ids
+
+
+def _fork_retained_watch_rows(rows: list[Any], live_turns: list[Turn]) -> list[Any]:
+    """Keep the latest valid snapshot per watch omitted from the active fork history."""
+    seen: set[str] = set()
+    for turn in live_turns:
+        if turn.role is Role.SYSTEM and turn.source == "watch_triggered":
+            meta = watch_snapshot_meta(turn.meta.extra.get("source_meta"))
+            if meta is not None:
+                seen.add(meta["watch_id"])
+    retained = []
+    for row in reversed(rows):
+        if row[1] != "system" or row[7] != "watch_triggered":
+            continue
+        meta = watch_snapshot_meta(row[10])
+        if meta is None or meta["watch_id"] in seen:
+            continue
+        seen.add(meta["watch_id"])
+        retained.append(row)
+    return retained[::-1]
 
 
 def clone_workstream_transaction(
@@ -2922,6 +3057,12 @@ def clone_workstream_transaction(
     )
     watermark = _compaction_watermark(marker) if marker is not None else None
     has_checkpoint = marker is not None and watermark is not None
+    preliminary_turns = recover_trajectory(
+        reconstruct_turns_checkpointed(source_rows, source_ws_id, checkpoint=True)
+    )
+    retained_watch_rows = (
+        _fork_retained_watch_rows(source_rows, preliminary_turns) if has_checkpoint else []
+    )
     candidate_rows = (
         [marker]
         + [row for row in source_rows if row[0] > watermark and not _is_compaction_marker(row)]
@@ -2929,16 +3070,13 @@ def clone_workstream_transaction(
         else [row for row in source_rows if not _is_compaction_marker(row)]
     )
     candidate_attachment_refs: dict[int, list[str]] = {}
-    for row in candidate_rows:
+    for row in [*retained_watch_rows, *candidate_rows]:
         refs = _fork_attachment_refs(row[11] if len(row) > 11 else None)
         if refs and row[1] not in ("user", "tool"):
             raise ForkSourceUnavailableError("fork source attachment references are invalid")
         if refs:
             candidate_attachment_refs[int(row[0])] = refs
 
-    preliminary_turns = recover_trajectory(
-        reconstruct_turns_checkpointed(source_rows, source_ws_id, checkpoint=True)
-    )
     if has_checkpoint and (
         len(preliminary_turns) < 2
         or preliminary_turns[0].source != COMPACTION_SOURCE
@@ -3019,6 +3157,16 @@ def clone_workstream_transaction(
         )
 
     insert_rows = [insert_row for insert_row, _refs in serialized]
+    if retained_watch_rows:
+        # Copy snapshots inside the authorized source transaction, before the
+        # child checkpoint. Reads remain durable without restoring old model context.
+        conn.execute(
+            sa.insert(conversations),
+            [
+                _fork_turn_insert_row(turn, destination_ws_id, now)[0]
+                for turn in reconstruct_turns(retained_watch_rows, source_ws_id)
+            ],
+        )
     if has_checkpoint and insert_rows:
         marker_result = conn.execute(sa.insert(conversations), insert_rows[0])
         marker_id = marker_result.inserted_primary_key[0]
@@ -3045,11 +3193,12 @@ def clone_workstream_transaction(
     updated = conn.execute(
         sa.update(workstreams)
         .where(workstreams.c.ws_id == destination_ws_id)
-        .values(project_id=effective_project_id, required_node_id=required_node_id, updated=now)
+        .values(project_id=effective_project_id, required_node_id=required_node_id)
         .returning(workstreams.c.ws_id)
     ).fetchone()
     if updated is None:
         raise ForkDestinationConflictError("fork destination is no longer available")
+    stamp_conversation_change(conn, destination_ws_id, now=now)
 
     return ForkCloneSnapshot(
         turns=tuple(final_turns),

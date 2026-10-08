@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "turnstone Server API",
-    "version": "1.8.2",
+    "version": "1.8.3",
     "description": "Single-node workstream management, chat interaction, and real-time streaming."
   },
   "paths": {
@@ -815,7 +815,14 @@
         ],
         "responses": {
           "200": {
-            "description": "Success"
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkstreamDeleteResponse"
+                }
+              }
+            }
           },
           "400": {
             "description": "Error 400",
@@ -829,6 +836,16 @@
           },
           "404": {
             "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Error 409",
             "content": {
               "application/json": {
                 "schema": {
@@ -857,6 +874,7 @@
         "tags": [
           "Workstreams"
         ],
+        "description": "``409`` with code ``workstream_lease_held`` names the node that has the workstream open. ``429`` when every session slot on the node is busy (retry later). ``503`` when its history or saved settings could not be read (retry shortly) or the session factory is misconfigured.",
         "parameters": [
           {
             "name": "ws_id",
@@ -891,8 +909,38 @@
               }
             }
           },
+          "409": {
+            "description": "Error 409",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Error 429",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Error 500",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
             "content": {
               "application/json": {
                 "schema": {
@@ -989,7 +1037,7 @@
         "tags": [
           "Workstreams"
         ],
-        "description": "Returns the persisted workstream's display fields. If the session isn't currently in memory, write scope is additionally required before the manager rehydrates it before responding; ``500`` on rehydrate failure carries a correlation id matching the server log line. Lifted from the coord-only surface in the Stage 2 history/detail verb lift \u2014 interactive previously had no detail endpoint.",
+        "description": "Returns the persisted workstream's display fields. If the session isn't currently in memory, write scope is additionally required before the manager rehydrates it before responding; ``429`` when every session slot is busy (retry later); ``500`` on rehydrate failure carries a correlation id matching the server log line. Lifted from the coord-only surface in the Stage 2 history/detail verb lift \u2014 interactive previously had no detail endpoint.",
         "parameters": [
           {
             "name": "ws_id",
@@ -1033,6 +1081,26 @@
           },
           "404": {
             "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Error 409",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Error 429",
             "content": {
               "application/json": {
                 "schema": {
@@ -1597,7 +1665,74 @@
         "tags": [
           "Workstreams"
         ],
-        "description": "Lists interactive history visible through creator/project access; requires read scope.",
+        "description": "One page of interactive workstreams with history that no process has loaded, visible through creator/project access; requires read scope. total counts every matching row across pages. A malformed parameter returns 400.",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 50
+            },
+            "description": "Rows per page (default 50, at most 200; larger values are clamped, and 0 returns only the total)."
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 0
+            },
+            "description": "Matching rows to skip before the page starts."
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Case-insensitive substring of the alias, title, name, project name or ws_id (at most 256 characters)."
+          },
+          {
+            "name": "sort",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "updated",
+              "enum": [
+                "child_count",
+                "context_ratio",
+                "kind",
+                "message_count",
+                "model",
+                "name",
+                "persona",
+                "project",
+                "updated",
+                "ws_id"
+              ]
+            },
+            "description": "Column to sort by; ws_id breaks ties so pages never overlap."
+          },
+          {
+            "name": "order",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "desc",
+              "enum": [
+                "asc",
+                "desc"
+              ]
+            },
+            "description": "Sort direction."
+          }
+        ],
         "responses": {
           "200": {
             "description": "Success",
@@ -1605,6 +1740,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ListSavedWorkstreamsResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
@@ -2548,6 +2693,45 @@
             "description": "Error message",
             "title": "Error",
             "type": "string"
+          },
+          "code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Machine-readable reason on some refusals, e.g. ``workstream_lease_held`` (another process owns the workstream) or ``wrong_execution_node``",
+            "title": "Code"
+          },
+          "holder_node_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "With ``workstream_lease_held``: the node holding the lease, if known",
+            "title": "Holder Node Id"
+          },
+          "retry_after_ms": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "With ``workstream_lease_held``: milliseconds until that lease expires",
+            "title": "Retry After Ms"
           }
         },
         "required": [
@@ -3134,7 +3318,7 @@
           },
           "judge_model": {
             "default": "",
-            "description": "Optional judge model alias for this workstream. Empty uses the server's configured judge model.",
+            "description": "Optional judge model alias for this workstream. Empty uses the server's configured judge model. The output guard's LLM stage runs on it too unless judge.output_guard_model is set.",
             "title": "Judge Model",
             "type": "string"
           },
@@ -3847,7 +4031,7 @@
           },
           "auto_approve_reason": {
             "default": "",
-            "description": "Source that fired the bypass.  ``skill`` (skill template's ``allowed_tools``), ``always`` (user 'Approve + Always' click), ``policy`` (admin tool-policy ``allow`` rule), ``blanket`` (workstream-level ``auto_approve=True``), ``smart_approval`` (Smart Approvals: high-confidence LLM judge ``approve`` verdict), or ``auto_approve_tools`` (legacy / unknown writer).",
+            "description": "Source that fired the bypass.  ``skill`` (skill template's ``allowed_tools``), ``always`` (user 'Approve + Always' click), ``policy`` (admin tool-policy ``allow`` rule), ``blanket`` (workstream-level ``auto_approve=True``), ``smart_approval`` (Smart Approvals: high-confidence LLM judge ``approve`` verdict), ``unattended_watch`` (a watch restore loaded the workstream and no client had reached it yet), or ``auto_approve_tools`` (legacy / unknown writer).",
             "title": "Auto Approve Reason",
             "type": "string"
           },
@@ -3862,6 +4046,7 @@
         "type": "object"
       },
       "ListSavedWorkstreamsResponse": {
+        "description": "One page of saved workstreams.\n\n``total`` counts every row matching the request's search, across all\npages; ``limit`` and ``offset`` echo the page the server applied. A server\nolder than paging sends only ``workstreams``; the defaults keep a newer\nSDK reading it.",
         "properties": {
           "workstreams": {
             "items": {
@@ -3869,6 +4054,21 @@
             },
             "title": "Workstreams",
             "type": "array"
+          },
+          "total": {
+            "default": 0,
+            "title": "Total",
+            "type": "integer"
+          },
+          "limit": {
+            "default": 0,
+            "title": "Limit",
+            "type": "integer"
+          },
+          "offset": {
+            "default": 0,
+            "title": "Offset",
+            "type": "integer"
           }
         },
         "required": [
@@ -3906,6 +4106,11 @@
             ],
             "default": null,
             "title": "Title"
+          },
+          "name": {
+            "default": "",
+            "title": "Name",
+            "type": "string"
           },
           "created": {
             "title": "Created",
@@ -4800,6 +5005,21 @@
           }
         },
         "title": "ListAvailableModelsResponse",
+        "type": "object"
+      },
+      "WorkstreamDeleteResponse": {
+        "description": "Success response of a workstream delete.",
+        "properties": {
+          "deleted": {
+            "description": "ID of the workstream that was deleted",
+            "title": "Deleted",
+            "type": "string"
+          }
+        },
+        "required": [
+          "deleted"
+        ],
+        "title": "WorkstreamDeleteResponse",
         "type": "object"
       },
       "AuthWhoamiResponse": {

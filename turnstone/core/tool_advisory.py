@@ -18,7 +18,13 @@ framing for a drained queued message).
 
 from __future__ import annotations
 
-from typing import Any, Final
+import re
+from typing import TYPE_CHECKING, Any, Final
+
+from turnstone.core.output_guard import surviving_line_ranges
+
+if TYPE_CHECKING:
+    from turnstone.core.output_guard import OutputAssessment
 
 # Priority constants
 PRIORITY_IMPORTANT: Final = "important"
@@ -57,17 +63,23 @@ _USER_INTERJECTION_BODY_MARKER: Final = "\n\nUser message: "
 def render_output_guard_text(meta: dict[str, Any]) -> str:
     """Render an ``output_guard`` system turn's text from its structured *meta*.
 
-    *meta* carries ``{flags, risk_level, annotations, redacted}``.  Returns the
+    *meta* carries ``{flags, risk_level, annotations, redacted}``, and
+    ``result`` when the finding is about one of several results.  Returns the
     operator/model-facing prose — the flag list + risk level, one indented line
     per annotation, and (when credentials were redacted) the do-not-reconstruct
     notice.  This is the text projection of the structured guard finding: the
-    producer (``ChatSession._collect_advisories``) builds *meta* and derives the
-    turn ``content`` from it via this function, so the wire text and the FE
+    producer (:func:`output_guard_advisory`) builds *meta* and derives the turn
+    ``content`` from it via this function, so the wire text and the FE
     guard-finding card cannot drift (both read the same *meta*).
     """
     flags = meta.get("flags") or []
     risk_level = str(meta.get("risk_level") or "none")
-    lines = [f"Output guard: {', '.join(flags)} ({risk_level.upper()})"]
+    result = meta.get("result")
+    where = ""
+    if isinstance(result, dict):
+        tool = f", {result['tool']}" if result.get("tool") else ""
+        where = f" (result {result['index']} of {result['count']}{tool})"
+    lines = [f"Output guard{where}: {', '.join(flags)} ({risk_level.upper()})"]
     for ann in meta.get("annotations") or []:
         lines.append(f"  {ann}")
     if meta.get("redacted"):
@@ -75,6 +87,99 @@ def render_output_guard_text(meta: dict[str, Any]) -> str:
             "Credentials have been redacted. Do not attempt to reconstruct redacted values."
         )
     return "\n".join(lines)
+
+
+# What a label may print as a tool's name: the characters registered names
+# use.  The advisory reaches the model with operator authority, so a name with
+# anything else (a newline in an MCP server's tool name, say) is left out, and
+# the label names the result by position alone.
+_LABEL_TOOL_NAME: Final = re.compile(r"[A-Za-z0-9_.-]{1,128}")
+
+# Added to an output_guard advisory when the result was cut after the guard read
+# it: the task-agent guard reads past the clip so it can redact a credential
+# that straddles it, and the main loop cuts again a result that redaction made
+# longer than its share.  Either way a finding can concern text the model never
+# receives.
+OUTPUT_GUARD_CUT_NOTICE: Final = (
+    "Part of this result was cut before you received it; the finding may concern that part."
+)
+
+
+def render_line_spans(ranges: tuple[tuple[int, int], ...]) -> str:
+    """Line ranges as the advisory names them: ``12-14, 40``."""
+    return ", ".join(str(first) if first == last else f"{first}-{last}" for first, last in ranges)
+
+
+def render_cited_lines(ranges: tuple[tuple[int, int], ...]) -> str:
+    """Name the judge's cited line ranges, never their content.
+
+    Tool output can print numbers of its own (``read_file`` numbers file lines
+    from its offset; search and shell output cite ``path:line``), so the
+    sentence says what its numbers count.  The judge picked the lines after
+    reading the output, which can steer it, and at most
+    :data:`~turnstone.core.output_guard.MAX_CITED_RANGES` ranges survive, so the
+    sentence points without bounding where the model looks.
+    """
+    return (
+        "Flagged lines, counted from the first line of this result and not by any line "
+        f"numbers printed in it: {render_line_spans(ranges)}. Other lines may matter too; "
+        "treat the whole result with the same caution."
+    )
+
+
+def output_guard_advisory(
+    assessment: OutputAssessment,
+    *,
+    received: str | list[Any] | None = None,
+    index: int = 1,
+    count: int = 1,
+    tool: str = "",
+) -> tuple[str, dict[str, Any]]:
+    """Return an ``output_guard`` system turn's text and its structured *meta*.
+
+    Both loops build their advisory here, so one assessment reads the same in
+    either.  The meta is the source of truth: the text derives from it through
+    :func:`render_output_guard_text`, and the FE guard-finding card renders the
+    same meta, so the two cannot drift.  Cited lines (:func:`render_cited_lines`)
+    and :data:`OUTPUT_GUARD_CUT_NOTICE` follow the annotations.
+
+    *received* is the result as the model receives it.  Checked here, once,
+    against the text the guard returned (``assessment.returned_text``): a
+    result cut since then keeps only the citations that still name the same
+    lines (:func:`~turnstone.core.output_guard.surviving_line_ranges`) and gets
+    the cut notice, and a list result gets no citations, since its parts' line
+    numbers are ambiguous once the parts reach the model as one result.
+
+    Every advisory of a step follows the step's last tool result, since a turn's
+    results must stay together on the wire.  When the step returned several,
+    the advisory names its own by position among them (*index* of *count*, from
+    1) and by *tool*, the registered name of the tool that produced it, when it
+    is plain letters, digits, ``_``, ``.`` and ``-``; one result needs no label.
+    """
+    cited = assessment.cited_lines
+    returned = assessment.returned_text
+    cut = False
+    if isinstance(received, list):
+        cited = ()
+    elif isinstance(received, str) and returned is not None:
+        cut = received != returned
+        if cut:
+            cited = surviving_line_ranges(cited, returned, received)
+    annotations = list(assessment.annotations)
+    if cited:
+        annotations.append(render_cited_lines(cited))
+    if cut:
+        annotations.append(OUTPUT_GUARD_CUT_NOTICE)
+    meta: dict[str, Any] = {
+        "flags": list(assessment.flags),
+        "risk_level": assessment.risk_level,
+        "annotations": annotations,
+        "redacted": assessment.sanitized is not None,
+    }
+    if count > 1:
+        label_tool = tool if _LABEL_TOOL_NAME.fullmatch(tool) else ""
+        meta["result"] = {"index": index, "count": count, "tool": label_tool}
+    return render_output_guard_text(meta), meta
 
 
 def render_user_interjection(message: str, priority: str) -> str:

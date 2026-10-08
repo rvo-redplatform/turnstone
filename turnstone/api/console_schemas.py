@@ -185,7 +185,11 @@ class ConsoleCreateWsRequest(BaseModel):
         description="Durable execution requirement; omission inherits the fork source requirement",
     )
     judge_model: str = Field(
-        default="", description="Override judge model alias for this workstream"
+        default="",
+        description=(
+            "Override judge model alias for this workstream; the output guard's LLM "
+            "stage runs on it too unless judge.output_guard_model is set"
+        ),
     )
 
 

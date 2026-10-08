@@ -308,8 +308,9 @@ All verdicts are persisted to the `intent_verdicts` table (migration 012):
 - LLM verdicts are stored when the `intent_verdict` event is delivered
 - The `user_decision` column is updated when the user approves or denies;
   auto-approved rows carry the bypass reason (`policy`, `blanket`,
-  `auto_approve_tools`, `smart_approval`), and rows whose verdict landed only
-  after a newer batch replaced the judge generation carry `superseded`
+  `auto_approve_tools`, `smart_approval`, `unattended_watch`), and rows whose
+  verdict landed only after a newer batch replaced the judge generation carry
+  `superseded`
 - Every stored verdict — including the benign `risk_level = "none"` majority —
   is re-attached to its tool call on history replay, so a reloaded workstream
   shows the same verdict badges the live stream did
@@ -450,7 +451,8 @@ from the output before it enters the conversation.
 
 When `redact_secrets` is enabled (default), detected credentials in tool output
 are replaced with `[REDACTED:<type>]` markers before the output enters the
-conversation. The original unredacted output is never shown to the model.
+conversation. The original unredacted output is never shown to the model, nor
+to the output guard's LLM stage, which reads the redacted text.
 Redaction types: `api_key`, `private_key`, `password`, `secret`.
 
 A URL query or fragment parameter named `token`, `access_token`,
@@ -484,6 +486,42 @@ judge.redact_secrets = true  # auto-redact detected credentials (default)
 
 Configure both at runtime through the admin Judge settings.
 
+The LLM stage (`judge.output_guard_llm`, off by default) runs the model named
+by `judge.output_guard_model`, else the one named by `judge.model`, else the
+session's model; a set alias that is not registered is passed over with a
+warning. On `judge.model` the guard shares that alias's `max_concurrency` with
+the intent judge, and long tool output needs a context window to match, so
+setting `judge.output_guard_model` gives the guard a model of its own. A
+workstream's own judge model (the launcher's judge picker, the create API's
+`judge_model`, the CLI's `--judge-model`) is its `judge.model`, so it runs the
+guard too unless `judge.output_guard_model` is set. The judge reads the tool
+output the model receives: the redacted text where the regex stage redacted a
+credential. Its output cap is that model's own `max_tokens`: the alias's value,
+else the `model.max_tokens` setting (32,768 unless changed), never above the
+model's advertised maximum output. The cap is fitted to the context window the
+prompt leaves, because a server such as vLLM refuses a request whose prompt and
+cap together exceed the window. The prompt is counted generously for that: each
+ASCII digit as a token, other ASCII at 3.5 characters per token, other text by
+its UTF-8 length (a Chinese, Japanese or Korean character as about half a
+token), and a run of base64-like characters at 0.6 tokens a character; then up
+to 1.4 times that, the most the count ran short against four tokenizers on
+code, logs, CSV, JSON, Chinese, Japanese, Korean, Russian and base64. A prompt
+that would fill more than 90% of the window when counted that way skips the LLM
+stage with a labelled `llm_error` row. The cap counts the model's reasoning as
+well as its verdict, so a thinking model that spends all of it also yields a
+labelled `llm_error` row, and the heuristic stage stands.
+
+The judge samples at the effort its alias resolves: the alias's own, else
+`model.reasoning_effort`. On a model that takes a fixed thinking budget, as
+some of Anthropic's do, a resolved effort turns thinking on for every judged
+result, and the request then carries temperature 1.0, which thinking requires,
+whatever the alias sets. The judge reads untrusted output, so that output can
+push each verdict toward the cap, and each judged result can take up to
+`judge.output_guard_llm_timeout`. The main loop judges up to four results of a
+batch at once; a task agent judges its results one at a time. To bound the
+cost and the wait, set the guard alias's effort (or `none`) and a smaller
+`max_tokens`.
+
 ### Merge semantics (heuristic + LLM judge)
 
 The chip is a **merge** of the two detectors (issue #560, "show, annotated"),
@@ -504,11 +542,56 @@ The same merge runs live and on reconnect (both call
 `output_guard.merge_guard_display_payload`), so the chip can't drift between
 the two surfaces.
 
-The MODEL on the other side of the conversation is shown the merged
-`risk_level` + `flags` (via the `GuardAdvisory` spliced into the tool-result
-envelope), but is **never** told the judge cleared a finding — a judge fooled
-into "none" must not get to talk the model out of caution. The judge's
-"benign" verdict is operator-facing only.
+### What the model is shown
+
+The model reads a finding as an `output_guard` system turn after the tool
+results, built only from text the framework wrote. The judge read the
+attacker-controlled output, and the advisory carries operator-level trust, so
+nothing the judge wrote reaches the model: its reasoning and its flags as
+written stay on the chip and in the audit rows. The advisory carries:
+
+- the merged `risk_level`;
+- the heuristic's flags and annotations, unchanged (an admin-defined pattern's
+  annotation included);
+- for each flag only the judge raised, a symbol from a fixed vocabulary and
+  that symbol's one sentence. The judge's prompt lists the vocabulary
+  (`output_guard.JUDGE_SYMBOLS`). A flag outside it shows as `unclassified`,
+  and so does a judge finding that names no flag when nothing else names it.
+  Judge symbols follow the heuristic flags in vocabulary order, at most four
+  per finding;
+- the lines the judge cited, as numbers only. The judge reads the output with
+  each line numbered and may cite `[first, last]` ranges. A range reaches the
+  model only if every line it names reads the same, at the same number, in the
+  text the model receives: the judge reads the redacted text, but the main loop
+  can re-cut a result and a task agent's guard reads past the cut the agent
+  receives, so a range after such a change is dropped rather than renumbered.
+  Ranges merge where they overlap, at most four per finding, and the sentence
+  says the numbers count from the first line of the result, because tool
+  output such as `read_file` prints line numbers of its own. It points without
+  bounding: the judge picked the lines after reading the output, which can
+  steer it, so the sentence asks the model to treat the whole result with the
+  same caution. A tool's own text inside a list result reaches the model as
+  part of one result, so a finding on it cites no lines (the only list result
+  today, `read_file` on an image, holds no tool text). Numbering every line
+  can grow padded output severalfold, so output whose numbered prompt would
+  not fit the judge's window but whose plain one would is judged unnumbered,
+  and that verdict cites no lines;
+- the redaction notice when credentials were redacted.
+
+All of a step's advisories follow its last tool result, because a turn's
+results must stay together on the wire. When a step returned several, each
+advisory names its own result by position, and by tool when the session offers
+a tool of that name, as in `Output guard (result 1 of 3, read_file): ...`; the
+operator's guard card shows the same label. A result the guard did not flag
+gets no entry: no advisory is never a clearance. Text the framework wrote
+itself is not guarded at all: a denial, which quotes the approver's feedback,
+an unknown-tool or agent-mode gate error, and the header `read_file` puts
+before an image.
+
+The judge's flags and lines count only when its own verdict is above "none",
+and the model is **never** told the judge cleared a finding — a judge fooled
+into "none" must not get to talk the model out of caution. The judge's raw
+ranges are not stored, so the chip shows none.
 
 ### SSE event: `output_warning`
 

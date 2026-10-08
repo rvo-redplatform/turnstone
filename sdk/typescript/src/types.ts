@@ -163,7 +163,10 @@ export interface CreateWorkstreamRequest {
   auto_approve?: boolean;
   /** Tool names accepted as a CSV string or array; blanks are removed server-side. */
   auto_approve_tools?: string | string[];
-  /** Override judge model alias for this workstream. */
+  /**
+   * Override judge model alias for this workstream; the output guard's LLM
+   * stage runs on it too unless judge.output_guard_model is set.
+   */
   judge_model?: string;
   /**
    * Owner override for trusted service identities. Ordinary callers remain
@@ -329,6 +332,7 @@ export interface SavedWorkstreamInfo {
   ws_id: string;
   alias?: string | null;
   title?: string | null;
+  name?: string;
   created: string;
   updated: string;
   message_count: number;
@@ -342,12 +346,40 @@ export interface SavedWorkstreamInfo {
   child_count?: number;
   context_tokens?: number;
   context_ratio?: number;
+  project_id?: string | null;
   /** Persona slug the workstream was created with (empty/absent = pre-persona). */
   persona?: string | null;
 }
 
+/** One page of saved workstreams; `total` counts every matching row. A server
+ *  older than paging sends only `workstreams`. */
 export interface ListSavedWorkstreamsResponse {
   workstreams: SavedWorkstreamInfo[];
+  total?: number;
+  limit?: number;
+  offset?: number;
+}
+
+/** Page, search and sort for `listSavedWorkstreams`; omitted fields take the
+ *  server defaults (its page size, newest first). `limit: 0` returns only
+ *  `total`. */
+export interface ListSavedWorkstreamsOptions {
+  limit?: number;
+  offset?: number;
+  /** Case-insensitive substring of the alias, title, name, project name or ws_id. */
+  search?: string;
+  sort?:
+    | "updated"
+    | "name"
+    | "kind"
+    | "persona"
+    | "project"
+    | "model"
+    | "message_count"
+    | "child_count"
+    | "context_ratio"
+    | "ws_id";
+  order?: "asc" | "desc";
 }
 
 // ---------------------------------------------------------------------------
@@ -622,7 +654,10 @@ export interface ConsoleCreateWsRequest {
   resume_ws?: string;
   resume_ws_exact?: boolean;
   required_node_id?: string | null;
-  /** Override judge model alias for this workstream. */
+  /**
+   * Override judge model alias for this workstream; the output guard's LLM
+   * stage runs on it too unless judge.output_guard_model is set.
+   */
   judge_model?: string;
 }
 

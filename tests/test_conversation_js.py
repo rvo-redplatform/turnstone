@@ -15,7 +15,10 @@ import json
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from tests._js_harness_helpers import FAKE_DOM, node_skip
+from turnstone.core.watch import build_watch_reminder
 
 _CONVERSATION_JS = (
     Path(__file__).resolve().parent.parent / "turnstone/shared_static/conversation.js"
@@ -70,6 +73,43 @@ def test_watch_card_carries_operator_context_marker() -> None:
         "msg-watch-footer",
     ):
         assert part in body, f"watch card missing {part}"
+
+
+@node_skip
+@pytest.mark.parametrize("output", ["external <script>command output</script>", ""])
+def test_watch_card_renders_output_from_metadata_without_inline_output(output: str) -> None:
+    reminder = build_watch_reminder(
+        watch_id="a" * 32,
+        name="checks",
+        command="echo poll",
+        output=output,
+        poll_count=2,
+        max_polls=100,
+        elapsed_secs=20,
+        stop_on=None,
+        is_final=True,
+        reason="output changed",
+    )
+    script = (
+        FAKE_DOM
+        + f"""
+const conv = await import({json.dumps(_CONVERSATION_JS.as_uri())});
+const reminder = {json.dumps(reminder)};
+const card = conv.buildWatchResultCard(reminder, reminder.text);
+const body = card.querySelector(".msg-watch-body");
+if (body.textContent !== reminder.output) throw new Error("card lost output metadata");
+if (body.children.length) throw new Error("command output was parsed as markup");
+if (!card.querySelector(".msg-watch-footer").textContent.includes("poll 2/100"))
+  throw new Error("card lost poll count");
+"""
+    )
+    result = subprocess.run(
+        ["node", "--input-type=module", "-e", script],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_nudge_marker_shape() -> None:
@@ -710,6 +750,42 @@ def test_builders_emit_conv_vocabulary() -> None:
         assert cls in body, f"builders missing {cls}"
     for stale in ("coord-tool-", "ts-approval-", "verdict-badge"):
         assert stale not in body, f"builders leaked stale vocab: {stale}"
+
+
+@node_skip
+def test_warning_names_one_of_several_results() -> None:
+    """An output-guard card names its result as the model's advisory does
+    (``result 2 of 3, web_fetch``): rendered from the advisory's own meta, the
+    chip's text holds the label the advisory text gives, as plain text."""
+    from turnstone.core.output_guard import OutputAssessment
+    from turnstone.core.tool_advisory import output_guard_advisory
+
+    assessment = OutputAssessment(flags=["pii"], risk_level="low")
+    text, meta = output_guard_advisory(assessment, index=2, count=3, tool="web_fetch")
+    assert "result 2 of 3, web_fetch" in text
+    script = (
+        FAKE_DOM
+        + f"""
+document.createTextNode = text => Object.assign(new FakeElement('text'), {{textContent: text}});
+const conv = await import({json.dumps(_CONVERSATION_JS.as_uri())});
+const chip = conv.buildConvWarning({json.dumps(meta)});
+const read = el => el.textContent + el.children.map(read).join("");
+const shown = read(chip);
+if (!shown.includes("result 2 of 3, web_fetch")) throw new Error("label missing: " + shown);
+if (!shown.includes("LOW")) throw new Error("risk missing: " + shown);
+"""
+    )
+    result = subprocess.run(
+        ["node", "--input-type=module", "-e", script],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    body = _body()
+    start = body.index("export function buildConvWarning(")
+    builder = body[start : body.index("\nexport function ", start + 1)]
+    assert "innerHTML" not in builder
 
 
 def test_approve_all_label_unified() -> None:

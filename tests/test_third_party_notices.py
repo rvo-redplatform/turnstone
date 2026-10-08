@@ -20,6 +20,7 @@ _SHARED = _ROOT / "turnstone/shared_static"
 _VERSIONED_DIR = re.compile(r"(?P<name>[a-z][a-z0-9_-]*)-(?P<version>\d+(?:\.\d+)+)")
 # The name each vendored directory's section header gives, by directory name.
 _NOTICE_NAMES = {
+    "dejavu-sans": "DejaVu Sans",
     "hljs": "highlight.js",
     "hls": "hls.js",
     "inter": "Inter",
