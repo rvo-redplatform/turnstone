@@ -74,6 +74,11 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPO }}
+          # metadata-action's default `latest=auto` adds :latest on tag
+          # events. The ECR repo is IMMUTABLE, so the second build would fail
+          # re-pushing :latest. Explicit tags only.
+          flavor: |
+            latest=false
           # Immutable tags only: the git tag itself (1.8.5-rvoh.1) and the
           # short sha. No :latest / moving branch tags; the ECR repo is
           # IMMUTABLE and the chart pins an exact tag.
