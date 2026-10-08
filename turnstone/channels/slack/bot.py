@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import re
 import time
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
@@ -106,6 +107,42 @@ def _escape_mrkdwn(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _strip_ansi(text: str) -> str:
+    """Drop terminal colour codes the server embeds in tool previews/headers."""
+    return _ANSI_RE.sub("", text)
+
+
+def _approval_detail(item: dict[str, Any], name: str) -> str:
+    """Return the text that tells a human WHAT the tool is about to do.
+
+    The server fills ``preview`` only for multi-line bodies (scripts,
+    file contents).  For the common one-line case -- ``bash: ls /data``,
+    ``read_file: /etc/hosts`` -- the argument lives in ``header`` as
+    ``"<glyph> <func_name>: <args>"`` and ``preview`` is empty, so a
+    card that renders ``preview`` alone shows a bare tool name and asks
+    the operator to approve blind.  Prefer ``preview``; fall back to
+    ``header`` with the glyph and the redundant ``name:`` prefix removed.
+    """
+    preview = _strip_ansi(item.get("preview") or "").strip("\n")
+    if preview.strip():
+        return preview
+    header = _strip_ansi(item.get("header") or "").strip()
+    if not header:
+        return ""
+    # Leading status glyph (U+2699 gear, U+2717 cross, ...) and a space.
+    if not header[0].isalnum():
+        header = header[1:].lstrip()
+    # "bash: cmd" -> "cmd" (the card already names the tool); qualified
+    # forms such as "bash (30s): cmd" keep their qualifier.
+    prefix = f"{name}: "
+    if header.startswith(prefix) and len(header) > len(prefix):
+        header = header[len(prefix):]
+    return header
+
+
 def _sanitize_slack_preview(text: str, max_length: int = 1200) -> str:
     """Escape Slack mrkdwn-sensitive content for safe fenced display.
 
@@ -117,7 +154,7 @@ def _sanitize_slack_preview(text: str, max_length: int = 1200) -> str:
     ``&<>`` for good measure.  Single backticks are kept intact so code
     snippets in plans / tool previews remain readable.
     """
-    text = _escape_mrkdwn(text)
+    text = _escape_mrkdwn(_strip_ansi(text))
     text = text.replace("```", "``\u200b`")
     if len(text) > max_length:
         return text[: max_length - 3] + "..."
@@ -1264,7 +1301,7 @@ class TurnstoneSlackBot:
             raw_name = item.get("approval_label") or item.get("func_name") or "tool"
             name = _escape_mrkdwn(raw_name)
 
-            raw_preview = item.get("preview", "")
+            raw_preview = _approval_detail(item, item.get("func_name") or raw_name)
             preview = (
                 _sanitize_slack_preview(raw_preview, max_length=_APPROVAL_PER_ITEM_PREVIEW)
                 if raw_preview
