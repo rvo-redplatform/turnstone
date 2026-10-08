@@ -71,6 +71,14 @@ spec:
             {{- end }}
           env:
             {{- include "turnstone.db.env" . | nindent 12 }}
+            # Kubernetes service links inject TURNSTONE_CHANNEL_PORT=tcp://<ip>:<port>
+            # for the `turnstone-channel` Service into every pod in the
+            # namespace, and the gateway's CLI reads that variable as its
+            # listen port (int() crashes on the URL). An explicit env var
+            # takes precedence over service links; same reason the ConfigMap
+            # pins TURNSTONE_SERVER_PORT / TURNSTONE_CONSOLE_PORT.
+            - name: TURNSTONE_CHANNEL_PORT
+              value: {{ .Values.channel.port | quote }}
             # Server nodes call back to the gateway for notifications. The
             # default advertise URL is the pod hostname, which nothing can
             # resolve; the Service DNS name is the one logical endpoint.
