@@ -1,11 +1,14 @@
 name: CI
 
+# rvo-redplatform fork: upstream's full suite (13k tests x 3 Python/Postgres
+# jobs, ~20+ min) is not a gate here. Fork PRs are chart/CI/deploy changes
+# plus small cherry-picked fixes that upstream's own CI already covers; the
+# upstream PRs we open from this fork run the real suite there. Kept as a
+# manual workflow (Actions -> CI -> Run workflow) rather than deleted so
+# upstream syncs merge cleanly. publish.yml / docker-publish.yml hang off
+# CI completion and are therefore inert on the fork as well.
 on:
-  push:
-    branches: [main, dev, "stable/*"]
-    tags: ["v*"]
-  pull_request:
-    branches: [main, dev, "stable/*"]
+  workflow_dispatch:
 
 permissions:
   contents: read
