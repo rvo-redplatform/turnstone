@@ -69,3 +69,13 @@ the context window on vLLM-style servers. Through a gateway, set
 helm lint .
 helm template turnstone . -f <your-values.yaml> | kubectl apply --dry-run=server -f -
 ```
+
+## Fork images (rvo-redplatform)
+
+The chart defaults to upstream's `ghcr.io/turnstonelabs/turnstone`. Patched
+runtimes are built by `.github/workflows/docker-publish-rvoh.yml` from a
+release branch `rvoh/<upstream-version>` (the upstream tag plus cherry-picked
+fixes plus that workflow file) when a `<upstream-version>-rvoh.<n>` tag is
+pushed, and land at `ghcr.io/rvo-redplatform/turnstone:<tag>`. Point
+`image.repository` / `image.tag` at that in the Argo Application. `dev` tracks
+upstream and carries the chart; it is not what the image is built from.

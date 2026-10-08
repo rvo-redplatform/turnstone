@@ -1,0 +1,79 @@
+# Fork-only image publish for the rvo-redplatform runtime.
+#
+# Upstream's docker-publish.yml only fires for `v*` release tags after the
+# full CI run, so no image is ever built from this fork by default. We deploy
+# patched builds of an upstream release: this workflow builds whatever commit
+# a `<upstream-version>-rvoh.<n>` tag points at (e.g. `1.8.5-rvoh.1`) and
+# pushes it to ghcr.io/rvo-redplatform/turnstone:<tag>. The tags carry no
+# leading `v`, so upstream's CI tag filter and publish gate ignore them.
+#
+# The workflow file must exist in the tagged commit, so release branches
+# (`rvoh/<version>`) carry this file alongside the cherry-picked fixes.
+#
+#   git checkout -b rvoh/1.8.5 v1.8.5
+#   git cherry-pick <fix commits> <this workflow's commit>
+#   git tag -a 1.8.5-rvoh.1 -m "..." && git push origin rvoh/1.8.5 1.8.5-rvoh.1
+#
+# Then set image.repository / image.tag in the Argo Application.
+name: Publish rvoh image
+
+on:
+  push:
+    tags:
+      - "*-rvoh.*"
+  workflow_dispatch:
+
+concurrency:
+  group: docker-rvoh-${{ github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Compute image tag
+        id: tags
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          FULL="${REGISTRY}/${IMAGE_NAME}"
+          FULL="${FULL,,}"
+          if [ "$REF_TYPE" = "tag" ]; then
+            TAG="$REF_NAME"
+          else
+            # Manual run from a branch: immutable sha tag only.
+            TAG="sha-$(git rev-parse --short=12 HEAD)"
+          fi
+          echo "tags=${FULL}:${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Publishing ${FULL}:${TAG}"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+
+      - name: Build and push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
