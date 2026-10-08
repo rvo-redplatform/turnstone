@@ -1,0 +1,94 @@
+# Builds the Turnstone image from this fork and pushes it to ECR (rp-tools
+# nonprod account), mirroring rvo-redplatform/Switchyard's
+# publish-ecr-image.yml. The turnstone Argo Application in
+# eks-rp-tools-nonprod-crds pulls from this registry.
+#
+# Registry : 543248655649.dkr.ecr.us-east-1.amazonaws.com/turnstone/turnstone
+#            (repo created by tfe_redplatform-tools application/nonprod/ecr.tf)
+# Auth     : OIDC -> arn:aws:iam::543248655649:role/gha (no stored secrets).
+#            The role's trust policy accepts any repo:rvo-redplatform/* subject
+#            and its policy allows ECR push. EKS nodes pull with the node role.
+# Trigger  : push of a `<upstream-version>-rvoh.<n>` tag (e.g. 1.8.5-rvoh.1),
+#            or workflow_dispatch from any branch (sha tag only). No leading
+#            `v`, so upstream's CI tag filter and publish gate ignore these.
+# Arch     : linux/amd64 only; the rp-tools-nonprod nodes are x86_64.
+#
+# Why not upstream's docker-publish.yml: it only fires for v* release tags
+# after the full CI run, so nothing is ever built from this fork by default,
+# and the cluster would keep running ghcr.io/turnstonelabs/turnstone without
+# our patches.
+#
+# Release flow: branch rvoh/<version> from the upstream tag, cherry-pick the
+# fixes and this workflow's commit, tag `<version>-rvoh.<n>`, push branch and
+# tag, then set image.repository / image.tag in the Argo Application.
+
+name: Publish turnstone image to ECR
+
+on:
+  push:
+    tags: ["*-rvoh.*"]
+  workflow_dispatch:
+
+permissions:
+  id-token: write # required for OIDC token exchange
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  AWS_ACCOUNT_ID: "543248655649"
+  ECR_REPO: turnstone/turnstone
+
+concurrency:
+  group: ecr-${{ github.ref_name }}
+  # Never cancel mid-push: a partial multi-tag push leaves the registry
+  # inconsistent.
+  cancel-in-progress: false
+
+jobs:
+  build-and-push:
+    name: Build and push turnstone image to ECR
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/gha
+          role-session-name: turnstone-ecr-publish
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          registries: ${{ env.AWS_ACCOUNT_ID }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPO }}
+          # Immutable tags only: the git tag itself (1.8.5-rvoh.1) and the
+          # short sha. No :latest / moving branch tags; the ECR repo is
+          # IMMUTABLE and the chart pins an exact tag.
+          tags: |
+            type=ref,event=tag
+            type=sha,prefix=sha-,format=short
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          platforms: linux/amd64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
