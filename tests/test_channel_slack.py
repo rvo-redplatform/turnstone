@@ -368,6 +368,56 @@ class TestMrkdwnFieldEscaping:
         assert body.startswith("*Tool Approval Required*")
         assert "```" in body
 
+    def test_approval_card_shows_one_line_bash_command_from_header(self) -> None:
+        """Single-line tool calls carry their arguments in ``header`` with an
+        empty ``preview``; the card must still show the command."""
+        from turnstone.channels.slack.routes import SlackRoute
+        from turnstone.sdk.events import ApproveRequestEvent
+
+        bot, _router, client = _make_bot()
+
+        event = ApproveRequestEvent(
+            ws_id="ws-1",
+            cycle_id="cyc-1",
+            items=[
+                {
+                    "call_id": "c-1",
+                    "func_name": "bash",
+                    "approval_label": "bash",
+                    "header": "\u2699 bash: find /data -type f -name '*.csv' | head -50",
+                    "preview": "",
+                    "needs_approval": True,
+                }
+            ],
+        )
+        route = SlackRoute(channel="C01SAPU5414", user_id="U9", thread_ts="1.2")
+        _run(bot._on_ws_event("ws-1", route, event))  # type: ignore[attr-defined]
+
+        body = client.chat_postMessage.call_args[1]["blocks"][0]["text"]["text"]
+        assert "*bash*" in body
+        assert "```find /data -type f -name '*.csv' | head -50```" in body
+        assert "\u2699" not in body
+
+    def test_approval_card_prefers_preview_and_strips_ansi(self) -> None:
+        from turnstone.channels.slack.bot import _approval_detail
+
+        item = {
+            "func_name": "bash",
+            "header": "\u2699 bash: echo one ... (1 more line)",
+            "preview": "\x1b[2m    echo one\n    echo two\x1b[0m",
+        }
+        assert _approval_detail(item, "bash") == "    echo one\n    echo two"
+        # Qualified headers keep their qualifier; other tools keep their path.
+        assert (
+            _approval_detail({"header": "\u2699 bash (30s): sleep 5", "preview": ""}, "bash")
+            == "bash (30s): sleep 5"
+        )
+        assert (
+            _approval_detail({"header": "\u270e write_file: /tmp/x.txt", "preview": ""}, "write_file")
+            == "/tmp/x.txt"
+        )
+        assert _approval_detail({"header": "", "preview": ""}, "bash") == ""
+
     def test_policy_deny_notice_escapes_names_but_feedback_stays_verbatim(self) -> None:
         from turnstone.channels._routing import PolicyVerdict
         from turnstone.channels.slack.routes import SlackRoute
