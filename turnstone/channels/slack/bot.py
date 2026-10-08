@@ -139,7 +139,7 @@ def _approval_detail(item: dict[str, Any], name: str) -> str:
     # forms such as "bash (30s): cmd" keep their qualifier.
     prefix = f"{name}: "
     if header.startswith(prefix) and len(header) > len(prefix):
-        header = header[len(prefix):]
+        header = header[len(prefix) :]
     return header
 
 

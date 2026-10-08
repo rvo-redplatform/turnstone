@@ -413,7 +413,9 @@ class TestMrkdwnFieldEscaping:
             == "bash (30s): sleep 5"
         )
         assert (
-            _approval_detail({"header": "\u270e write_file: /tmp/x.txt", "preview": ""}, "write_file")
+            _approval_detail(
+                {"header": "\u270e write_file: /tmp/x.txt", "preview": ""}, "write_file"
+            )
             == "/tmp/x.txt"
         )
         assert _approval_detail({"header": "", "preview": ""}, "bash") == ""
