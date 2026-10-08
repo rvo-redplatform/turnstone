@@ -263,6 +263,9 @@ class TestGetOrCreateWorkstream:
         mock_create.assert_awaited_once()
         call_kwargs = mock_create.call_args[1]
         assert call_kwargs["resume_ws"] == "ws-stale"
+        # The fork's alias must not collide with the saved source, which still
+        # owns the channel's fixed name: finalize would refuse it (409).
+        assert call_kwargs["name"] == "test-ws-sta"
 
     @pytest.mark.anyio
     async def test_missing_stale_source_retries_fresh_via_server(
