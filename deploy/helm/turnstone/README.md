@@ -69,3 +69,16 @@ the context window on vLLM-style servers. Through a gateway, set
 helm lint .
 helm template turnstone . -f <your-values.yaml> | kubectl apply --dry-run=server -f -
 ```
+
+## Fork images (rvo-redplatform)
+
+The chart defaults to upstream's `ghcr.io/turnstonelabs/turnstone`. Patched
+runtimes are built by `.github/workflows/publish-ecr-image.yml` (same pattern
+as the Switchyard fork: GitHub OIDC into the nonprod account's `gha` role) from
+a release branch `rvoh/<upstream-version>` -- the upstream tag plus
+cherry-picked fixes plus that workflow file -- when a
+`<upstream-version>-rvoh.<n>` tag is pushed. Images land at
+`543248655649.dkr.ecr.us-east-1.amazonaws.com/turnstone/turnstone:<tag>`
+(ECR repo in `tfe_redplatform-tools` `application/nonprod/ecr.tf`). Point
+`image.repository` / `image.tag` at that in the Argo Application. `dev` tracks
+upstream and carries the chart; it is not what the image is built from.
