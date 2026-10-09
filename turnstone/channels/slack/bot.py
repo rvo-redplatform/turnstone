@@ -44,6 +44,7 @@ from turnstone.channels._routing import (
     pop_ws_entries,
 )
 from turnstone.channels._sse import run_sse_stream
+from turnstone.channels.slack.format import blocks_fallback, markdown_to_blocks
 from turnstone.channels.slack.routes import SlackRoute
 from turnstone.core.log import get_logger
 from turnstone.sdk._types import TurnstoneAPIError
@@ -1408,21 +1409,34 @@ class TurnstoneSlackBot:
     async def send(self, channel_id: str, content: str) -> str:
         route = SlackRoute.parse(channel_id)
 
-        # Notification bodies are server/model-authored text (titles, task
-        # names) with no bot-composed mrkdwn — the whole content is one
-        # untrusted field.  Escape before chunking so broadcast keywords
-        # and raw mention syntax can't resolve on the wire.
-        content = _escape_mrkdwn(content)
+        # Strip the notify wrapper's leading "**Schedule: …**" title line.
+        # _http.py prepends it to scheduled notifications, but the report body
+        # carries its own title, so the wrapper is redundant noise.
+        content = re.sub(r"^\*\*Schedule:.*?\*\*\n", "", content)
+
+        # Render as Block Kit (pretty tables/notes) instead of raw mrkdwn text.
+        # `content` is one untrusted field; format.apply() sanitises it.
+        messages = markdown_to_blocks(content) or [None]
 
         root_ts = route.thread_ts or ""
         first_post_ts = ""
 
-        for i, chunk in enumerate(chunk_message(content, self.config.max_message_length)):
-            resp = await self._client.chat_postMessage(
-                channel=route.channel,
-                thread_ts=root_ts or None,
-                text=chunk,
-            )
+        for i, blocks in enumerate(messages):
+            if blocks is None:
+                # No meaningful blocks (e.g. empty body): fall back to text.
+                resp = await self._client.chat_postMessage(
+                    channel=route.channel,
+                    thread_ts=root_ts or None,
+                    text=content.strip() or "(no output)",
+                )
+            else:
+                # Slack requires a `text` fallback whenever `blocks` are sent.
+                resp = await self._client.chat_postMessage(
+                    channel=route.channel,
+                    thread_ts=root_ts or None,
+                    text=blocks_fallback(blocks),
+                    blocks=blocks,
+                )
             if resp.get("ok"):
                 ts = resp["ts"]
                 if i == 0:
