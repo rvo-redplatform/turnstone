@@ -106,6 +106,4 @@ def test_empty_body_is_marked_for_plain_text() -> None:
 
 def test_blocks_fallback_uses_first_section_text() -> None:
     blocks = _blocks_of(SAMPLE_REPORT)
-    assert blocks_fallback(blocks).startswith(
-        "*AI Data Platform Usage Report - 2026-10-08*"
-    )
+    assert blocks_fallback(blocks).startswith("*AI Data Platform Usage Report - 2026-10-08*")
