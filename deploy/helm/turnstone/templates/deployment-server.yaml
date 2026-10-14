@@ -1,5 +1,9 @@
+{{- $kind := .Values.server.workloadKind | default "Deployment" }}
+{{- if not (or (eq $kind "Deployment") (eq $kind "StatefulSet")) }}
+{{- fail (printf "server.workloadKind must be Deployment or StatefulSet, got %q" $kind) }}
+{{- end }}
 apiVersion: apps/v1
-kind: Deployment
+kind: {{ $kind }}
 metadata:
   name: {{ include "turnstone.fullname" . }}-server
   labels:
@@ -7,6 +11,18 @@ metadata:
     app.kubernetes.io/component: server
 spec:
   replicas: {{ .Values.server.replicas }}
+  {{- if eq $kind "StatefulSet" }}
+  # Stable pod names (…-server-0..N-1) are the point of the StatefulSet: a
+  # restarted node re-registers under the same TURNSTONE_NODE_ID. Pods are
+  # independent nodes with no startup ordering, hence Parallel.
+  serviceName: {{ include "turnstone.server.headlessServiceName" . }}
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
+  {{- else }}
+  strategy:
+    {{- toYaml .Values.server.strategy | nindent 4 }}
+  {{- end }}
   selector:
     matchLabels:
       {{- include "turnstone.selectorLabels" . | nindent 6 }}
@@ -21,12 +37,38 @@ spec:
       labels:
         {{- include "turnstone.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: server
+        {{- with .Values.server.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.server.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
     spec:
       serviceAccountName: {{ include "turnstone.serviceAccountName" . }}
-      {{- if .Values.server.sidecars }}
-      # Sidecars get no service-account token: the pod stops mounting it, and
-      # the server container gets the same token through a volume of its own.
+      # The server runs model-chosen shell commands. Nothing in it needs the
+      # Kubernetes API, so it must not hold a token that could reach it, with
+      # or without sidecars (upstream re-mounts the token into the server
+      # container when sidecars are on; this chart does not).
       automountServiceAccountToken: false
+      terminationGracePeriodSeconds: {{ .Values.server.terminationGracePeriodSeconds }}
+      {{- with (include "turnstone.server.priorityClassName" .) }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- if or .Values.imagePullSecrets .Values.server.imagePullSecrets }}
+      # Chart-wide pull secrets (every pod) plus upstream's server-only list
+      # for sidecar images.
+      imagePullSecrets:
+        {{- with .Values.imagePullSecrets }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- with .Values.server.imagePullSecrets }}
+        {{- include "turnstone.server.imagePullSecrets" $ | trim | nindent 8 }}
+        {{- end }}
+      {{- end }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
       {{- end }}
       {{- with .Values.server.nodeSelector }}
       nodeSelector:
@@ -46,14 +88,14 @@ spec:
       initContainers:
         {{- include "turnstone.server.sidecars" . | trim | nindent 8 }}
       {{- end }}
-      {{- if .Values.server.imagePullSecrets }}
-      imagePullSecrets:
-        {{- include "turnstone.server.imagePullSecrets" . | trim | nindent 8 }}
-      {{- end }}
       containers:
         - name: server
           image: {{ include "turnstone.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.containerSecurityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           # command replaces the image's entrypoint, and with it entrypoint.sh,
           # whose migrations the service and the migrate Job already run; tini
           # is named here so that, as PID 1, it reaps orphaned processes, such
@@ -81,11 +123,9 @@ spec:
             {{- include "turnstone.db.env" . | nindent 12 }}
             # Each replica is a distinct node in the rendezvous ring, so it
             # must advertise an address that reaches *itself*. The Service
-            # DNS name would load-balance across every replica, sending
-            # console traffic routed for node A to an arbitrary pod; the
-            # default (gethostname(), i.e. the pod name) is not resolvable
-            # at all. The pod IP is unique, routable in-cluster, and
-            # re-registered on every start, so churn is self-healing.
+            # DNS name would load-balance across every replica; the pod IP
+            # is unique, routable in-cluster, and re-registered on every
+            # start, so churn is self-healing.
             - name: POD_IP
               valueFrom:
                 fieldRef:
@@ -104,6 +144,27 @@ spec:
             {{- with include "turnstone.oidc.env" . }}
             {{- . | nindent 12 }}
             {{- end }}
+            {{- if .Values.server.nodeIdFromPodName }}
+            # Node identity = pod name. Without this the server derives
+            # `{hostname}_{4hex}` with a fresh suffix on every start, which
+            # nothing outside the pod can map back to it (the disruption
+            # guard relies on this, and so does node affinity).
+            - name: TURNSTONE_NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            {{- end }}
+            {{- with .Values.server.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: workspace
+              mountPath: /workspace
+            {{- with (include "turnstone.configFile.volumeMounts" . | trim) }}
+            {{- . | nindent 12 }}
+            {{- end }}
           readinessProbe:
             httpGet:
               path: /health
@@ -118,47 +179,19 @@ spec:
             periodSeconds: 20
           resources:
             {{- toYaml .Values.server.resources | nindent 12 }}
-          {{- if or .Values.server.sidecars .Values.config.file .Values.config.existingSecret .Values.config.secretMounts }}
-          volumeMounts:
-            {{- if .Values.server.sidecars }}
-            - name: workspace
-              mountPath: /workspace
-            - name: kube-api-access
-              mountPath: /var/run/secrets/kubernetes.io/serviceaccount
-              readOnly: true
-            {{- end }}
-            {{- with (include "turnstone.configFile.volumeMounts" . | trim) }}
-            {{- . | nindent 12 }}
-            {{- end }}
-          {{- end }}
-      {{- if or .Values.server.sidecars .Values.config.file .Values.config.existingSecret .Values.config.secretMounts }}
       volumes:
+        - name: data
+          emptyDir:
+            {{- with .Values.server.persistence.data.sizeLimit }}
+            sizeLimit: {{ . }}
+            {{- end }}
+        # Always present; sidecars (server.sidecars) share it. The image names
+        # /workspace in the model's tool descriptions (TURNSTONE_WORKSPACE).
+        - name: workspace
+          emptyDir:
+            {{- with .Values.server.persistence.workspace.sizeLimit }}
+            sizeLimit: {{ . }}
+            {{- end }}
         {{- with (include "turnstone.configFile.volumes" . | trim) }}
         {{- . | nindent 8 }}
         {{- end }}
-        {{- if .Values.server.sidecars }}
-        # Shared with every sidecar. The image names /workspace in the model's
-        # tool descriptions (TURNSTONE_WORKSPACE), so the paths agree.
-        - name: workspace
-          emptyDir: {}
-        # What automountServiceAccountToken would have mounted, for the server
-        # container only.
-        - name: kube-api-access
-          projected:
-            defaultMode: 420
-            sources:
-              - serviceAccountToken:
-                  path: token
-                  expirationSeconds: 3607
-              - configMap:
-                  name: kube-root-ca.crt
-                  items:
-                    - key: ca.crt
-                      path: ca.crt
-              - downwardAPI:
-                  items:
-                    - path: namespace
-                      fieldRef:
-                        fieldPath: metadata.namespace
-        {{- end }}
-      {{- end }}

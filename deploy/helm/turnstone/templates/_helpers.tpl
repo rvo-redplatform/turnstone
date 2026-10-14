@@ -72,8 +72,31 @@ Determine the PostgreSQL host.
 {{- define "turnstone.postgresql.host" -}}
 {{- if .Values.postgresql.enabled }}
 {{- printf "%s-postgresql" .Release.Name }}
+{{- else if and .Values.cnpg.enabled (not .Values.database.external.host) }}
+{{- printf "%s-rw" (include "turnstone.cnpg.clusterName" .) }}
 {{- else }}
 {{- .Values.database.external.host }}
+{{- end }}
+{{- end }}
+
+{{/*
+Name of the chart-managed CloudNativePG Cluster (cnpg.enabled).
+*/}}
+{{- define "turnstone.cnpg.clusterName" -}}
+{{- .Values.cnpg.name | default (printf "%s-db" (include "turnstone.fullname" .)) | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{/*
+The Secret an external database's password comes from: an explicit
+database.external.existingSecret, else -- when the chart manages a CNPG
+Cluster -- the `<cluster>-app` basic-auth Secret CNPG generates for the
+initdb owner (key "password"). Empty when neither applies.
+*/}}
+{{- define "turnstone.db.externalSecret" -}}
+{{- if .Values.database.external.existingSecret }}
+{{- .Values.database.external.existingSecret }}
+{{- else if .Values.cnpg.enabled }}
+{{- printf "%s-app" (include "turnstone.cnpg.clusterName" .) }}
 {{- end }}
 {{- end }}
 
@@ -130,7 +153,7 @@ authenticate with it.
 {{- define "turnstone.db.inlinePassword" -}}
 {{- if .Values.postgresql.enabled }}
 {{- .Values.postgresql.auth.password | default "" }}
-{{- else if not .Values.database.external.existingSecret }}
+{{- else if not (include "turnstone.db.externalSecret" .) }}
 {{- .Values.database.external.password | default "" }}
 {{- end }}
 {{- end }}
@@ -207,8 +230,8 @@ holds LLM API keys and has no reason to carry a database password.
 */}}
 {{- define "turnstone.db.secretName" -}}
 {{- if not .Values.postgresql.enabled }}
-{{- if .Values.database.external.existingSecret }}
-{{- .Values.database.external.existingSecret }}
+{{- if (include "turnstone.db.externalSecret" .) }}
+{{- include "turnstone.db.externalSecret" . }}
 {{- else }}
 {{- printf "%s-secrets" (include "turnstone.fullname" .) }}
 {{- end }}
@@ -221,7 +244,7 @@ holds LLM API keys and has no reason to carry a database password.
 
 {{- define "turnstone.db.passwordKey" -}}
 {{- if not .Values.postgresql.enabled }}
-{{- if .Values.database.external.existingSecret }}
+{{- if (include "turnstone.db.externalSecret" .) }}
 {{- .Values.database.external.existingSecretPasswordKey | default "password" }}
 {{- else }}
 {{- printf "POSTGRES_PASSWORD" }}
@@ -499,3 +522,30 @@ for the comparison, which is what the image makes of it.
     secretName: {{ $m.name | quote }}
 {{- end }}
 {{- end -}}
+
+{{/*
+Name of the PriorityClass this chart creates (cluster-scoped, so it carries
+the release namespace to stay unique across installs).
+*/}}
+{{- define "turnstone.priorityClassName" -}}
+{{- printf "%s-%s-long-running" .Release.Namespace (include "turnstone.fullname" .) | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{/*
+Effective priorityClassName for server pods: an explicit value wins, else the
+chart's own class when enabled, else nothing.
+*/}}
+{{- define "turnstone.server.priorityClassName" -}}
+{{- if .Values.server.priorityClassName }}
+{{- .Values.server.priorityClassName }}
+{{- else if .Values.priorityClass.enabled }}
+{{- include "turnstone.priorityClassName" . }}
+{{- end }}
+{{- end }}
+
+{{/*
+Headless Service name used by the server StatefulSet.
+*/}}
+{{- define "turnstone.server.headlessServiceName" -}}
+{{- printf "%s-server-headless" (include "turnstone.fullname" .) | trunc 63 | trimSuffix "-" }}
+{{- end }}

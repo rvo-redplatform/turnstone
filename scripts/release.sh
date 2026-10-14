@@ -96,14 +96,18 @@ fi
 # A changed default image is a changed chart, so its patch version moves too:
 # deployments that follow the chart from Git may rebuild it only when the
 # chart's version changes.
-CHART_VERSION=$(sed -n 's/^version: \([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)$/\1/p' "$CHART")
+# rvoh fork: the chart may carry a `-rvoh.N` suffix (see FORK.md); the patch
+# bump applies to X.Y.Z and the suffix is kept as it is.
+CHART_VERSION=$(sed -n 's/^version: \([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\(-rvoh\.[0-9][0-9]*\)\{0,1\}\)$/\1/p' "$CHART")
 if [ -z "$CHART_VERSION" ]; then
-    echo "error: $CHART version is not a plain X.Y.Z" >&2
+    echo "error: $CHART version is not a plain X.Y.Z (or X.Y.Z-rvoh.N)" >&2
     exit 1
 fi
+CHART_BASE_VERSION="${CHART_VERSION%%-*}"
+CHART_VERSION_SUFFIX="${CHART_VERSION#"$CHART_BASE_VERSION"}"
 NEW_CHART_VERSION="$CHART_VERSION"
 if [ "$CURRENT_APP_VERSION" != "$CHART_APP_VERSION" ]; then
-    NEW_CHART_VERSION="${CHART_VERSION%.*}.$(( ${CHART_VERSION##*.} + 1 ))"
+    NEW_CHART_VERSION="${CHART_BASE_VERSION%.*}.$(( ${CHART_BASE_VERSION##*.} + 1 ))$CHART_VERSION_SUFFIX"
 fi
 
 # Detect current version

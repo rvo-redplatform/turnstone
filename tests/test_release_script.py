@@ -121,14 +121,25 @@ def test_release_script_points_main_chart_at_newest_stable_tag(tmp_path: Path) -
     assert 'appVersion: "1.8.10"' in (repo / CHART_PATH).read_text()
 
 
-def test_release_script_bumps_a_two_digit_chart_patch(tmp_path: Path) -> None:
-    chart = CHART.replace("version: 0.3.0", "version: 0.3.9")
+@pytest.mark.parametrize(
+    ("chart_version", "bumped"),
+    [
+        ("0.3.9", "0.3.10"),
+        # rvoh fork: the patch bump applies to X.Y.Z and the suffix is kept.
+        ("0.3.9-rvoh.1", "0.3.10-rvoh.1"),
+        ("0.3.13-rvoh.12", "0.3.14-rvoh.12"),
+    ],
+)
+def test_release_script_bumps_a_two_digit_chart_patch(
+    tmp_path: Path, chart_version: str, bumped: str
+) -> None:
+    chart = CHART.replace("version: 0.3.0", f"version: {chart_version}")
     repo, env = _release_repo(tmp_path, "main", chart=chart)
 
     result = _run_release(repo, env, "1.8.1")
 
     assert result.returncode == 0, result.stderr
-    assert "\nversion: 0.3.10\n" in (repo / CHART_PATH).read_text()
+    assert f"\nversion: {bumped}\n" in (repo / CHART_PATH).read_text()
 
 
 def test_release_script_never_moves_the_app_version_back(tmp_path: Path) -> None:
@@ -156,8 +167,9 @@ def test_release_script_leaves_an_unchanged_chart_alone(tmp_path: Path) -> None:
     assert str(CHART_PATH) not in _git(repo, "show", "--name-only", "HEAD").stdout
 
 
-def test_release_script_requires_a_plain_chart_version(tmp_path: Path) -> None:
-    chart = CHART.replace("version: 0.3.0", "version: 0.3.0-rc1")
+@pytest.mark.parametrize("chart_version", ["0.3.0-rc1", "0.3.0-rvoh", "0.3.0-rvoh.1.2"])
+def test_release_script_requires_a_plain_chart_version(tmp_path: Path, chart_version: str) -> None:
+    chart = CHART.replace("version: 0.3.0", f"version: {chart_version}")
     repo, env = _release_repo(tmp_path, "main", chart=chart)
     before = _git(repo, "rev-parse", "HEAD").stdout.strip()
 
@@ -205,7 +217,8 @@ def test_real_chart_has_the_form_the_script_rewrites() -> None:
     assert len(app_lines) == 1
     assert re.fullmatch(r'appVersion: "[^"#\s]+"', app_lines[0])
     assert len(version_lines) == 1
-    assert re.fullmatch(r"version: \d+\.\d+\.\d+", version_lines[0])
+    # rvoh fork: an optional -rvoh.N suffix, which release.sh carries through.
+    assert re.fullmatch(r"version: \d+\.\d+\.\d+(-rvoh\.\d+)?", version_lines[0])
 
 
 @pytest.mark.parametrize(
