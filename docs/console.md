@@ -781,6 +781,14 @@ List execution history for a task (most recent first). `limit` defaults to 50, m
 
 Status is `dispatched` on success, `failed` with an `error` message (e.g. no reachable nodes) for each attempt that created no workstream, or `disabled` when the schedule was disabled at dispatch, with the reason in `error`: no next firing could be computed, or a one-shot's firing was given up. When a failed firing is retried, and when it is not, is described under the scheduler's architecture above.
 
+#### `POST /v1/api/admin/schedules/{task_id}/run`
+
+Dispatch the stored schedule once, now, the way it would fire. Its timing is left alone: `next_run` and `enabled` do not change, so the next scheduled firing still happens on time. A disabled schedule runs too, so you can try one out before enabling it. A run-now is attempted once and not retried. It lands in the run history like any firing, and `last_run` is set when a workstream is created.
+
+Response: `{"status": "ok", "outcome": "created"}`. Returns `404` if not found, `503` if the console has no scheduler (no storage), or `502` with `{"error": "...", "outcome": "not_created" | "unknown"}` when no node took the workstream. `unknown` means a node may have created it anyway; check the node before running again.
+
+The admin Schedules list has a ▶ button on each row for this, and the edit shelf has a **Run now** button. Both run the saved schedule, not unsaved edits in the shelf.
+
 ---
 
 ## CLI Commands

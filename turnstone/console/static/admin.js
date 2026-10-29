@@ -1217,6 +1217,12 @@ function _renderSchedules(schedules) {
       statusLabel +
       "</span></span>" +
       '<span class="admin-col admin-col-actions">' +
+      '<button type="button" class="admin-kebab-btn sched-run-btn" ' +
+      'data-run-sched="' +
+      escapeHtml(s.task_id) +
+      '" data-sname="' +
+      escapeHtml(s.name) +
+      '" aria-label="Run now" title="Run now">▶</button>' +
       _kebabMenu([
         {
           label: "edit",
@@ -1251,6 +1257,16 @@ function _renderSchedules(schedules) {
   for (let j = 0; j < editBtns.length; j++) {
     editBtns[j].addEventListener("click", function () {
       showEditScheduleModal(this.getAttribute("data-edit-sched"));
+    });
+  }
+  const runNowBtns = container.querySelectorAll("[data-run-sched]");
+  for (let r = 0; r < runNowBtns.length; r++) {
+    runNowBtns[r].addEventListener("click", function () {
+      runScheduleNow(
+        this.getAttribute("data-run-sched"),
+        this.getAttribute("data-sname"),
+        this,
+      );
     });
   }
   const runsBtns = container.querySelectorAll("[data-runs-sched]");
@@ -1292,6 +1308,33 @@ function toggleSchedule(taskId, currentlyEnabled) {
     })
     .catch(function () {
       showToast("Failed to toggle schedule");
+    });
+}
+
+// POST .../run — dispatch the stored schedule once, now; its timing is left
+// alone.  Runs what is saved, so the edit shelf's unsaved changes do not
+// ride along.  btn (optional) is disabled while the dispatch is in flight.
+function runScheduleNow(taskId, name, btn) {
+  if (btn) btn.disabled = true;
+  authFetch(
+    "/v1/api/admin/schedules/" + encodeURIComponent(taskId) + "/run",
+    { method: "POST" },
+  )
+    .then(function (r) {
+      return r.json().then(function (d) {
+        if (!r.ok) throw new Error(d.error || "Run failed");
+        return d;
+      });
+    })
+    .then(function () {
+      showToast("Started ‘" + name + "’");
+      loadAdminSchedules();
+    })
+    .catch(function (err) {
+      showToast("Run failed: " + (err.message || "unknown error"));
+    })
+    .finally(function () {
+      if (btn) btn.disabled = false;
     });
 }
 
@@ -1600,6 +1643,15 @@ function _schWire() {
   document
     .getElementById("sch-submit")
     .addEventListener("click", _submitScheduleShelf);
+  document
+    .getElementById("sch-run-now")
+    .addEventListener("click", function () {
+      runScheduleNow(
+        document.getElementById("sch-id").value,
+        document.getElementById("sch-name").value || "schedule",
+        this,
+      );
+    });
   // Latched only once everything above succeeded: a failed mount is retried
   // on the next open instead of dying on a null builder.
   _schWired = true;
@@ -1620,6 +1672,7 @@ function _schResetForm() {
   document.getElementById("sch-message").value = "";
   document.getElementById("sch-autoapprove").checked = false;
   document.getElementById("sch-enabled").checked = true;
+  document.getElementById("sch-run-now").hidden = true;
   _populateNotifyRows("sch", []);
 }
 
@@ -1732,6 +1785,7 @@ function showEditScheduleModal(taskId) {
       document.getElementById("sch-autoapprove").checked = !!s.auto_approve;
       document.getElementById("sch-enabled").checked = !!s.enabled;
       document.getElementById("sch-enabled-row").hidden = false;
+      document.getElementById("sch-run-now").hidden = false;
       _populateNotifyRows("sch", s.notify_targets || []);
       _schOpen(
         "Edit schedule — " + (s.name || s.task_id),

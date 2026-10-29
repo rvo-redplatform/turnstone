@@ -7531,6 +7531,38 @@ async def admin_list_schedule_runs(request: Request) -> JSONResponse:
     return JSONResponse({"runs": runs})
 
 
+async def admin_run_schedule_now(request: Request) -> JSONResponse:
+    """POST /v1/api/admin/schedules/{task_id}/run — dispatch once, now.
+
+    Runs the stored schedule as it would fire, without touching its timing:
+    next_run and enabled stay as they are.  The attempt is recorded in the
+    run history either way.  A node that took no workstream is a 502 with
+    the reason; ``outcome`` says whether one may have been created anyway.
+    """
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.schedules")
+    if err:
+        return err
+    scheduler = getattr(request.app.state, "scheduler", None)
+    if scheduler is None:
+        return JSONResponse({"error": "Scheduler is not running"}, status_code=503)
+    task_id = request.path_params["task_id"]
+
+    task = storage.get_scheduled_task(task_id)
+    if task is None:
+        return JSONResponse({"error": "Schedule not found"}, status_code=404)
+
+    outcome, error = await asyncio.to_thread(scheduler.run_now, task)
+    if outcome != "created":
+        return JSONResponse({"error": error, "outcome": outcome}, status_code=502)
+    return JSONResponse({"status": "ok", "outcome": outcome})
+
+
 # ---------------------------------------------------------------------------
 # Admin API endpoints — watches (aggregated from nodes)
 # ---------------------------------------------------------------------------
@@ -17816,6 +17848,11 @@ def create_app(
                         methods=["DELETE"],
                     ),
                     Route("/api/admin/schedules/{task_id}/runs", admin_list_schedule_runs),
+                    Route(
+                        "/api/admin/schedules/{task_id}/run",
+                        admin_run_schedule_now,
+                        methods=["POST"],
+                    ),
                     Route("/api/admin/watches", admin_list_watches),
                     Route(
                         "/api/admin/watches/{watch_id}/cancel",

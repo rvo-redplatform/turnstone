@@ -63,6 +63,7 @@ from turnstone.api.schemas import (
     DeleteSettingResponse,
     ListScheduleRunsResponse,
     ListSchedulesResponse,
+    RunScheduleNowResponse,
     ScheduleInfo,
     StatusResponse,
 )
@@ -690,6 +691,14 @@ class AsyncTurnstoneConsole(_BaseClient):
             f"/v1/api/admin/schedules/{task_id}/runs",
             params={"limit": limit},
             response_model=ListScheduleRunsResponse,
+        )
+
+    async def run_schedule_now(self, task_id: str) -> RunScheduleNowResponse:
+        """Dispatch a schedule once now; its timing is left unchanged."""
+        return await self._request(
+            "POST",
+            f"/v1/api/admin/schedules/{task_id}/run",
+            response_model=RunScheduleNowResponse,
         )
 
     # -- governance: roles ---------------------------------------------------
@@ -1633,6 +1642,9 @@ class TurnstoneConsole:
 
     def list_schedule_runs(self, task_id: str, *, limit: int = 50) -> ListScheduleRunsResponse:
         return self._runner.run(self._async.list_schedule_runs(task_id, limit=limit))
+
+    def run_schedule_now(self, task_id: str) -> RunScheduleNowResponse:
+        return self._runner.run(self._async.run_schedule_now(task_id))
 
     # -- governance: roles ---------------------------------------------------
 

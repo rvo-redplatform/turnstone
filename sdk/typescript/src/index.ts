@@ -135,6 +135,7 @@ export type {
   ScheduleRunInfo,
   ListSchedulesResponse,
   ListScheduleRunsResponse,
+  RunScheduleNowResponse,
   RoleInfo,
   CreateRoleOptions,
   UpdateRoleOptions,

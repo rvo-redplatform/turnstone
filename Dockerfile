@@ -6,7 +6,7 @@
 FROM python:3.14-slim
 
 LABEL org.opencontainers.image.title="turnstone" \
-      org.opencontainers.image.description="Multi-node AI orchestration platform"
+  org.opencontainers.image.description="Multi-node AI orchestration platform"
 
 COPY --from=ghcr.io/astral-sh/uv:0.12.23 /uv /uvx /usr/local/bin/
 
@@ -21,14 +21,14 @@ RUN rm -f /etc/dpkg/dpkg.cfg.d/docker
 # WAV the omni chat-audio lane decodes. tini is the container's PID 1 (see
 # ENTRYPOINT).
 RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
-    libpq5 git curl jq man-db manpages procps file ripgrep ffmpeg tini \
-    && rm -rf /var/lib/apt/lists/*
+  libpq5 git curl jq man-db manpages procps file ripgrep ffmpeg tini \
+  && rm -rf /var/lib/apt/lists/*
 
 # Node.js LTS (for npx-based MCP servers like @modelcontextprotocol/server-github)
 COPY --from=node:24-slim /usr/local/bin/node /usr/local/bin/node
 COPY --from=node:24-slim /usr/local/lib/node_modules /usr/local/lib/node_modules
 RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
-    && ln -s ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
+  && ln -s ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
 
 # Non-root user
 RUN useradd --create-home --shell /bin/bash turnstone
@@ -38,12 +38,12 @@ WORKDIR /app
 # Install dependencies first (cached layer — only re-runs when deps change)
 COPY pyproject.toml uv.lock README.md LICENSE NOTICE THIRD-PARTY-NOTICES ./
 RUN uv sync --frozen --no-install-project --no-dev \
-    --no-compile --extra all
+  --no-compile --extra all
 
 # Install the project itself
 COPY turnstone/ turnstone/
 RUN uv sync --frozen --no-dev \
-    --no-compile --extra all
+  --no-compile --extra all
 
 # Compile bytecode in a separate step (avoids fd exhaustion during install)
 RUN python -m compileall -q .venv turnstone/
