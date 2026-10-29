@@ -33,6 +33,7 @@ import type {
   ListScheduleRunsResponse,
   ListSchedulesResponse,
   ListSettingSchemaResponse,
+  RunScheduleNowResponse,
   ListSettingsResponse,
   ListSkillResourcesResponse,
   ListSkillsResponse,
@@ -312,6 +313,10 @@ export class TurnstoneConsole extends BaseClient {
     return this.request("GET", `/v1/api/admin/schedules/${taskId}/runs`, {
       params: { limit: opts?.limit ?? 50 },
     });
+  }
+
+  async runScheduleNow(taskId: string): Promise<RunScheduleNowResponse> {
+    return this.request("POST", `/v1/api/admin/schedules/${taskId}/run`);
   }
 
   // -- Governance: Roles ------------------------------------------------------

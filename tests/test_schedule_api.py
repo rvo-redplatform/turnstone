@@ -25,6 +25,7 @@ from turnstone.console.server import (
     admin_list_schedule_runs,
     admin_list_schedules,
     admin_preview_schedule,
+    admin_run_schedule_now,
     admin_update_schedule,
 )
 from turnstone.core.auth import AuthResult
@@ -76,6 +77,11 @@ def client(storage):
                     Route(
                         "/api/admin/schedules/{task_id}/runs",
                         admin_list_schedule_runs,
+                    ),
+                    Route(
+                        "/api/admin/schedules/{task_id}/run",
+                        admin_run_schedule_now,
+                        methods=["POST"],
                     ),
                 ],
             ),
@@ -808,6 +814,56 @@ class TestScheduleAPI:
         resp = client.get(f"/v1/api/admin/schedules/{task_id}/runs?limit=abc")
         assert resp.status_code == 200
         assert resp.json()["runs"] == []
+
+
+class _FakeScheduler:
+    """Stands in for TaskScheduler.run_now and records the rows it got."""
+
+    def __init__(self, result: tuple[str, str]) -> None:
+        self.result = result
+        self.tasks: list[dict[str, Any]] = []
+
+    def run_now(self, task: dict[str, Any]) -> tuple[str, str]:
+        self.tasks.append(task)
+        return self.result
+
+
+class TestRunScheduleNow:
+    """POST /v1/api/admin/schedules/{task_id}/run — dispatch once, now."""
+
+    def test_runs_the_stored_task_and_leaves_its_timing(self, client, storage):
+        task_id = client.post("/v1/api/admin/schedules", json=_cron_payload()).json()["task_id"]
+        before = storage.get_scheduled_task(task_id)
+        fake = _FakeScheduler(("created", ""))
+        client.app.state.scheduler = fake
+
+        resp = client.post(f"/v1/api/admin/schedules/{task_id}/run")
+
+        assert resp.status_code == 200
+        assert resp.json() == {"status": "ok", "outcome": "created"}
+        assert [t["task_id"] for t in fake.tasks] == [task_id]
+        after = storage.get_scheduled_task(task_id)
+        assert after["next_run"] == before["next_run"]
+        assert after["enabled"] == before["enabled"]
+
+    def test_a_failed_dispatch_is_a_502_with_the_reason(self, client):
+        task_id = client.post("/v1/api/admin/schedules", json=_cron_payload()).json()["task_id"]
+        client.app.state.scheduler = _FakeScheduler(("not_created", "No reachable nodes"))
+
+        resp = client.post(f"/v1/api/admin/schedules/{task_id}/run")
+
+        assert resp.status_code == 502
+        assert resp.json() == {"error": "No reachable nodes", "outcome": "not_created"}
+
+    def test_unknown_schedule_is_404(self, client):
+        client.app.state.scheduler = _FakeScheduler(("created", ""))
+        resp = client.post("/v1/api/admin/schedules/nonexistent_id/run")
+        assert resp.status_code == 404
+
+    def test_no_scheduler_is_503(self, client):
+        task_id = client.post("/v1/api/admin/schedules", json=_cron_payload()).json()["task_id"]
+        resp = client.post(f"/v1/api/admin/schedules/{task_id}/run")
+        assert resp.status_code == 503
 
 
 class TestPreviewSchedule:

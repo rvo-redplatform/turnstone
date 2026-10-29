@@ -744,6 +744,11 @@ export interface ListScheduleRunsResponse {
   runs: ScheduleRunInfo[];
 }
 
+export interface RunScheduleNowResponse {
+  status: string;
+  outcome: string;
+}
+
 // ---------------------------------------------------------------------------
 // Console API — Governance: Roles
 // ---------------------------------------------------------------------------

@@ -326,3 +326,13 @@ class ListScheduleRunsResponse(BaseModel):
     """GET /v1/api/admin/schedules/{task_id}/runs response."""
 
     runs: list[ScheduleRunInfo]
+
+
+class RunScheduleNowResponse(BaseModel):
+    """POST /v1/api/admin/schedules/{task_id}/run response."""
+
+    status: str = "ok"
+    outcome: str = Field(
+        default="created",
+        description="'created'; a 502 carries 'not_created' or 'unknown' with an error",
+    )

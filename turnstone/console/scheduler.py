@@ -123,6 +123,10 @@ class TaskScheduler:
         self._token_manager = token_manager
         self._sdk_clients: dict[str, TurnstoneServer] = {}
         self._last_token: str = ""
+        # Serializes dispatch between the tick thread and run_now callers:
+        # both go through the SDK client cache, which a token rotation
+        # clears and closes.
+        self._dispatch_lock = threading.Lock()
 
     def start(self) -> None:
         """Start the scheduler daemon thread."""
@@ -224,14 +228,15 @@ class TaskScheduler:
                 self._holds = loaded
             self._holds_dirty = False
             due_tasks = self._storage.list_due_tasks(now)
-            for task in due_tasks:
-                try:
-                    self._dispatch_task(task, now)
-                except Exception:
-                    # One bad row must not starve the rest of the tick: an
-                    # unadvanced next_run would make it the earliest due
-                    # task again next tick, and every tick after.
-                    log.exception("scheduler.dispatch_error", task_id=task.get("task_id", ""))
+            with self._dispatch_lock:
+                for task in due_tasks:
+                    try:
+                        self._dispatch_task(task, now)
+                    except Exception:
+                        # One bad row must not starve the rest of the tick: an
+                        # unadvanced next_run would make it the earliest due
+                        # task again next tick, and every tick after.
+                        log.exception("scheduler.dispatch_error", task_id=task.get("task_id", ""))
             self._prune_holds({t["task_id"] for t in due_tasks})
             if self._holds_dirty:
                 self._save_holds()
@@ -257,9 +262,10 @@ class TaskScheduler:
                 # Prune SDK clients for nodes no longer in the cluster
                 if self._sdk_clients and self._collector:
                     live_urls = {n.get("server_url", "") for n in self._collector.get_all_nodes()}
-                    stale = [u for u in self._sdk_clients if u not in live_urls]
-                    for url in stale:
-                        self._sdk_clients.pop(url).close()
+                    with self._dispatch_lock:
+                        stale = [u for u in self._sdk_clients if u not in live_urls]
+                        for url in stale:
+                            self._sdk_clients.pop(url).close()
                     if stale:
                         log.info("scheduler.pruned_sdk_clients", count=len(stale))
         finally:
@@ -268,7 +274,6 @@ class TaskScheduler:
     def _dispatch_task(self, task: dict[str, Any], now: str) -> None:
         """Dispatch a single task as one or more CreateWorkstreamMessages,
         then advance its schedule — or hold it for a retry."""
-        target_mode = task["target_mode"]
         task_id = task["task_id"]
         now_dt = datetime.strptime(now, TS_FMT)
 
@@ -281,13 +286,7 @@ class TaskScheduler:
         if hold is not None and timedelta(0) <= now_dt - hold.last_attempt < self._retry_interval:
             return
 
-        if target_mode == "all":
-            outcome, error = self._dispatch_to_all(task, now)
-        elif target_mode in ("auto", "pool"):
-            outcome, error = self._dispatch_to_pool(task, now)
-        else:
-            # Specific node_id
-            outcome, error = self._dispatch_to_node(task, target_mode, now)
+        outcome, error = self._dispatch_by_target(task, now)
 
         if error:
             if outcome is _Outcome.UNKNOWN:
@@ -326,6 +325,43 @@ class TaskScheduler:
             # the lesser harm.  The failed row says so.
             log.warning("scheduler.dispatch_unresolved", task_id=task_id)
         self._advance(task, now, outcome)
+
+    def run_now(self, task: dict[str, Any]) -> tuple[str, str]:
+        """Dispatch *task* once, now, outside its timing.
+
+        The schedule is left as it is: next_run, enabled and any held
+        firing are untouched, so a run-now neither consumes nor delays the
+        next scheduled firing.  A disabled schedule runs too — trying one
+        out before enabling it is the point.  No retry: the caller sees the
+        outcome and can try again.  Returns the outcome's value and, short
+        of created, what happened; both also land in the run history.
+        """
+        task_id = task["task_id"]
+        now = datetime.now(UTC).strftime(TS_FMT)
+        with self._dispatch_lock:
+            outcome, error = self._dispatch_by_target(task, now)
+        if error:
+            self._record_failure(task, now, error)
+        if outcome is _Outcome.CREATED:
+            self._storage.update_scheduled_task(task_id, last_run=now)
+            log.info(
+                "scheduler.task_run_now",
+                task_id=task_id,
+                target_mode=task["target_mode"],
+                created_by=task.get("created_by", ""),
+                auto_approve=bool(task.get("auto_approve", 0)),
+            )
+        return outcome.value, error
+
+    def _dispatch_by_target(self, task: dict[str, Any], now: str) -> tuple[_Outcome, str]:
+        """One dispatch attempt, routed by the task's target mode."""
+        target_mode = task["target_mode"]
+        if target_mode == "all":
+            return self._dispatch_to_all(task, now)
+        if target_mode in ("auto", "pool"):
+            return self._dispatch_to_pool(task, now)
+        # Specific node_id
+        return self._dispatch_to_node(task, target_mode, now)
 
     def _advance(self, task: dict[str, Any], now: str, outcome: _Outcome) -> None:
         """Move the schedule past this firing.  last_run only when a node

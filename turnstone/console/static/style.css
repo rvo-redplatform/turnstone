@@ -977,6 +977,17 @@
   color: var(--accent);
 }
 
+/* Row "run now" trigger: sits left of the kebab, same bordered look. */
+.sched-run-btn {
+  margin-right: 6px;
+  font-size: 10px;
+  padding: 4px 7px;
+}
+.sched-run-btn:disabled {
+  opacity: 0.4;
+  cursor: progress;
+}
+
 /* Watches grid: NAME | NODE | COMMAND | INTERVAL | POLL | CONDITION | STATUS | ACTIONS */
 #admin-watches .admin-colheaders,
 #admin-watches .admin-row {

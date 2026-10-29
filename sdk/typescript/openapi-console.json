@@ -1290,6 +1290,67 @@
         }
       }
     },
+    "/v1/api/admin/schedules/{task_id}/run": {
+      "post": {
+        "summary": "Run a scheduled task once now, leaving its timing unchanged",
+        "operationId": "v1_api_admin_schedules_{task_id}_run_post",
+        "tags": [
+          "Schedules"
+        ],
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunScheduleNowResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Error 502",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/api/admin/roles": {
       "get": {
         "summary": "List all roles",
@@ -10949,6 +11010,24 @@
           "started"
         ],
         "title": "ScheduleRunInfo",
+        "type": "object"
+      },
+      "RunScheduleNowResponse": {
+        "description": "POST /v1/api/admin/schedules/{task_id}/run response.",
+        "properties": {
+          "status": {
+            "default": "ok",
+            "title": "Status",
+            "type": "string"
+          },
+          "outcome": {
+            "default": "created",
+            "description": "'created'; a 502 carries 'not_created' or 'unknown' with an error",
+            "title": "Outcome",
+            "type": "string"
+          }
+        },
+        "title": "RunScheduleNowResponse",
         "type": "object"
       },
       "RoleInfo": {

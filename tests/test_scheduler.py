@@ -980,3 +980,77 @@ class TestSchedulerTick:
         storage.record_task_run.assert_called_once()
         run_kwargs = storage.record_task_run.call_args[1]
         assert run_kwargs["status"] == "failed"
+
+
+class TestRunNow:
+    """run_now dispatches once, outside the timing, and leaves it alone."""
+
+    def _wire_node(self, collector):
+        collector.get_nodes.return_value = ([_make_node()], 1)
+        collector.get_node_detail.return_value = {"server_url": "http://node-001:8080"}
+
+    def test_dispatches_and_sets_only_last_run(self, mocks):
+        collector, storage = mocks
+        self._wire_node(collector)
+        task = _make_task(next_run="2099-01-01T09:00:00")
+
+        scheduler = TaskScheduler(collector, storage)
+        with patch(
+            "turnstone.console.scheduler.TurnstoneServer.create_workstream",
+            return_value=_mock_create_response(),
+        ) as mock_create:
+            outcome, error = scheduler.run_now(task)
+
+        assert (outcome, error) == ("created", "")
+        mock_create.assert_called_once()
+        assert storage.record_task_run.call_args[1]["status"] == "dispatched"
+        storage.update_scheduled_task.assert_called_once()
+        args, kwargs = storage.update_scheduled_task.call_args
+        assert args == ("task_001",)
+        assert set(kwargs) == {"last_run"}
+
+    def test_a_disabled_schedule_still_runs(self, mocks):
+        collector, storage = mocks
+        self._wire_node(collector)
+        task = _make_task(enabled=0, next_run="")
+
+        scheduler = TaskScheduler(collector, storage)
+        with patch(
+            "turnstone.console.scheduler.TurnstoneServer.create_workstream",
+            return_value=_mock_create_response(),
+        ) as mock_create:
+            outcome, _ = scheduler.run_now(task)
+
+        assert outcome == "created"
+        mock_create.assert_called_once()
+        _, kwargs = storage.update_scheduled_task.call_args
+        assert "enabled" not in kwargs and "next_run" not in kwargs
+
+    def test_no_reachable_node_records_failure_and_leaves_the_row(self, mocks):
+        collector, storage = mocks
+        collector.get_nodes.return_value = ([_make_node(reachable=False)], 1)
+
+        scheduler = TaskScheduler(collector, storage)
+        outcome, error = scheduler.run_now(_make_task())
+
+        assert outcome == "not_created"
+        assert error == "No reachable nodes"
+        assert storage.record_task_run.call_args[1]["status"] == "failed"
+        storage.update_scheduled_task.assert_not_called()
+        assert scheduler._holds == {}
+
+    def test_a_5xx_is_unknown_and_not_retried(self, mocks):
+        collector, storage = mocks
+        self._wire_node(collector)
+
+        scheduler = TaskScheduler(collector, storage)
+        with patch(
+            "turnstone.console.scheduler.TurnstoneServer.create_workstream",
+            side_effect=TurnstoneAPIError(502, "Bad Gateway"),
+        ) as mock_create:
+            outcome, error = scheduler.run_now(_make_task())
+
+        assert outcome == "unknown"
+        assert "node-001" in error
+        mock_create.assert_called_once()
+        storage.update_scheduled_task.assert_not_called()
