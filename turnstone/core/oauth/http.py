@@ -332,6 +332,7 @@ async def _hardened_token_post(
     request_label: str,
     endpoint_label: str,
     classify_oversized_by_status: bool = False,
+    headers: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """POST one token-grant request with the shared hardening skeleton.
 
@@ -359,11 +360,16 @@ async def _hardened_token_post(
     pass ``True`` so an over-sized client-error body is AMBIGUOUS (it can't read
     the body to pin PERMANENT without defeating the guard) and still escalates
     to the honest re-login/admin remedy instead of looping "please retry".
+
+    ``headers`` adds request headers, e.g. an ``Authorization: Basic`` client
+    credential (RFC 6749 §2.3.1) for grants that authenticate the client by
+    header rather than in the form body.
     """
     try:
         resp = await http_client.post(
             token_endpoint,
             data=data,
+            headers=headers,
             timeout=_DEFAULT_HTTP_TIMEOUT,
         )
     except (*REQUEST_FAILURES, RuntimeError) as exc:
