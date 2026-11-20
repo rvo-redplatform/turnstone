@@ -6475,6 +6475,11 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
         obo_audience: str = "",
         obo_scopes: str = "",
         max_concurrency: int = 0,
+        oauth_token_url: str = "",
+        oauth_client_id: str = "",
+        oauth_client_secret: str = "",
+        default_headers: str = "{}",
+        session_headers: bool = False,
     ) -> None:
         from sqlalchemy.dialects import postgresql
 
@@ -6501,6 +6506,11 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
                     obo_audience=obo_audience,
                     obo_scopes=obo_scopes,
                     max_concurrency=max_concurrency,
+                    oauth_token_url=oauth_token_url,
+                    oauth_client_id=oauth_client_id,
+                    oauth_client_secret=oauth_client_secret,
+                    default_headers=default_headers,
+                    session_headers=1 if session_headers else 0,
                     created_by=created_by,
                     created=now,
                     updated=now,
@@ -6520,7 +6530,11 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
             if row is None:
                 return None
             return _row_to_dict(
-                row, "enabled", "surface_persisted_reasoning", "replay_reasoning_to_model"
+                row,
+                "enabled",
+                "surface_persisted_reasoning",
+                "replay_reasoning_to_model",
+                "session_headers",
             )
 
     def get_model_definition_by_alias(self, alias: str) -> dict[str, Any] | None:
@@ -6532,7 +6546,11 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
             if row is None:
                 return None
             return _row_to_dict(
-                row, "enabled", "surface_persisted_reasoning", "replay_reasoning_to_model"
+                row,
+                "enabled",
+                "surface_persisted_reasoning",
+                "replay_reasoning_to_model",
+                "session_headers",
             )
 
     def list_model_definitions(self, enabled_only: bool = False) -> list[dict[str, Any]]:
@@ -6544,7 +6562,11 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
             rows = conn.execute(q).fetchall()
             return [
                 _row_to_dict(
-                    r, "enabled", "surface_persisted_reasoning", "replay_reasoning_to_model"
+                    r,
+                    "enabled",
+                    "surface_persisted_reasoning",
+                    "replay_reasoning_to_model",
+                    "session_headers",
                 )
                 for r in rows
             ]
@@ -6567,6 +6589,8 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
             )
         if "replay_reasoning_to_model" in fields:
             fields["replay_reasoning_to_model"] = 1 if fields["replay_reasoning_to_model"] else 0
+        if "session_headers" in fields:
+            fields["session_headers"] = 1 if fields["session_headers"] else 0
         with self._conn() as conn:
             stmt = sa.update(model_definitions).where(
                 model_definitions.c.definition_id == definition_id

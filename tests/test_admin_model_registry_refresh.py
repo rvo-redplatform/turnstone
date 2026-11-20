@@ -4330,6 +4330,11 @@ def test_model_definition_schema_auth_classification(storage: SQLiteBackend) -> 
         "auth_mode",
         "obo_audience",
         "obo_scopes",
+        "oauth_token_url",
+        "oauth_client_id",
+        "oauth_client_secret",
+        "default_headers",
+        "session_headers",
     } == MODEL_DEFINITION_MUTABLE - MODEL_AUTH_NEUTRAL_FIELDS
 
 
@@ -4365,14 +4370,31 @@ def test_every_mutable_column_probes_its_classification(
         "auth_mode": "entra_app",
         "obo_audience": "api://other",
         "obo_scopes": "aud-gw openid",
+        "oauth_token_url": "https://idp.example/oauth2/token",
+        "oauth_client_id": "client-2",
+        "oauth_client_secret": "secret-2",
+        "default_headers": {"x-team": "probe"},
+        "session_headers": True,
     }
     assert set(probes) == set(MODEL_DEFINITION_MUTABLE), (
         "a mutable column has no probe value — add one so its classification "
         "is exercised, not just declared"
     )
+    # Migration 090 columns the console write path does not accept yet: it
+    # drops them, so no caller can write them at all. AI-DP-3009 (console API
+    # for oauth_client_credentials) gates them and empties this set.
+    console_pending = {
+        "oauth_token_url",
+        "oauth_client_id",
+        "oauth_client_secret",
+        "default_headers",
+        "session_headers",
+    }
+    assert console_pending <= MODEL_DEFINITION_MUTABLE
+    assert not (console_pending & MODEL_AUTH_NEUTRAL_FIELDS)
     _stub_console_mcp(monkeypatch)
 
-    for column in sorted(MODEL_DEFINITION_MUTABLE):
+    for column in sorted(MODEL_DEFINITION_MUTABLE - console_pending):
         definition_id = f"probe-{column.replace('_', '-')}"
         _seed_model_def(
             storage,

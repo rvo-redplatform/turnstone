@@ -940,6 +940,16 @@ model_definitions = sa.Table(
     sa.Column("auth_mode", sa.Text, nullable=False, server_default="static"),
     sa.Column("obo_audience", sa.Text, nullable=False, server_default=""),
     sa.Column("obo_scopes", sa.Text, nullable=False, server_default=""),
+    # ``oauth_client_credentials`` mode (migration 090): the per-definition
+    # token endpoint and client, with ``obo_scopes`` as the raw scope. The
+    # secret is a ``secret://`` reference or a literal masked on output.
+    sa.Column("oauth_token_url", sa.Text, nullable=False, server_default=""),
+    sa.Column("oauth_client_id", sa.Text, nullable=False, server_default=""),
+    sa.Column("oauth_client_secret", sa.Text, nullable=False, server_default=""),
+    # JSON object of extra request headers sent on every call (migration 090).
+    sa.Column("default_headers", sa.Text, nullable=False, server_default="{}"),
+    # Send the run's session headers on every call (migration 090).
+    sa.Column("session_headers", sa.Integer, nullable=False, server_default="0"),
     sa.Column("created_by", sa.Text, nullable=False, server_default=""),
     sa.Column("created", sa.Text, nullable=False),
     sa.Column("updated", sa.Text, nullable=False),

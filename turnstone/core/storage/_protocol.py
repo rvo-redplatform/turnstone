@@ -3339,6 +3339,11 @@ class StorageBackend(Protocol):
         obo_audience: str = "",
         obo_scopes: str = "",
         max_concurrency: int = 0,
+        oauth_token_url: str = "",
+        oauth_client_id: str = "",
+        oauth_client_secret: str = "",
+        default_headers: str = "{}",
+        session_headers: bool = False,
     ) -> None:
         """Create a model definition. No-op if definition_id already exists."""
         ...

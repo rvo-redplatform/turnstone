@@ -1659,6 +1659,11 @@ MODEL_DEFINITION_MUTABLE = frozenset(
         "auth_mode",
         "obo_audience",
         "obo_scopes",
+        "oauth_token_url",
+        "oauth_client_id",
+        "oauth_client_secret",
+        "default_headers",
+        "session_headers",
     }
 )
 # Sentinel for ``update_model_definition``'s optional conditional-write
