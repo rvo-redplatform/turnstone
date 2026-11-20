@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 from typing import TYPE_CHECKING, Any
 
 from turnstone.core.log import get_logger
@@ -81,6 +82,7 @@ async def _obo_token_post(
     data: dict[str, str],
     http_client: httpx2.AsyncClient,
     leg: str,
+    headers: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """POST one OBO grant-leg request; classify failures like a refresh.
 
@@ -102,6 +104,7 @@ async def _obo_token_post(
         # looping "please retry" — see _hardened_token_post. (oauth_user keeps
         # the TRANSIENT default.)
         classify_oversized_by_status=True,
+        headers=headers,
     )
 
 
@@ -302,3 +305,97 @@ async def mint_client_credentials(
         http_client=http_client,
         leg="client-credentials",
     )
+
+
+def _scrub_secrets(message: str, secrets: tuple[str, ...]) -> str:
+    """Replace every non-empty *secrets* value in *message* with ``***``."""
+    for value in secrets:
+        if value:
+            message = message.replace(value, "***")
+    return message
+
+
+async def mint_client_credentials_basic(
+    *,
+    token_endpoint: str,
+    client_id: str,
+    client_secret: str,
+    scope: str,
+    http_client: httpx2.AsyncClient,
+) -> dict[str, Any]:
+    """Redeem client credentials for a raw ``scope`` with HTTP Basic client auth.
+
+    The generic RFC 6749 §4.4 client-credentials grant behind the model
+    ``oauth_client_credentials`` auth mode (e.g. AWS Cognito, where the
+    AI-DP gateway scope is ``ai-gateway/invoke``). Unlike
+    :func:`mint_client_credentials` it sends *scope* verbatim (no Entra
+    ``<audience>/.default``) and authenticates the client with an
+    ``Authorization: Basic`` header (RFC 6749 §2.3.1) instead of form fields,
+    so the secret never travels in the body. Cognito accepts Basic (verified
+    live); its tokens last 3600 s and carry no refresh token.
+
+    Returns ``{"access_token": str}`` plus ``"expires_in": int`` when the AS
+    sent a positive lifetime (int, float or numeric string). A missing or
+    malformed ``expires_in`` is left out, so the caller's
+    :func:`~turnstone.core.oauth.tokens._expires_at_from_response` applies its
+    default TTL rather than caching forever.
+
+    Raises :class:`~turnstone.core.oauth.http.OAuthRefreshError` (classified as
+    by :func:`_hardened_token_post`) on transport, status or body failures and
+    on a response without an access token: callers fail closed. Error text
+    never contains the client secret or the encoded Basic credential.
+    """
+    # RFC 6749 §2.3.1 form-encodes id/secret before base64; Cognito ids and
+    # secrets are alphanumeric, and its docs specify the plain pair, so the
+    # pair is encoded as-is (byte-identical for every Cognito credential).
+    basic = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode("ascii")
+    data: dict[str, str] = {"grant_type": "client_credentials"}
+    if scope:
+        data["scope"] = scope
+    secrets = (client_secret, basic)
+    try:
+        resp = await _obo_token_post(
+            token_endpoint=token_endpoint,
+            data=data,
+            http_client=http_client,
+            leg="client-credentials-basic",
+            headers={"Authorization": f"Basic {basic}"},
+        )
+    except oauth_http.OAuthRefreshError as exc:
+        # Defence in depth: some ASes echo request material in error bodies.
+        # _format_as_error already redacts token-shaped values; the raw secret
+        # is not always token-shaped, so scrub it explicitly. ``from None``
+        # keeps a transport exception (which may carry request detail) off
+        # the chain that callers log with exc_info.
+        raise oauth_http.OAuthRefreshError(
+            _scrub_secrets(str(exc), secrets), failure_class=exc.failure_class
+        ) from None
+
+    access_token = resp.get("access_token")
+    if not isinstance(access_token, str) or not access_token:
+        raise oauth_http.OAuthRefreshError(
+            "obo client-credentials-basic response missing access_token"
+        )
+    result: dict[str, Any] = {"access_token": access_token}
+    expires_in = _positive_seconds(resp.get("expires_in"))
+    if expires_in is not None:
+        result["expires_in"] = expires_in
+    return result
+
+
+def _positive_seconds(value: Any) -> int | None:
+    """Parse an ``expires_in`` (int, float or numeric string) as positive seconds."""
+    seconds: int | None = None
+    if isinstance(value, bool):
+        # bool subclasses int: True must not read as a 1-second lifetime.
+        seconds = None
+    elif isinstance(value, int):
+        seconds = value
+    elif isinstance(value, float | str):
+        try:
+            seconds = int(float(value))
+        except (ValueError, OverflowError):  # "abc", nan, inf
+            seconds = None
+    if seconds is None or seconds <= 0:
+        return None
+    return seconds
