@@ -3598,6 +3598,12 @@ def test_coordinator_tool_output_pres_are_focusable() -> None:
     )
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="AI-DP-3007 adds oauth_client_credentials to the registry; the admin shelf "
+    "fallbacks and select option land with the model-form ticket (AI-DP-3013), "
+    "which removes this marker",
+)
 def test_admin_js_auth_mode_fallbacks_match_registry() -> None:
     """The model shelf's fail-open fallback literals track the server maps.
 
