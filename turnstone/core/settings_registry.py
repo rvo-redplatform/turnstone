@@ -95,6 +95,37 @@ def _build_registry() -> dict[str, SettingDef]:
             "configured static key after a mint failure.",
         ),
         SettingDef(
+            "model.oauth_token_url_allowlist",
+            "str",
+            "",
+            "Comma- or newline-separated token endpoint allow-list for "
+            "oauth_client_credentials model auth (empty = deny all)",
+            "model",
+            help="Exact token endpoint URLs that oauth_client_credentials model "
+            "definitions may mint from, for example "
+            "https://<domain>.auth.<region>.amazoncognito.com/oauth2/token. Required "
+            "before an administrator can save that auth mode; when empty, every "
+            "oauth_token_url is refused. Literal match only, with no wildcard or host "
+            "matching. This list replaces the [oidc], grant-profile and audience gates "
+            "for this mode only; the Entra and RFC 8693 modes still use "
+            "model.auth_audience_allowlist.",
+        ),
+        SettingDef(
+            "model.oauth_refresh_margin_seconds",
+            "int",
+            660,
+            "Refresh an oauth_client_credentials token when fewer than this many seconds remain",
+            "model",
+            min_value=60,
+            strict_int=True,
+            help="How early a cached oauth_client_credentials access token is replaced. "
+            "A token with fewer than this many seconds left is re-minted before the next "
+            "model call, so no call starts with a token that could expire mid-request. "
+            "The default of 660 seconds covers a 10-minute call limit plus one minute: "
+            "a 3600-second token is used for 49 minutes. Set it above your gateway's "
+            "longest call duration. Minimum 60.",
+        ),
+        SettingDef(
             "model.temperature",
             "float",
             None,

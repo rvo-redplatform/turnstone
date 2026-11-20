@@ -304,6 +304,23 @@ each. Environment-variable expansion is deliberately not applied, so the
 allow-list decision cannot vary by node or expand beyond the persisted
 boundary.
 
+#### Client-credentials settings
+
+Two settings serve the `oauth_client_credentials` mode, which mints a
+shared token from a definition's own `oauth_token_url`, client ID and secret
+(for example an AWS Cognito app client) rather than from Turnstone's `[oidc]`
+client:
+
+| Setting | Type | Default | Meaning |
+|---------|------|---------|---------|
+| `model.oauth_token_url_allowlist` | str | `""` | Comma- or newline-separated exact token endpoint URLs that definitions may mint from. Empty denies every URL, so an operator must list an endpoint before an admin can save the mode. No wildcard or host matching. |
+| `model.oauth_refresh_margin_seconds` | int | `660` (min `60`) | A cached token with fewer than this many seconds left is re-minted before the next call. 660 s is a 10-minute call limit plus one minute, so a 3600 s token is used for 49 minutes. |
+
+For this mode the token URL allow-list takes the place of the `[oidc]`
+configuration, grant-profile pairing and `model.auth_audience_allowlist`
+gates described above; those gates still apply to the Entra and RFC 8693
+modes.
+
 ### Anthropic workspace scoping
 
 An organization-level Anthropic API key in an organization with several
@@ -436,7 +453,7 @@ initialization:
 
 | Section | Settings |
 |---------|----------|
-| `model` | default_alias, auth_audience_allowlist, auth_fail_closed, temperature, max_tokens, reasoning_effort, task_alias, task_effort, hide_utility_aliases |
+| `model` | default_alias, auth_audience_allowlist, auth_fail_closed, oauth_token_url_allowlist, oauth_refresh_margin_seconds, temperature, max_tokens, reasoning_effort, task_alias, task_effort, hide_utility_aliases |
 | `session` | instructions, retention_days, compact_max_tokens, auto_compact_pct |
 | `tools` | timeout, approval_timeout_seconds, truncation, agent_max_turns, skip_permissions, search, search_threshold, search_max_results |
 | `audio` | stt_model_alias, stt_prompt, tts_model_alias, tts_voice |
