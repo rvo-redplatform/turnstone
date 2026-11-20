@@ -70,7 +70,9 @@ def _deferred_close_actions(actions: list[Callable[[], None]]) -> Iterator[None]
                 log.warning("rerank.deferred_close_failed", exc_info=True)
 
 
-MODEL_AUTH_MODES = frozenset({"static", "entra_obo", "entra_app", "rfc8693_obo"})
+MODEL_AUTH_MODES = frozenset(
+    {"static", "entra_obo", "entra_app", "rfc8693_obo", "oauth_client_credentials"}
+)
 
 # One bound for the backend-auth text columns (obo_audience, obo_scopes),
 # shared with the console write path's cleaner so the two layers cannot
@@ -117,25 +119,36 @@ MAX_MODEL_CONCURRENCY = 2_147_483_647
 # static and skips the write gate entirely.
 DYNAMIC_MODEL_AUTH_MODES = frozenset(MODEL_AUTH_MODES) - {"static"}
 
-# Modes whose mint reads ``obo_scopes`` (the RFC 8693 exchange-leg scope
-# request). The console write path refuses a NEW non-empty obo_scopes on any
-# other mode, and the session dispatch passes scopes to the mint only for
-# members, so a value stored outside this set is inert by construction.
-SCOPES_MODEL_AUTH_MODES = frozenset({"rfc8693_obo"})
+# Modes whose mint reads ``obo_scopes``: the RFC 8693 exchange-leg scope
+# request, and the raw ``scope`` an ``oauth_client_credentials`` grant sends
+# (required there). The console write path refuses a NEW non-empty obo_scopes
+# on any other mode, and the session dispatch passes scopes to the mint only
+# for members, so a value stored outside this set is inert by construction.
+SCOPES_MODEL_AUTH_MODES = frozenset({"rfc8693_obo", "oauth_client_credentials"})
 
 # Modes that mint as the deployment's own app identity — no acting user
 # required. Every OTHER dynamic mode delegates the acting user's credential,
 # so the session's no-user-context refusal derives from this set's
 # complement: an unclassified future mode demands a user and fails closed
 # (loudly wrong for an app-identity mode, silently unsafe never).
-APP_IDENTITY_MODEL_AUTH_MODES = frozenset({"entra_app"})
+APP_IDENTITY_MODEL_AUTH_MODES = frozenset({"entra_app", "oauth_client_credentials"})
+
+# Dynamic modes that mint from their OWN per-definition token endpoint
+# (``oauth_token_url`` / ``oauth_client_id`` / ``oauth_client_secret``) and
+# never touch ``[oidc]``: they have no ``obo_grant_profile`` pairing, need no
+# ``obo_audience``, and are gated by ``model.oauth_token_url_allowlist``
+# instead of the audience allow-list. Every dynamic mode is either here or in
+# MODEL_AUTH_MODE_PROFILES, never both (pinned by
+# test_model_auth_mode_profile_map_matches_mint_legs).
+CLIENT_CREDENTIALS_MODEL_AUTH_MODES = frozenset({"oauth_client_credentials"})
 
 # Required ``[oidc] obo_grant_profile`` per dynamic mode — the type-pairing
 # the console validator enforces when a write CHOOSES a pair, and the grant
 # leg the session pins at mint time. Values are spelled as literals rather
 # than imported from oauth.grants.OBO_GRANT_PROFILES: lightweight consumers
 # import this module and must not pull OAuth protocol dependencies with it; the
-# registry-vs-legs agreement (and full coverage of the dynamic set) is
+# registry-vs-legs agreement (and full coverage of the dynamic set minus
+# CLIENT_CREDENTIALS_MODEL_AUTH_MODES, which pair with no profile) is
 # pinned by test_model_auth_mode_profile_map_matches_mint_legs.
 MODEL_AUTH_MODE_PROFILES: Mapping[str, str] = MappingProxyType(
     {
@@ -344,9 +357,23 @@ class ModelConfig:
     # OpenAI-style). ``obo_audience`` is the exact operator-approved resource
     # identifier; ``obo_scopes`` is the space-separated scope list the
     # rfc8693 exchange leg requests (inert for every other mode).
+    # ``oauth_client_credentials`` mints from this definition's own token
+    # endpoint: ``oauth_token_url`` / ``oauth_client_id`` /
+    # ``oauth_client_secret`` (a ``secret://`` reference or a literal, kept
+    # raw here and resolved at mint time so rotation needs no reload), with
+    # ``obo_scopes`` as the raw ``scope`` it requests; it has no audience.
     auth_mode: str = "static"
     obo_audience: str = ""
     obo_scopes: str = ""
+    oauth_token_url: str = ""
+    oauth_client_id: str = ""
+    oauth_client_secret: str = field(default="", repr=False)
+    # Extra request headers sent on every call of this alias (migration 090),
+    # and whether a run's session headers ride along. The loader checks shape
+    # only (a str -> str map, a real bool); the header-name rules live with
+    # the client construction that sends them.
+    default_headers: dict[str, str] = field(default_factory=dict)
+    session_headers: bool = False
     # Per-process admission limit for this alias.  Zero preserves the
     # historical unlimited behavior.  Operational admission changes do not
     # change binding identity, hence ``compare=False``.
@@ -464,6 +491,24 @@ def _anthropic_workspace_id_of(cfg: ModelConfig) -> str:
     return raw if isinstance(raw, str) else ""
 
 
+def _client_auth_identity(cfg: ModelConfig) -> tuple[object, ...]:
+    """The definition fields beyond ``auth_mode`` a cached client depends on.
+
+    A change to any of them must retire the alias's client on reload, or an
+    edited token endpoint, client, secret, scope, audience or header set would
+    keep serving through the client (and token) built for the old one.
+    """
+    return (
+        cfg.obo_audience,
+        cfg.obo_scopes,
+        cfg.oauth_token_url,
+        cfg.oauth_client_id,
+        cfg.oauth_client_secret,
+        tuple(sorted(cfg.default_headers.items())),
+        cfg.session_headers,
+    )
+
+
 def _normalize_auth_mode(
     alias: str, mode: Any, audience: Any, scopes: Any = ""
 ) -> tuple[str, str, str]:
@@ -496,7 +541,21 @@ def _normalize_auth_mode(
             f"Model '{alias}' has invalid auth_mode {normalized_mode!r}; "
             f"expected one of {sorted(MODEL_AUTH_MODES)}"
         )
-    if normalized_mode != "static" and not normalized_audience:
+    if normalized_mode in CLIENT_CREDENTIALS_MODEL_AUTH_MODES and normalized_audience:
+        # This mode never reads an audience. Dropped (not refused) so a row
+        # switched from entra_app keeps loading, and so no app-identity mint
+        # path keyed on the audience can ever fire for it.
+        log.warning(
+            "Model '%s' has obo_audience but auth_mode %s never uses it; ignoring",
+            alias,
+            normalized_mode,
+        )
+        normalized_audience = ""
+    if (
+        normalized_mode != "static"
+        and normalized_mode not in CLIENT_CREDENTIALS_MODEL_AUTH_MODES
+        and not normalized_audience
+    ):
         raise ModelAuthConfigError(
             f"Model '{alias}' requires obo_audience when auth_mode is {normalized_mode!r}"
         )
@@ -514,7 +573,118 @@ def _normalize_auth_mode(
     tolerated = re.sub(r"[ \t\n\r]+", " ", str(scopes or "")).strip()
     _check_auth_text(alias, "obo_scopes", tolerated)
     normalized_scopes = sanitize_backend_auth_scopes(scopes)
+    if normalized_mode in CLIENT_CREDENTIALS_MODEL_AUTH_MODES and not normalized_scopes:
+        raise ModelAuthConfigError(
+            f"Model '{alias}' requires obo_scopes (the scope to request) when "
+            f"auth_mode is {normalized_mode!r}"
+        )
     return normalized_mode, normalized_audience, normalized_scopes
+
+
+def _normalize_client_credentials(
+    alias: str, mode: str, token_url: Any, client_id: Any, client_secret: Any
+) -> tuple[str, str, str]:
+    """Validate the per-definition client-credentials fields for one model.
+
+    *mode* is the already-normalized auth mode. Shape checks run regardless of
+    mode (the REFUSE policy :func:`_normalize_auth_mode` applies to the
+    audience and scopes); the three fields are REQUIRED only for a
+    :data:`CLIENT_CREDENTIALS_MODEL_AUTH_MODES` member and inert otherwise, like
+    a stale audience on a static row. The token URL is checked for shape only:
+    which endpoints may be used is ``model.oauth_token_url_allowlist``'s job,
+    enforced where the secret is actually sent. The secret is kept raw (a
+    ``secret://`` reference is parsed here so a malformed one fails at load,
+    resolved only at mint time); no message quotes it.
+    """
+    from urllib.parse import urlsplit
+
+    from turnstone.core.secret_refs import SecretReferenceError, is_reference, parse_reference
+
+    if client_secret is not None and not isinstance(client_secret, str):
+        raise ModelAuthConfigError(f"Model '{alias}' oauth_client_secret must be a string")
+    normalized_url = str(token_url or "").strip()
+    normalized_client_id = str(client_id or "").strip()
+    normalized_secret = (client_secret or "").strip()
+    _check_auth_text(alias, "oauth_token_url", normalized_url)
+    _check_auth_text(alias, "oauth_client_id", normalized_client_id)
+    _check_auth_text(alias, "oauth_client_secret", normalized_secret)
+    if mode not in CLIENT_CREDENTIALS_MODEL_AUTH_MODES:
+        return normalized_url, normalized_client_id, normalized_secret
+    missing = [
+        name
+        for name, value in (
+            ("oauth_token_url", normalized_url),
+            ("oauth_client_id", normalized_client_id),
+            ("oauth_client_secret", normalized_secret),
+        )
+        if not value
+    ]
+    if missing:
+        raise ModelAuthConfigError(
+            f"Model '{alias}' requires {', '.join(missing)} when auth_mode is {mode!r}"
+        )
+    parts = urlsplit(normalized_url)
+    if (
+        parts.scheme not in ("https", "http")
+        or not parts.hostname
+        or parts.username is not None
+        or parts.password is not None
+        or parts.fragment
+        or any(ch.isspace() for ch in normalized_url)
+    ):
+        raise ModelAuthConfigError(
+            f"Model '{alias}' oauth_token_url must be an absolute http(s) URL with a host "
+            "and no credentials or fragment"
+        )
+    if is_reference(normalized_secret):
+        try:
+            parse_reference(normalized_secret)
+        except SecretReferenceError as exc:
+            raise ModelAuthConfigError(
+                f"Model '{alias}' oauth_client_secret is not a valid secret:// reference: {exc}"
+            ) from exc
+    return normalized_url, normalized_client_id, normalized_secret
+
+
+def _normalize_request_headers(
+    alias: str, default_headers: Any, session_headers: Any
+) -> tuple[dict[str, str], bool]:
+    """Shape-check one model's request-header settings (migration 090).
+
+    ``default_headers`` arrives as the stored JSON text (DB) or a TOML table;
+    either must be an object of string names to string values, else the alias
+    is refused loud rather than silently sending (or dropping) headers.
+    ``session_headers`` must be a real bool. Header-name policy (credential
+    and Turnstone-owned names) is enforced where the client is built.
+    """
+    import json
+
+    raw = default_headers
+    if raw is None or raw == "":
+        raw = {}
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (ValueError, RecursionError) as exc:
+            raise ModelAuthConfigError(
+                f"Model '{alias}' default_headers is not valid JSON"
+            ) from exc
+    if not isinstance(raw, dict):
+        raise ModelAuthConfigError(f"Model '{alias}' default_headers must be an object")
+    headers: dict[str, str] = {}
+    for name, value in raw.items():
+        if not isinstance(name, str) or not name or not isinstance(value, str):
+            raise ModelAuthConfigError(
+                f"Model '{alias}' default_headers must map header names to string values"
+            )
+        headers[name] = value
+    if session_headers is None:
+        session_headers = False
+    if type(session_headers) is int and session_headers in (0, 1):
+        session_headers = bool(session_headers)
+    if type(session_headers) is not bool:
+        raise ModelAuthConfigError(f"Model '{alias}' session_headers must be true or false")
+    return headers, session_headers
 
 
 def _api_surface_of(cfg: ModelConfig) -> str | None:
@@ -592,6 +762,10 @@ class _RerankRuntimeConfig:
     auth_mode: str
     obo_audience: str
     obo_scopes: str
+    oauth_token_url: str
+    oauth_client_id: str
+    oauth_client_secret: str = field(repr=False)
+    default_headers: tuple[tuple[str, str], ...]
     rerank_mode: str
     supports_rerank: bool
     supports_prefill_rerank: bool
@@ -609,6 +783,10 @@ def _rerank_runtime_config(cfg: ModelConfig, instruction: str) -> _RerankRuntime
         auth_mode=cfg.auth_mode,
         obo_audience=cfg.obo_audience,
         obo_scopes=cfg.obo_scopes,
+        oauth_token_url=cfg.oauth_token_url,
+        oauth_client_id=cfg.oauth_client_id,
+        oauth_client_secret=cfg.oauth_client_secret,
+        default_headers=tuple(sorted(cfg.default_headers.items())),
         rerank_mode=str(caps.get("rerank_mode") or "endpoint"),
         supports_rerank=bool(caps.get("supports_rerank")),
         supports_prefill_rerank=bool(caps.get("supports_prefill_rerank")),
@@ -1118,8 +1296,8 @@ class ModelRegistry:
             # split old and new work across two independent limits.
             # Selective teardown — close + drop only clients whose
             # construction/connection target changed (alias removed, or
-            # base_url / api_key / provider / auth_mode / workspace scope
-            # differs). Keeps connection pools warm for the common admin-edit
+            # base_url / api_key / provider / auth mode or its endpoint and
+            # credential fields / workspace scope / request headers differs). Keeps connection pools warm for the common admin-edit
             # case where only ``model`` / ``temperature`` / ``context_window``
             # changed.
             for alias, client in list(self._clients.items()):
@@ -1132,6 +1310,7 @@ class ModelRegistry:
                     or old_cfg.api_key != new_cfg.api_key
                     or old_cfg.provider != new_cfg.provider
                     or old_cfg.auth_mode != new_cfg.auth_mode
+                    or _client_auth_identity(old_cfg) != _client_auth_identity(new_cfg)
                     or _anthropic_workspace_id_of(old_cfg) != _anthropic_workspace_id_of(new_cfg)
                 ):
                     if hasattr(client, "close"):
@@ -1189,6 +1368,11 @@ def _resolve_env_vars(value: str) -> str:
     return _ENV_PLACEHOLDER_RE.sub(_replace, value)
 
 
+# Stored fields where a ``secret://`` reference is legal (its resolver refuses
+# ``${VAR}`` inside one).
+_REFERENCE_FIELDS = frozenset({"api_key", "oauth_client_secret"})
+
+
 def stored_definition_error(row: Mapping[str, Any]) -> str:
     """Why a stored model definition *row* cannot load, or ``""``.
 
@@ -1211,10 +1395,16 @@ def stored_definition_error(row: Mapping[str, Any]) -> str:
             "enter the URL itself, or define the model in config.toml, where a URL that"
             " carries a credential belongs",
         ),
+        (
+            "oauth_client_secret",
+            "enter the secret itself, store a secret:// reference, or define the model in"
+            " config.toml",
+        ),
+        ("oauth_token_url", "enter the URL itself, or define the model in config.toml"),
     ):
         value = str(row.get(name) or "")
         match = _ENV_PLACEHOLDER_RE.search(value)
-        if match is None or (name == "api_key" and is_reference(value)):
+        if match is None or (name in _REFERENCE_FIELDS and is_reference(value)):
             continue
         return (
             f"{name} contains {match.group(0)}, which model definitions saved in the "
@@ -1468,14 +1658,22 @@ def _probe_context_window(cfg: ModelConfig) -> tuple[int | None, str]:
 
 
 def _same_endpoint(a: ModelConfig, b: ModelConfig) -> bool:
-    """Same provider, host, model and workspace scope — a different scope may
-    be served by a different backend, so a detected window never crosses it."""
-    return (a.provider, a.base_url.rstrip("/"), a.model, _anthropic_workspace_id_of(a)) == (
-        b.provider,
-        b.base_url.rstrip("/"),
-        b.model,
-        _anthropic_workspace_id_of(b),
-    )
+    """Same provider, host, model, workspace scope, token endpoint, client and
+    default headers — any of these may select a different backend (a gateway
+    routes on its caller and headers), so a detected window never crosses it."""
+
+    def key(c: ModelConfig) -> tuple[object, ...]:
+        return (
+            c.provider,
+            c.base_url.rstrip("/"),
+            c.model,
+            _anthropic_workspace_id_of(c),
+            c.oauth_token_url,
+            c.oauth_client_id,
+            tuple(sorted(c.default_headers.items())),
+        )
+
+    return key(a) == key(b)
 
 
 def _detected_before(
@@ -1799,6 +1997,16 @@ def load_model_registry(
                     row.get("obo_audience"),
                     row.get("obo_scopes"),
                 )
+                row_token_url, row_client_id, row_client_secret = _normalize_client_credentials(
+                    alias,
+                    row_auth_mode,
+                    row.get("oauth_token_url"),
+                    row.get("oauth_client_id"),
+                    row.get("oauth_client_secret"),
+                )
+                row_default_headers, row_session_headers = _normalize_request_headers(
+                    alias, row.get("default_headers"), row.get("session_headers")
+                )
                 row_api_key = _materialize_row_key(
                     alias,
                     row.get("api_key") or api_key,
@@ -1829,6 +2037,11 @@ def load_model_registry(
                     auth_mode=row_auth_mode,
                     obo_audience=row_obo_audience,
                     obo_scopes=row_obo_scopes,
+                    oauth_token_url=row_token_url,
+                    oauth_client_id=row_client_id,
+                    oauth_client_secret=row_client_secret,
+                    default_headers=row_default_headers,
+                    session_headers=row_session_headers,
                     max_concurrency=row.get("max_concurrency", 0),
                 )
         except (ModelAuthConfigError, ModelConcurrencyConfigError):
@@ -1974,6 +2187,16 @@ def load_model_registry(
             entry.get("obo_audience", ""),
             entry.get("obo_scopes", ""),
         )
+        entry_token_url, entry_client_id, entry_client_secret = _normalize_client_credentials(
+            alias,
+            entry_auth_mode,
+            entry.get("oauth_token_url", ""),
+            entry.get("oauth_client_id", ""),
+            entry.get("oauth_client_secret", ""),
+        )
+        entry_default_headers, entry_session_headers = _normalize_request_headers(
+            alias, entry.get("default_headers"), entry.get("session_headers", False)
+        )
         # From here config.toml's entry is the alias's definition, key or no
         # key, so its kind replaces a stored row's (the row's place is kept).
         defined[alias] = serves_chat(
@@ -2010,6 +2233,11 @@ def load_model_registry(
             auth_mode=entry_auth_mode,
             obo_audience=entry_obo_audience,
             obo_scopes=entry_obo_scopes,
+            oauth_token_url=entry_token_url,
+            oauth_client_id=entry_client_id,
+            oauth_client_secret=entry_client_secret,
+            default_headers=entry_default_headers,
+            session_headers=entry_session_headers,
             max_concurrency=entry.get("max_concurrency", 0),
         )
 
