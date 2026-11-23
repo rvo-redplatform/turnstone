@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import re
 import threading
+import time
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -145,6 +146,7 @@ def reset_model_mint_warn_state_for_tests() -> None:
     _MODEL_MINT_LAST_CAUSE.clear()
     with _CC_REJECTED_LOCK:
         _CC_REJECTED_TOKENS.clear()
+        _CC_REMINTED_AFTER_401.clear()
 
 
 def _warn_model_mint_misconfig_once(
@@ -1109,6 +1111,15 @@ _CC_REJECTED_TOKENS: dict[str, str] = {}
 _CC_REJECTED_LOCK = threading.Lock()
 _CC_REJECTED_CAP = 1024
 
+# The token each row last minted BECAUSE of a 401, as (digest, monotonic mint time).
+# If a backend rejects that one too within _CC_REMINT_STREAK_SECONDS, the backend is
+# refusing the client itself (a route grant revoked, say), not one stale token: the
+# next mint arms the 30 s failure cooldown instead of minting again, so a backend that
+# always answers 401 costs at most two mints per cooldown window, not one per call.
+# Same lock as _CC_REJECTED_TOKENS.
+_CC_REMINTED_AFTER_401: dict[str, tuple[str, float]] = {}
+_CC_REMINT_STREAK_SECONDS = 60.0
+
 
 def _token_digest(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
@@ -1160,9 +1171,35 @@ def _cached_token_rejected(cache_server: str, token: str | None) -> bool:
         return _CC_REJECTED_TOKENS.get(cache_server) == _token_digest(token)
 
 
-def _clear_rejected_token(cache_server: str) -> None:
+def _note_minted_token(cache_server: str, token: str, *, after_401: bool) -> None:
+    """Record whether *token* was minted to replace a 401-rejected one, and drop the 401 mark."""
     with _CC_REJECTED_LOCK:
         _CC_REJECTED_TOKENS.pop(cache_server, None)
+        _CC_REMINTED_AFTER_401.pop(cache_server, None)
+        if after_401:
+            if len(_CC_REMINTED_AFTER_401) >= _CC_REJECTED_CAP:
+                del _CC_REMINTED_AFTER_401[next(iter(_CC_REMINTED_AFTER_401))]
+            _CC_REMINTED_AFTER_401[cache_server] = (_token_digest(token), time.monotonic())
+
+
+def _take_repeat_rejection(cache_server: str, rejected_token: str) -> bool:
+    """Whether *rejected_token* was itself a fresh re-mint after a 401 (then forget it).
+
+    True means the backend rejected two tokens in a row: the caller arms the cooldown. The
+    mark is consumed, so the first mint after the cooldown is an ordinary 401 re-mint again.
+    """
+    with _CC_REJECTED_LOCK:
+        mark = _CC_REMINTED_AFTER_401.get(cache_server)
+        if mark is None or mark[0] != _token_digest(rejected_token):
+            return False
+        del _CC_REMINTED_AFTER_401[cache_server]
+        return time.monotonic() - mark[1] < _CC_REMINT_STREAK_SECONDS
+
+
+def _forget_client_credentials_401_state(cache_server: str) -> None:
+    with _CC_REJECTED_LOCK:
+        _CC_REJECTED_TOKENS.pop(cache_server, None)
+        _CC_REMINTED_AFTER_401.pop(cache_server, None)
 
 
 async def _mint_client_credentials_access_token(
@@ -1193,6 +1230,11 @@ async def _mint_client_credentials_access_token(
     cooldown it armed), the cached token is still served until it actually expires
     (the inner ``serve_still_valid``), so an IdP blip does not fail calls a good token covers.
     A 401-rejected token, and a ``force_refresh`` caller, never take that fallback.
+
+    A cached token rejected by a 401 is re-minted once. If the backend also rejects that
+    re-minted token (within ``_CC_REMINT_STREAK_SECONDS``), the next call arms the failure
+    cooldown and refuses with cause ``backend_rejected_token`` instead of minting, so a
+    backend that keeps answering 401 costs at most two mints per cooldown window.
     """
     alias = str(alias or "").strip()
     token_url = strip_control_characters(str(token_url or "")).strip()
@@ -1241,7 +1283,12 @@ async def _mint_client_credentials_access_token(
     # endpoint, client, secret or scope is a clean slate.
     cooldown_key = f"{cache_server}{_SYNTHETIC_KEY_SEP}{audience}{_SYNTHETIC_KEY_SEP}{scope}"
 
+    # The cached token a 401 rejected, if the last cache read found one: the mint that
+    # replaces it is a 401 re-mint (see _CC_REMINTED_AFTER_401).
+    rejected_token: str | None = None
+
     async def serve_cached() -> str | None:
+        nonlocal rejected_token
         token = await _serve_fresh_mint_cache(
             app_state=app_state,
             token_store=token_store,
@@ -1251,9 +1298,21 @@ async def _mint_client_credentials_access_token(
             scopes=scope,
             refresh_margin_seconds=refresh_margin_seconds,
         )
-        if force_refresh or _cached_token_rejected(cache_server, token):
+        rejected_token = token if _cached_token_rejected(cache_server, token) else None
+        if force_refresh or rejected_token:
             return None
         return token
+
+    def refuse_repeat_rejection() -> bool:
+        """Arm the cooldown when the backend rejected a token minted after its last 401."""
+        if not rejected_token or not _take_repeat_rejection(cache_server, rejected_token):
+            return False
+        oauth_tokens._arm_cooldown(coordination, _APP_CACHE_USER, cooldown_key)
+        _record_mint_refusal_cause(
+            "model_app", cause_key, _APP_CACHE_USER, "backend_rejected_token"
+        )
+        log.warning("model_cc.backend_rejected_reminted_token", alias=alias, token_url=token_url)
+        return True
 
     async def serve_still_valid(failure: str) -> str | None:
         """The refresh-ahead fallback after a failed (or cooling-down) mint.
@@ -1282,6 +1341,8 @@ async def _mint_client_credentials_access_token(
     if cached_token:
         oauth_tokens._clear_refresh_backoff(coordination, _APP_CACHE_USER, cooldown_key)
         return cached_token
+    if refuse_repeat_rejection():
+        return None
     if oauth_tokens._refresh_in_cooldown(coordination, _APP_CACHE_USER, cooldown_key):
         return await serve_still_valid("cooldown")
 
@@ -1295,8 +1356,11 @@ async def _mint_client_credentials_access_token(
             if cached_token:
                 oauth_tokens._clear_refresh_backoff(coordination, _APP_CACHE_USER, cooldown_key)
                 return cached_token
+            if refuse_repeat_rejection():
+                return None
             if oauth_tokens._refresh_in_cooldown(coordination, _APP_CACHE_USER, cooldown_key):
                 return await serve_still_valid("cooldown")
+            remint_after_401 = rejected_token is not None
             app_generation = _memo_generation(app_state, _APP_CACHE_USER)
             try:
                 async with oauth_http._enter_mint_client(app_state) as mint_client:
@@ -1354,7 +1418,7 @@ async def _mint_client_credentials_access_token(
                 audience=audience,
                 generation=app_generation,
             )
-            _clear_rejected_token(cache_server)
+            _note_minted_token(cache_server, access_token, after_401=remint_after_401)
             oauth_tokens._clear_refresh_backoff(coordination, _APP_CACHE_USER, cooldown_key)
             _clear_mint_refusal_cause("model_app", cause_key, _APP_CACHE_USER)
             log.info("model_cc.minted", alias=alias, token_url=token_url, expires_at=expires_at)
@@ -1385,7 +1449,7 @@ async def _purge_client_credentials_token(*, app_state: Any, alias: str) -> bool
         and (key[1] == cache_server or key[1].startswith(cache_server + _SYNTHETIC_KEY_SEP))
     ]:
         context.coordination.backoff.pop(key, None)
-    _clear_rejected_token(cache_server)
+    _forget_client_credentials_401_state(cache_server)
     token_store = context.token_store
     if token_store is not None:
         deleted = await durable_write(token_store.delete_user_token, _APP_CACHE_USER, cache_server)
@@ -1592,7 +1656,7 @@ class OAuthModelTokenClient:
         runtime = self.context.runtime
         if runtime is None:
             # No loop ever memoized anything; still drop the DB row and the 401 mark.
-            _clear_rejected_token(model_app_cache_server(str(alias or "").strip()))
+            _forget_client_credentials_401_state(model_app_cache_server(str(alias or "").strip()))
             token_store = self.context.token_store
             if token_store is None or not str(alias or "").strip():
                 return False

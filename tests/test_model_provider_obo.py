@@ -1800,6 +1800,113 @@ class TestBackendRejection401:
         assert len(provider.clients) == 1
 
 
+def _shift_monotonic(monkeypatch: pytest.MonkeyPatch, seconds: float) -> None:
+    """Move time.monotonic (the 30 s cooldown and the 401 streak window) forward."""
+    import time
+
+    real_monotonic = time.monotonic
+    monkeypatch.setattr(time, "monotonic", lambda: real_monotonic() + seconds)
+
+
+def _always_401_calls(
+    state: SimpleNamespace, calls: int
+) -> tuple[_AuthRetryProvider, list[type[BaseException]]]:
+    """Run *calls* model turns against a backend that always answers 401, minting for real."""
+    from turnstone.core.model_turn import model_turn
+    from turnstone.core.trajectory import Turn
+
+    def resolver(alias: str, cfg: Any) -> str:
+        token = _mint_cc(state)
+        if not token:
+            raise BackendAuthUnavailableError("client-credentials token unavailable")
+        return str(token)
+
+    provider = _AuthRetryProvider(failures=10_000)
+    lane = _cc_lane(provider, resolver, _cc_cfg())
+    raised: list[type[BaseException]] = []
+    for _ in range(calls):
+        with pytest.raises((_Status401Error, BackendAuthUnavailableError)) as info:
+            model_turn(lane, [Turn.user("hi")])
+        raised.append(info.type)
+    return provider, raised
+
+
+class TestRepeated401Backoff:
+    """A backend that keeps answering 401 (route grant revoked) must not mint per call."""
+
+    def test_always_401_mints_at_most_twice_per_cooldown_and_fails_closed(
+        self, storage: SQLiteBackend
+    ) -> None:
+        state, client = _cc_state(storage, _cc_tokens(*(f"cc-{i}" for i in range(1, 20))))
+
+        provider, raised = _always_401_calls(state, 6)
+
+        # Call 1 mints cc-1, is rejected, re-mints cc-2 and is rejected again (the second
+        # 401 surfaces). Call 2 sends cc-2, is rejected, and its re-mint finds that cc-2 was
+        # itself a 401 re-mint: the cooldown arms instead. Later calls refuse without HTTP.
+        assert client.post.call_count == 2
+        assert [c.api_key for c in provider.clients] == ["cc-1", "cc-2", "cc-2"]
+        assert raised == [_Status401Error] + [BackendAuthUnavailableError] * 5
+        assert _cc_cause() == "backend_rejected_token"
+
+    def test_after_the_cooldown_a_call_mints_again(
+        self, storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        state, client = _cc_state(storage, _cc_tokens(*(f"cc-{i}" for i in range(1, 20))))
+        _always_401_calls(state, 3)
+        assert client.post.call_count == 2
+
+        _shift_monotonic(monkeypatch, 31)
+        provider, raised = _always_401_calls(state, 3)
+
+        # The first call after the window mints cc-3 (an ordinary 401 re-mint); the backend
+        # rejects it too, so its retry re-arms the cooldown: one mint per window after that.
+        assert client.post.call_count == 3
+        assert [c.api_key for c in provider.clients] == ["cc-3"]
+        assert raised == [BackendAuthUnavailableError] * 3
+        assert _cc_cause() == "backend_rejected_token"
+
+    def test_a_single_stale_token_still_remints_and_recovers(self, storage: SQLiteBackend) -> None:
+        """One 401 followed by a good token never arms the cooldown."""
+        from turnstone.core.model_turn import model_turn
+        from turnstone.core.trajectory import Turn
+
+        state, client = _cc_state(storage, _cc_tokens("cc-1", "cc-2", "cc-3"))
+        provider = _AuthRetryProvider(failures=1)
+        lane = _cc_lane(provider, lambda alias, cfg: _mint_cc(state), _cc_cfg())
+        model_turn(lane, [Turn.user("hi")])
+        model_turn(lane, [Turn.user("hi")])
+        assert [c.api_key for c in provider.clients] == ["cc-1", "cc-2", "cc-2"]
+        assert client.post.call_count == 2
+
+    def test_a_401_long_after_a_remint_is_reminted_not_cooled_down(
+        self, storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Only a re-minted token rejected soon after its mint counts as a repeat 401."""
+        state, client = _cc_state(storage, _cc_tokens("cc-1", "cc-2", "cc-3"))
+        assert _mint_cc(state) == "cc-1"
+        model_oauth.note_client_credentials_token_rejected(CC_ALIAS, "cc-1")
+        assert _mint_cc(state) == "cc-2"
+        _shift_monotonic(monkeypatch, model_oauth._CC_REMINT_STREAK_SECONDS + 1)
+        model_oauth.note_client_credentials_token_rejected(CC_ALIAS, "cc-2")
+        assert _mint_cc(state) == "cc-3"
+        assert client.post.call_count == 3
+
+    def test_purge_forgets_the_repeat_401_state(self, storage: SQLiteBackend) -> None:
+        state, client = _cc_state(storage, _cc_tokens("cc-1", "cc-2", "cc-3"))
+        assert _mint_cc(state) == "cc-1"
+        model_oauth.note_client_credentials_token_rejected(CC_ALIAS, "cc-1")
+        assert _mint_cc(state) == "cc-2"
+        model_oauth.note_client_credentials_token_rejected(CC_ALIAS, "cc-2")
+
+        async def purge() -> bool:
+            return await model_oauth.purge_client_credentials_token(app_state=state, alias=CC_ALIAS)
+
+        assert asyncio.run(purge()) is True
+        assert _mint_cc(state) == "cc-3"
+        assert client.post.call_count == 3
+
+
 # ---------------------------------------------------------------------------
 # ChatSession._model_backend_auth_token — resolve at the model call site
 # ---------------------------------------------------------------------------
