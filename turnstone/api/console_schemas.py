@@ -1546,6 +1546,35 @@ class DetectModelResponse(BaseModel):
     rerank_calibration_note: str | None = None
 
 
+class ModelConnectionTestRequest(BaseModel):
+    """Mint one token for an ``oauth_client_credentials`` definition.
+
+    ``definition_id`` selects a stored row; any other field given overrides it
+    for this test only (nothing is saved). ``oauth_client_secret`` follows the
+    update rules: ``""``, ``***`` or the stored reference keep the stored one.
+    """
+
+    definition_id: str = ""
+    alias: str = ""
+    auth_mode: str = ""
+    oauth_token_url: str = ""
+    oauth_client_id: str = ""
+    oauth_client_secret: str = ""
+    obo_scopes: str = ""
+
+
+class ModelConnectionTestResponse(BaseModel):
+    """Outcome of a Test connection. Never carries the token or the secret."""
+
+    ok: bool = False
+    # Token lifetime in seconds the authorization server reported, when it did.
+    expires_in: int | None = None
+    # Present when ``ok`` is false: a redacted reason and the grant's failure
+    # class (permanent / transient / ambiguous, or unknown).
+    error: str | SkipJsonSchema[None] = Field(default=None)
+    failure_class: str | SkipJsonSchema[None] = Field(default=None)
+
+
 class CalibrateModelResponse(BaseModel):
     separated: bool = False
     suggested_threshold: float | None = None
