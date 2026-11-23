@@ -180,6 +180,24 @@ Then in the Argo Application set `targetRevision: rvoh/1.9.0` and `image.tag: "1
 **together**, so chart and image move as one, and deploy as above. Delete the old
 `rvoh/<version>` branch once nothing runs it.
 
+### Exception: 1.9.4-rvoh.1 was cut from upstream `main`, not tag `v1.9.4`
+
+`rvoh/1.9.4` and its first tag `1.9.4-rvoh.1` (2026-11-23) were **not** made with the
+rebase above. They point straight at `rvoh/dev` commit `80234075`, which is upstream
+`main` `9aae5a3a` plus our series and the AI-DP v1 auth work (oauth_client_credentials,
+default headers, run session headers). Upstream `main` `9aae5a3a` is `v1.9.4` plus 21
+unreleased upstream commits (console, webui and coordinator refactors) that the AI-DP
+work is built on, so replaying it onto `v1.9.4` would have conflicted.
+
+This means:
+
+- `rvoh/1.9.4` has upstream code that isn't in any upstream release, including
+  migration 089 (`audit_events` index). With our 090, the schema head is **090**.
+- Fixes for `rvoh/1.9.4` are still cherry-picked from `rvoh/dev` as in
+  [Releasing a fix](#releasing-a-fix-same-upstream-version), with tags `1.9.4-rvoh.<n>`.
+- At the next upstream release, go back to the normal rebase onto its tag. That tag will
+  already contain these upstream commits.
+
 ## Don'ts
 
 - Don't commit to, merge into or open PRs against `dev`.
