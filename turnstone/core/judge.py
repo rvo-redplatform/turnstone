@@ -1410,7 +1410,7 @@ class IntentJudge:
     # -- Client lifecycle helpers -------------------------------------------
 
     @staticmethod
-    def _extract_client_config(client: Any, provider_name: str) -> dict[str, str]:
+    def _extract_client_config(client: Any, provider_name: str) -> dict[str, Any]:
         """Extract connection config from an existing SDK client for re-creation."""
         from turnstone.core.providers import ANTHROPIC_WORKSPACE_HEADER
 

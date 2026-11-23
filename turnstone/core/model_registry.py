@@ -34,6 +34,7 @@ from turnstone.core.providers import (
     create_client,
     create_provider,
 )
+from turnstone.core.providers.headers import DefaultHeadersError, validate_default_headers
 
 log = get_logger(__name__)
 
@@ -654,8 +655,11 @@ def _normalize_request_headers(
     ``default_headers`` arrives as the stored JSON text (DB) or a TOML table;
     either must be an object of string names to string values, else the alias
     is refused loud rather than silently sending (or dropping) headers.
-    ``session_headers`` must be a real bool. Header-name policy (credential
-    and Turnstone-owned names) is enforced where the client is built.
+    The map must then pass
+    :func:`~turnstone.core.providers.headers.validate_default_headers`
+    (no credential, Turnstone-owned or transport names; values a header can
+    carry), the rule the console applies on save and ``create_client`` applies
+    again when it builds the client. ``session_headers`` must be a real bool.
     """
     import json
 
@@ -678,6 +682,10 @@ def _normalize_request_headers(
                 f"Model '{alias}' default_headers must map header names to string values"
             )
         headers[name] = value
+    try:
+        headers = validate_default_headers(headers)
+    except DefaultHeadersError as exc:
+        raise ModelAuthConfigError(f"Model '{alias}' {exc}") from exc
     if session_headers is None:
         session_headers = False
     if type(session_headers) is int and session_headers in (0, 1):
@@ -889,6 +897,7 @@ class ModelRegistry:
                     base_url=cfg.base_url,
                     api_key=client_key,
                     workspace_id=_anthropic_workspace_id_of(cfg),
+                    default_headers=cfg.default_headers,
                 )
             except ValueError as exc:
                 # create_client's own misconfig errors already carry
@@ -1632,6 +1641,7 @@ def _probe_context_window(cfg: ModelConfig) -> tuple[int | None, str]:
                 static_table=False,
                 timeout=_LOADER_PROBE_TIMEOUT,
                 workspace_id=_anthropic_workspace_id_of(cfg),
+                default_headers=cfg.default_headers,
             ),
             timeout=_LOADER_PROBE_TIMEOUT + 1.0,
             poll=0.05,
@@ -2557,6 +2567,7 @@ def probe_model_endpoint(
     static_table: bool = True,
     timeout: float = 10.0,
     workspace_id: str = "",
+    default_headers: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Stateless probe of a model endpoint.
 
@@ -2584,7 +2595,11 @@ def probe_model_endpoint(
     client = None
     try:
         client = create_client(
-            provider, base_url=base_url, api_key=api_key, workspace_id=workspace_id
+            provider,
+            base_url=base_url,
+            api_key=api_key,
+            workspace_id=workspace_id,
+            default_headers=default_headers,
         )
         fast = client.with_options(timeout=timeout, max_retries=0)
         models = fast.models.list()
