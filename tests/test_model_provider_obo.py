@@ -55,6 +55,7 @@ from turnstone.core.model_registry import (
     load_model_registry,
 )
 from turnstone.core.model_turn import ModelLane, ResolvedModelBinding, resolve_model_binding
+from turnstone.core.oauth import tokens as oauth_tokens
 from turnstone.core.oauth.context import TokenCoordination, oauth_context
 from turnstone.core.session import BackendAuthUnavailableError, ChatSession
 
@@ -1346,6 +1347,27 @@ def _shift_mint_clock(monkeypatch: pytest.MonkeyPatch, seconds: float) -> None:
     monkeypatch.setattr(model_oauth, "datetime", _Shifted)
 
 
+def _shift_cache_clock(monkeypatch: pytest.MonkeyPatch, seconds: float) -> None:
+    """Move both the refresh-margin clock and the cache freshness gate's clock forward."""
+    from datetime import datetime as real_datetime
+    from datetime import timedelta
+
+    class _Shifted(real_datetime):
+        @classmethod
+        def now(cls, tz: Any = None) -> Any:  # type: ignore[override]
+            return real_datetime.now(tz) + timedelta(seconds=seconds)
+
+    monkeypatch.setattr(model_oauth, "datetime", _Shifted)
+    monkeypatch.setattr(oauth_tokens, "datetime", _Shifted)
+
+
+def _cc_cooldown_key() -> str:
+    cache_server = model_oauth.model_app_cache_server(CC_ALIAS)
+    audience = model_oauth.client_credentials_cache_audience(CC_TOKEN_URL, "cc-cid", "cc-secret")
+    sep = model_oauth._SYNTHETIC_KEY_SEP
+    return f"{cache_server}{sep}{audience}{sep}{CC_SCOPE}"
+
+
 class TestMintClientCredentials:
     def test_mints_with_basic_auth_raw_scope_and_caches(self, storage: SQLiteBackend) -> None:
         state, client = _cc_state(storage, _cc_tokens("cc-1"))
@@ -1481,6 +1503,63 @@ class TestMintClientCredentials:
         model_oauth.note_client_credentials_token_rejected(CC_ALIAS, "cc-1")
         assert _mint_cc(state) == "cc-2"
         assert client.post.call_count == 2
+
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            _mk_response(400, {"error": "invalid_client"}),
+            _mk_response(503, {"error": "temporarily_unavailable"}),
+            _mk_response(200, {"token_type": "Bearer", "expires_in": 3600}),
+        ],
+        ids=["invalid_client", "server_error", "missing_access_token"],
+    )
+    def test_failed_refresh_ahead_serves_the_cached_token_until_expiry(
+        self, storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch, failure: MagicMock
+    ) -> None:
+        state, client = _cc_state(storage, [*_cc_tokens("cc-1"), failure, failure])
+        assert _mint_cc(state) == "cc-1"
+        # 600 s left < 660: refresh-ahead mint fails, the unexpired token still serves,
+        # and the cooldown it armed serves it too without another HTTP call.
+        _shift_mint_clock(monkeypatch, 3000)
+        assert _mint_cc(state) == "cc-1"
+        assert _mint_cc(state) == "cc-1"
+        assert client.post.call_count == 2
+        # Past expiry (the freshness gate's clock too): the same failure refuses the call.
+        _shift_cache_clock(monkeypatch, 3700)
+        oauth_tokens._clear_refresh_backoff(
+            oauth_context(state).coordination, "__app__", _cc_cooldown_key()
+        )
+        assert _mint_cc(state) is None
+        assert client.post.call_count == 3
+
+    def test_failed_refresh_ahead_never_serves_a_401_rejected_token(
+        self, storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        state, client = _cc_state(
+            storage, [*_cc_tokens("cc-1"), _mk_response(400, {"error": "invalid_client"})]
+        )
+        assert _mint_cc(state) == "cc-1"
+        _shift_mint_clock(monkeypatch, 3000)
+        model_oauth.note_client_credentials_token_rejected(CC_ALIAS, "cc-1")
+        assert _mint_cc(state) is None
+        # Nor from the cooldown the failure armed.
+        assert _mint_cc(state) is None
+        assert client.post.call_count == 2
+        assert _cc_cause() == "mint_failed"
+
+    def test_failed_forced_mint_does_not_fall_back_to_the_cached_token(
+        self, storage: SQLiteBackend
+    ) -> None:
+        """Test connection forces a mint: its failure must show, not hide behind the cache."""
+        state, client = _cc_state(
+            storage, [*_cc_tokens("cc-1"), _mk_response(400, {"error": "invalid_client"})]
+        )
+        assert _mint_cc(state) == "cc-1"
+        assert _mint_cc(state, force_refresh=True) is None
+        assert client.post.call_count == 2
+        assert _cc_cause() == "mint_failed"
+        # Unforced callers still get the valid cached token.
+        assert _mint_cc(state) == "cc-1"
 
     def test_purge_drops_the_cached_token(self, storage: SQLiteBackend) -> None:
         state, client = _cc_state(storage, _cc_tokens("cc-1", "cc-2"))
