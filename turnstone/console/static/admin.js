@@ -7353,19 +7353,24 @@ function _syncModelAuthFields() {
 
 // ── Client credentials, request headers, Test connection (AI-DP-3013) ──────
 
-// Header names a definition's default_headers may not set, mirroring the
-// console's _RESERVED_DEFAULT_HEADER_NAMES (compared lower-case). The server
-// is the authority; this only names the problem before a round trip.
+// Header names a definition's default_headers may not set, mirroring
+// turnstone/core/providers/headers.py RESERVED_DEFAULT_HEADER_NAMES (compared
+// lower-case), which the console enforces on save. The server is the
+// authority; this only names the problem before a round trip.
 const _MODEL_CREDENTIAL_HEADERS = [
   "authorization",
   "proxy-authorization",
   "x-api-key",
   "api-key",
   "x-goog-api-key",
+  "x-auth-token",
+  "x-amz-security-token",
   "cookie",
 ];
 const _MODEL_TURNSTONE_HEADERS = [
   "anthropic-workspace-id",
+  "anthropic-beta",
+  "anthropic-version",
   "x-switchyard-session-id",
   "x-switchyard-agent-id",
   "x-switchyard-is-subagent",
@@ -7373,8 +7378,14 @@ const _MODEL_TURNSTONE_HEADERS = [
   "host",
   "content-length",
   "content-type",
+  "content-encoding",
   "transfer-encoding",
   "connection",
+  "keep-alive",
+  "te",
+  "trailer",
+  "upgrade",
+  "expect",
 ];
 const _MODEL_HEADERS_MAX = 32;
 // RFC 9110 field-name token, as the server checks it.

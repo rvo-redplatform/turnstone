@@ -3675,7 +3675,7 @@ def _admin_js_const(name: str) -> str:
 
 def test_admin_js_model_header_problems_mirror_server_rules() -> None:
     """AI-DP-3013: the header editor names what the console would refuse."""
-    from turnstone.console.server import _RESERVED_DEFAULT_HEADER_NAMES
+    from turnstone.core.providers.headers import RESERVED_DEFAULT_HEADER_NAMES
 
     prelude = "\n".join(
         _admin_js_const(n)
@@ -3708,8 +3708,9 @@ def test_admin_js_model_header_problems_mirror_server_rules() -> None:
     assert "more than once" in out["dup"]
     assert "control characters" in out["ctl"]
     assert "secret://" in out["ref"]
-    # The hand-kept lists are exactly the server's reserved set.
-    assert sorted(out["reserved"]) == sorted(_RESERVED_DEFAULT_HEADER_NAMES)
+    # The hand-kept lists are exactly the core reserved set the console
+    # enforces (AI-DP-3073).
+    assert sorted(out["reserved"]) == sorted(RESERVED_DEFAULT_HEADER_NAMES)
 
 
 def test_admin_js_client_credentials_problems_and_submit_fields() -> None:
