@@ -67,6 +67,7 @@ from turnstone.core.judge import (
     _positive_window,
     _UsageHandoff,
     judge_alias,
+    judge_client_default_headers,
     resolve_judge_binding,
 )
 from turnstone.core.log import get_logger
@@ -465,6 +466,7 @@ class OutputGuardJudge:
         self._client_factory_args = self._extract_client_config(
             self._lane.client,
             self._lane.provider.provider_name,
+            default_headers=judge_client_default_headers(binding.config),
         )
         self._judge_context_window = _positive_window(
             getattr(binding.config, "context_window", None),
@@ -522,12 +524,18 @@ class OutputGuardJudge:
     # -- Client lifecycle helpers ------------------------------------------
 
     @staticmethod
-    def _extract_client_config(client: Any, provider_name: str) -> dict[str, Any]:
+    def _extract_client_config(
+        client: Any,
+        provider_name: str,
+        *,
+        default_headers: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
         """Extract connection config from an existing SDK client.
 
         Reads ``base_url`` and ``api_key`` from the client and returns
-        the dict ``turnstone.core.providers.create_client`` accepts.
-        Inlined from IntentJudge's ``_extract_client_config``.
+        the dict ``turnstone.core.providers.create_client`` accepts, with the
+        definition's *default_headers*.  Inlined from IntentJudge's
+        ``_extract_client_config``.
         """
         from turnstone.core.providers import ANTHROPIC_WORKSPACE_HEADER
 
@@ -544,6 +552,7 @@ class OutputGuardJudge:
             "base_url": base_url,
             "api_key": api_key,
             "workspace_id": scope if isinstance(scope, str) else "",
+            "default_headers": dict(default_headers or {}),
         }
 
     def _create_client(self) -> Any:

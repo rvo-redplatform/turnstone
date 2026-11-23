@@ -247,6 +247,11 @@ from turnstone.core.preview import (
     transcode_text,
 )
 from turnstone.core.ratelimit import TokenBucket
+from turnstone.core.run_session import (
+    RUN_SESSION_ID_CONFIG_KEY,
+    RunIdentity,
+    resolve_run_identity,
+)
 from turnstone.core.safety import is_command_blocked, sanitize_command
 from turnstone.core.session_worker import WorkerClaim, current_worker_claim
 from turnstone.core.settings_registry import (
@@ -3245,6 +3250,7 @@ class ChatSession:
         fork_reservation_token: str = "",
         workstream_lease: WorkstreamLease | None = None,
         workstream_judge_model: str = "",
+        run_session_id: str = "",
     ):
         if kind == WorkstreamKind.COORDINATOR and not user_id:
             # Coordinators carry real authority — they mint child-spawn
@@ -3510,10 +3516,22 @@ class ChatSession:
         # MCP listeners below), so that raise leaves nothing to undo.  One built without a lease
         # (an eval or optimizer run's throwaway session) loads nothing a save could overwrite, so
         # storage trouble must not stop it.
-        settings_saved = bool(
+        saved_settings = (
             self._read_workstream_config(self._ws_id)
             if workstream_lease is not None
             else load_workstream_config(self._ws_id)
+        )
+        settings_saved = bool(saved_settings)
+        # The run every model call of this workstream belongs to (run session
+        # headers, :mod:`turnstone.core.run_session`).  Resolved once, from the
+        # create body's override, the saved value, or the parent's run, and
+        # stamped on every lane this session binds.
+        self._run_identity = self._resolve_run_identity(
+            run_session_id, (saved_settings or {}).get(RUN_SESSION_ID_CONFIG_KEY, "")
+        )
+        self._model_binding = dataclasses.replace(
+            self._model_binding,
+            lane=self._with_run_identity(self._model_binding.lane),
         )
         self._memory_index_snapshot: dict[str, Any] | None = None
         # Generation whose accepted input contains at least one genuine human
@@ -4522,6 +4540,42 @@ class ChatSession:
             log.warning("skill.lookup_by_id_failed", template_id=template_id, exc_info=True)
             return None
 
+    def _resolve_run_identity(self, override: str, saved: object) -> RunIdentity:
+        """This workstream's run identity; see :func:`resolve_run_identity`.
+
+        A child with no saved run id reads its parent's, so a coordinator created
+        with a ``session_id`` override shares it with every child it spawns.
+        """
+        saved_id = saved if isinstance(saved, str) else ""
+        parent_saved = ""
+        if self._parent_ws_id and not override and not saved_id:
+            try:
+                parent_cfg = load_workstream_config(self._parent_ws_id)
+            except Exception:
+                log.warning(
+                    "session.run_session_parent_read_failed ws=%s parent=%s",
+                    self._ws_id[:8],
+                    self._parent_ws_id[:8],
+                    exc_info=True,
+                )
+                parent_cfg = {}
+            value = (parent_cfg or {}).get(RUN_SESSION_ID_CONFIG_KEY, "")
+            parent_saved = value if isinstance(value, str) else ""
+        return resolve_run_identity(
+            ws_id=self._ws_id,
+            parent_ws_id=self._parent_ws_id,
+            override=override,
+            saved=saved_id,
+            parent_saved=parent_saved,
+        )
+
+    def _with_run_identity(self, lane: ModelLane) -> ModelLane:
+        """*lane* carrying this session's run identity (a no-op when it already does)."""
+        identity = getattr(self, "_run_identity", None)
+        if identity is None or lane.run_identity == identity:
+            return lane
+        return dataclasses.replace(lane, run_identity=identity)
+
     def _config_for_save(self) -> dict[str, str]:
         """Snapshot the durable session configuration without writing it."""
         config = {
@@ -4554,6 +4608,11 @@ class ChatSession:
         snap = self._current_persona_snapshot()
         if snap is not None:
             config.update(snap.to_config())
+        # A run id other than the workstream's own (a create-body override, or
+        # a child's inherited run) is saved so children and a rehydrate find it.
+        identity = getattr(self, "_run_identity", None)
+        if identity is not None and identity.session_id != self._ws_id:
+            config[RUN_SESSION_ID_CONFIG_KEY] = identity.session_id
         return config
 
     def _switch_model(self, alias: str, *, principal_id: str | None = None) -> ModelConfig | None:
@@ -5431,7 +5490,9 @@ class ChatSession:
         :meth:`_retire_output_guard` after releasing the lock.
         """
         with self._output_guard_judge_lock:
-            self._model_binding = binding
+            self._model_binding = dataclasses.replace(
+                binding, lane=self._with_run_identity(binding.lane)
+            )
             stale: _StaleOutputGuard = (
                 self._output_guard_judge,
                 self._output_guard_judge_cancel,
@@ -8851,7 +8912,7 @@ class ChatSession:
         except Exception as exc:
             log.warning("perception alias %r not resolvable: %s", alias, exc)
             return None
-        return binding
+        return dataclasses.replace(binding, lane=self._with_run_identity(binding.lane))
 
     def _perception_parts(
         self,
@@ -26859,7 +26920,7 @@ class ChatSession:
                 config_store=self._config_store,
                 backend_auth_resolver=self._model_backend_auth_token,
             )
-            lane = agent_binding.lane
+            lane = self._with_run_identity(agent_binding.lane)
         else:
             # The whole sub-agent invocation inherits one semantic snapshot of
             # the primary lane.  A reload never splices a different
@@ -29123,7 +29184,8 @@ class ChatSession:
             # propagates as itself.
             raise _WebFetchModelUnavailableError(alias) from exc
         max_tokens = resolve_max_tokens_setting(binding.config, self._config_store)
-        return binding.lane, self.max_tokens if max_tokens is None else max_tokens
+        lane = self._with_run_identity(binding.lane)
+        return lane, self.max_tokens if max_tokens is None else max_tokens
 
     def _web_fetch_lane(self, item: dict[str, Any]) -> tuple[ModelLane, int]:
         """The lane web_fetch reads a page with, and the output allowance it starts from.

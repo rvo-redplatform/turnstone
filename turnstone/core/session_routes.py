@@ -44,6 +44,7 @@ from starlette.routing import Route
 from turnstone.core.log import get_logger
 from turnstone.core.model_registry import UnknownModelAliasError
 from turnstone.core.node_affinity import NodeAffinityError
+from turnstone.core.run_session import RunSessionIdError, validate_run_session_id
 from turnstone.core.session_manager import (
     CloseOutcome,
     SessionCapacityError,
@@ -3774,6 +3775,14 @@ def make_create_handler(
             if err_validate is not None:
                 return err_validate
 
+        # Optional run id override for the run session headers, on either
+        # kind (``turnstone.core.run_session``).  Refused here, before any
+        # slot is reserved, so a bad value creates nothing.
+        try:
+            run_session_id = validate_run_session_id(body.get("session_id"))
+        except RunSessionIdError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+
         # --- require_project gate ----------------------------------------
         # Gated by the declarative cfg.create_gate_require_project capability
         # (True on both the interactive and coordinator create mounts) rather
@@ -4073,6 +4082,10 @@ def make_create_handler(
             )
             if fork_model:
                 kwargs["model"] = fork_model
+            if run_session_id:
+                # Rides ``**extra_session_kwargs`` into the session factory;
+                # only sent when set, so factories that predate it still work.
+                kwargs["run_session_id"] = run_session_id
             if persona_snapshot is not None:
                 # ``persona`` is SessionManager.create's explicit param
                 # (Workstream attr + workstreams row); the snapshot rides
