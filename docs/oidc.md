@@ -254,6 +254,178 @@ database. See [Shared OAuth storage](oauth-storage.md) for bootstrap settings,
 startup requirements, key rotation, and the effect of identity unlink on
 delegated credentials and app-identity caches.
 
+### Client-credentials model gateways (`oauth_client_credentials`)
+
+Some model gateways issue their own tokens and do not trust Turnstone's
+`[oidc]` client. An example is an AWS Cognito app client in front of an AI
+gateway. For these, use `auth_mode = "oauth_client_credentials"`. Turnstone
+mints one shared token per alias from the definition's own token endpoint,
+with the OAuth 2.0 client-credentials grant. No user is involved, so the mode
+works for service, CLI and coordinator turns the same way.
+
+This mode does not use `[oidc]`, `obo_grant_profile` or `obo_audience`, and
+`model.auth_audience_allowlist` does not apply to it. The token URL
+allow-list below takes their place.
+
+#### Fields
+
+| Field | Required | Meaning |
+|-------|----------|---------|
+| `oauth_token_url` | yes | The token endpoint. It must be an absolute `http(s)` URL with a host and no userinfo or fragment. It must also be listed in `model.oauth_token_url_allowlist`. |
+| `oauth_client_id` | yes | The app client ID. |
+| `oauth_client_secret` | yes | The app client secret. It can be a `secret://` reference (recommended) or a literal. |
+| `obo_scopes` | yes | The `scope` value, sent exactly as written. Turnstone does not add `/.default` to it. |
+
+If any of these is missing, the registry load fails with one error that names
+every missing field. For example: `Model 'aidp' requires oauth_token_url,
+oauth_client_id, oauth_client_secret when auth_mode is
+'oauth_client_credentials'`. A `secret://` reference is parsed when the
+definition loads, so a malformed one fails early. The secret itself is only
+resolved at mint time, so you can rotate it without a reload. A stale
+`obo_audience` on a definition in this mode is dropped with a warning.
+
+The request is a `POST` with `grant_type=client_credentials` and the raw
+`scope`. The client authenticates with `Authorization: Basic
+base64(client_id:client_secret)`, and neither credential is put in the form
+body. Errors from the token endpoint are logged with the secret and the Basic
+credential replaced by `***`.
+
+#### Configuration example
+
+Settings, in the admin **Settings** tab or with the console settings API (see
+[Settings](settings.md#client-credentials-settings)):
+
+```text
+model.oauth_token_url_allowlist  = https://rp-aidp-tools-nonprod.auth.us-east-1.amazoncognito.com/oauth2/token
+model.oauth_refresh_margin_seconds = 660
+```
+
+A model definition in `config.toml`:
+
+```toml
+[models.aidp-agent]
+provider = "openai"
+base_url = "https://aidp.rp-tools-nonprod.rvohealth.com/v1"
+model = "aiq-agent"                       # the gateway route id
+auth_mode = "oauth_client_credentials"
+oauth_token_url = "https://rp-aidp-tools-nonprod.auth.us-east-1.amazoncognito.com/oauth2/token"
+oauth_client_id = "<cognito-app-client-id>"
+oauth_client_secret = "secret://file/run/turnstone/secrets/aidp-client-secret"
+obo_scopes = "ai-gateway/invoke"
+```
+
+The same definition, created with the console API
+(`POST /v1/api/admin/model-definitions`):
+
+```json
+{
+  "alias": "aidp-agent",
+  "provider": "openai",
+  "base_url": "https://aidp.rp-tools-nonprod.rvohealth.com/v1",
+  "model": "aiq-agent",
+  "auth_mode": "oauth_client_credentials",
+  "oauth_token_url": "https://rp-aidp-tools-nonprod.auth.us-east-1.amazoncognito.com/oauth2/token",
+  "oauth_client_id": "<cognito-app-client-id>",
+  "oauth_client_secret": "secret://file/run/turnstone/secrets/aidp-client-secret",
+  "obo_scopes": "ai-gateway/invoke"
+}
+```
+
+On Kubernetes, mount the client secret from a Kubernetes Secret with the Helm
+chart's `config.secretMounts`, and set `[secrets.file] root` to the mount
+directory. See [Secret references](security.md#secret-references). A
+definition saved in the console never expands `${VAR}`, and the console
+refuses a `${VAR}` in the token URL or the secret.
+
+#### Token URL allow-list
+
+`model.oauth_token_url_allowlist` lists the exact token endpoint URLs that
+definitions may mint from, separated by commas or newlines. There is no
+wildcard or host matching. The default is empty, which denies every URL, so
+an operator must list an endpoint before an admin can save a definition in
+this mode.
+
+The console checks the allow-list on every write that would save or change
+such a definition, and refuses an unlisted URL with a 400. The mint checks it
+again on every call, so removing a URL from the list stops minting for every
+definition that uses it. The console's
+`GET /v1/api/admin/model-definitions/auth-constraints` returns the current
+list as `oauth_token_url_allowlist` and the mode names as
+`client_credentials_auth_modes`, for the admin UI.
+
+#### Refresh margin and caching
+
+The token is cached per alias in the encrypted `oauth_tokens` table, in the
+same `__model_app__:<alias>` row that `entra_app` uses. Every node shares
+the row, and each host also keeps an in-memory copy. Concurrent calls at
+expiry are single-flight: a burst of calls mints once.
+
+A cached token with fewer than `model.oauth_refresh_margin_seconds` left is
+minted again before the next call. The default is 660 seconds, the 10-minute
+call limit plus one minute, and the minimum is 60. So a 3600-second token is
+used for 49 minutes. The margin is capped at half of the token's lifetime, so
+an IdP that issues short tokens (for example 300 seconds) does not cause a
+mint on every call.
+
+The cache entry is keyed by the token URL, the client ID, the resolved
+secret and the scope. If any of them changes, the old token is never served,
+even before anything purges it and even from a host's in-memory copy. When an
+admin changes the token URL, client ID or secret in the console, the console
+also deletes the cached row.
+
+#### Fail closed
+
+This mode always fails closed. When Turnstone cannot get a token, the call
+raises `BackendAuthUnavailableError` and nothing is sent to the model
+gateway. It never falls back to a static `api_key`, even when
+`model.auth_fail_closed` is `false`. The refusal is logged as
+`model_cc.refused` with the alias, the token URL and one of these causes:
+
+| Cause | Meaning |
+|-------|---------|
+| `credentials_unavailable` | The definition is missing the URL, the client ID, the secret or the scope. |
+| `token_url_not_allowlisted` | The token URL is not in `model.oauth_token_url_allowlist`. |
+| `secret_unavailable` | The `secret://` reference could not be resolved. |
+| `mint_failed` | The token endpoint refused the grant or could not be reached. |
+| `mint_missing_access_token` | The token endpoint answered without an `access_token`. |
+| `token_store_unavailable` | The process has no protected token store. |
+
+After a failed mint, calls for that alias are refused for 30 seconds without
+contacting the token endpoint, so a wrong secret (Cognito `invalid_client`)
+does not cause a tight retry loop. Correcting the configuration clears this
+cooldown.
+
+#### 401 from the model gateway
+
+A gateway can revoke a token before it expires. When the gateway answers a
+request with `401` and Turnstone minted the token for that call, Turnstone
+marks the token as rejected, mints a new one and sends the request once more.
+A second `401` is returned to the caller. The `401` arrives before any
+streamed output, so the retry cannot duplicate output. Concurrent callers
+mint only once. Only this mode retries; the other modes return the `401`
+as before. Audio calls are not retried.
+
+#### Secret masking in the console
+
+The console never returns a literal client secret. On read, a literal
+`oauth_client_secret` comes back as `***`, as `api_key` does. A `secret://`
+reference is returned as written, so you can see which secret entry the
+definition uses. On update, an empty value, `***` or the unchanged reference
+keeps the stored secret, so the secret cannot be cleared through the API. The
+audit log records `(set)` on create and `(updated)` on update, never the
+value.
+
+As for every dynamic mode, changing a definition in this mode also needs
+`admin.mcp`, apart from the tuning fields (see
+[Settings](settings.md#model-backend-authentication)). Changing the token URL,
+the client ID or the secret is also recorded as a posture event. Disabling
+the definition needs only `admin.models`, even when the definition cannot
+load.
+
+Per-definition request headers (`default_headers`) and run session headers
+(`session_headers`) are often used with this mode. See
+[Architecture](architecture.md#per-definition-default-headers).
+
 ---
 
 ## Provider-Specific Setup
