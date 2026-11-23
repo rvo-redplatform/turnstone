@@ -89,12 +89,14 @@ from turnstone.core.metacognition import field_str, sanitize_display
 from turnstone.core.model_oauth import MEMO_EVICTION_WINDOW_S, get_model_token_client
 from turnstone.core.model_registry import (
     APP_IDENTITY_MODEL_AUTH_MODES,
+    CLIENT_CREDENTIALS_MODEL_AUTH_MODES,
     DYNAMIC_MODEL_AUTH_MODES,
     MAX_MODEL_CONCURRENCY,
     MODEL_AUTH_MODE_PROFILES,
     MODEL_AUTH_TEXT_MAX_LEN,
     SCOPES_MODEL_AUTH_MODES,
     DynamicAuthKeyError,
+    ModelAuthConfigError,
     describe_skipped,
     dynamic_auth_key_error,
     sanitize_backend_auth_scopes,
@@ -13943,6 +13945,176 @@ def _model_auth_audience_allowlist(request: Request) -> frozenset[str]:
     return frozenset(item.strip() for item in re.split(r"[,\n]", str(raw or "")) if item.strip())
 
 
+def _model_oauth_token_url_allowlist(request: Request) -> frozenset[str]:
+    """Exact operator-approved token endpoints for ``oauth_client_credentials``.
+
+    Literal match only (no wildcard or host matching), empty = deny all; the
+    setting's help text carries the contract.
+    """
+    config_store = getattr(request.app.state, "config_store", None)
+    raw = config_store.get("model.oauth_token_url_allowlist") if config_store is not None else ""
+    return frozenset(item.strip() for item in re.split(r"[,\n]", str(raw or "")) if item.strip())
+
+
+# Dynamic modes that read ``obo_audience``: every dynamic mode except the
+# client-credentials ones, which mint from their own token endpoint and are
+# gated by ``model.oauth_token_url_allowlist`` instead. Derived, so a new
+# dynamic mode lands here (audience required) unless it is classified as a
+# client-credentials mode in the registry.
+_AUDIENCE_MODEL_AUTH_MODES = DYNAMIC_MODEL_AUTH_MODES - CLIENT_CREDENTIALS_MODEL_AUTH_MODES
+
+# The per-definition client-credentials columns (migration 090). Only a
+# CLIENT_CREDENTIALS_MODEL_AUTH_MODES row reads them; the write twins refuse
+# a NEW non-empty value on any other mode, like the audience/scopes staging
+# guards.
+_CLIENT_CREDENTIALS_FIELDS = ("oauth_token_url", "oauth_client_id", "oauth_client_secret")
+
+_CLIENT_CREDENTIALS_STAGING_ERROR = (
+    "oauth_token_url, oauth_client_id and oauth_client_secret are only used by auth_mode "
+    f"({'/'.join(sorted(CLIENT_CREDENTIALS_MODEL_AUTH_MODES))}); omit them for other modes"
+)
+_TOKEN_URL_NOT_ALLOWED_ERROR = (
+    "oauth_token_url is not in the operator-configured model.oauth_token_url_allowlist"
+)
+
+# Header names a definition's ``default_headers`` may not set: credentials
+# (the backend credential is the auth mode's job, and a static header would
+# bypass every gate on it), the headers Turnstone itself sends, and transport
+# headers the HTTP client owns. Compared case-insensitively.
+_RESERVED_DEFAULT_HEADER_NAMES = frozenset(
+    {
+        # Credentials.
+        "authorization",
+        "proxy-authorization",
+        "x-api-key",
+        "api-key",
+        "x-goog-api-key",
+        "cookie",
+        # Sent by Turnstone.
+        "anthropic-workspace-id",
+        "x-switchyard-session-id",
+        "x-switchyard-agent-id",
+        "x-switchyard-is-subagent",
+        "agent-session-id",
+        # Transport.
+        "host",
+        "content-length",
+        "content-type",
+        "transfer-encoding",
+        "connection",
+    }
+)
+_DEFAULT_HEADERS_MAX_COUNT = 32
+_DEFAULT_HEADER_NAME_MAX_LEN = 128
+_DEFAULT_HEADER_VALUE_MAX_LEN = 2048
+# RFC 9110 field-name token.
+_HEADER_NAME_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+
+
+def _parse_client_credentials_text(
+    body: dict[str, Any], field: str
+) -> tuple[str | None, JSONResponse | None]:
+    """Parse one submitted client-credentials text field.
+
+    Returns ``(value, None)`` (stripped) when present, ``(None, None)`` when
+    absent, or ``(None, error)``. Over-length input is refused rather than
+    truncated: a shortened URL, client id or secret is a different one.
+    Control characters are left for the registry's own check (run on the
+    effective row), which refuses them instead of stripping.
+    """
+    if field not in body:
+        return None, None
+    raw = body[field]
+    if not isinstance(raw, str):
+        return None, JSONResponse({"error": f"{field} must be a string"}, status_code=400)
+    value = raw.strip()
+    if len(value) > MODEL_AUTH_TEXT_MAX_LEN:
+        return None, JSONResponse(
+            {"error": f"{field} exceeds {MODEL_AUTH_TEXT_MAX_LEN} characters"}, status_code=400
+        )
+    return value, None
+
+
+def _client_credentials_error(
+    alias: str, mode: str, token_url: str, client_id: str, client_secret: str, scopes: str
+) -> str:
+    """Why an ``oauth_client_credentials`` row's effective fields cannot load, or ``""``.
+
+    Runs the registry loader's own check (required fields, token-URL shape,
+    ``secret://`` syntax, control characters), so a definition saved here is
+    one it would load; plus the scope the grant must send.
+    """
+    from turnstone.core.model_registry import _normalize_client_credentials
+
+    try:
+        _normalize_client_credentials(alias, mode, token_url, client_id, client_secret)
+    except ModelAuthConfigError as exc:
+        return str(exc)
+    if not scopes:
+        return f"obo_scopes (the scope to request) is required when auth_mode is {mode!r}"
+    return ""
+
+
+def _parse_default_headers_field(raw: Any) -> tuple[dict[str, str] | None, JSONResponse | None]:
+    """Validate a submitted ``default_headers`` object.
+
+    Names must be RFC 9110 tokens and not reserved
+    (:data:`_RESERVED_DEFAULT_HEADER_NAMES`, case-insensitive, no duplicates
+    by case); values must be strings without control characters and without
+    ``secret://`` text (a header value is sent verbatim, never resolved).
+    """
+    from turnstone.core.secret_refs import REFERENCE_SCHEME
+
+    def _bad(message: str) -> tuple[None, JSONResponse]:
+        return None, JSONResponse({"error": f"default_headers: {message}"}, status_code=400)
+
+    if not isinstance(raw, dict):
+        return _bad("must be an object of header names to string values")
+    if len(raw) > _DEFAULT_HEADERS_MAX_COUNT:
+        return _bad(f"at most {_DEFAULT_HEADERS_MAX_COUNT} headers")
+    headers: dict[str, str] = {}
+    seen: set[str] = set()
+    for name, value in raw.items():
+        if (
+            not isinstance(name, str)
+            or len(name) > _DEFAULT_HEADER_NAME_MAX_LEN
+            or not _HEADER_NAME_RE.match(name)
+        ):
+            return _bad(f"{str(name)[:64]!r} is not a valid header name")
+        lowered = name.lower()
+        if lowered in _RESERVED_DEFAULT_HEADER_NAMES:
+            return _bad(
+                f"{name!r} is set by Turnstone or carries a credential; use the auth mode "
+                "for credentials"
+            )
+        if lowered in seen:
+            return _bad(f"{name!r} appears more than once")
+        seen.add(lowered)
+        if not isinstance(value, str):
+            return _bad(f"{name!r} must have a string value")
+        if len(value) > _DEFAULT_HEADER_VALUE_MAX_LEN:
+            return _bad(f"{name!r} value exceeds {_DEFAULT_HEADER_VALUE_MAX_LEN} characters")
+        if strip_control_characters(value) != value:
+            return _bad(f"{name!r} value contains control characters")
+        if REFERENCE_SCHEME in value:
+            return _bad(f"{name!r} value cannot be a secret:// reference")
+        headers[name] = value
+    return headers, None
+
+
+def _stored_default_headers(raw: Any) -> dict[str, Any] | None:
+    """A row's stored ``default_headers`` as a dict, ``None`` when unreadable."""
+    if raw is None or raw == "":
+        return {}
+    if isinstance(raw, dict):
+        return raw
+    try:
+        parsed = json.loads(str(raw))
+    except (ValueError, RecursionError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
 def _oidc_configured_for_model_auth(request: Request) -> bool:
     """Whether ``[oidc]`` is configured, counting the healing state as yes.
 
@@ -14005,12 +14177,13 @@ def _parse_model_max_concurrency(raw: Any) -> tuple[int, JSONResponse | None]:
 # fourth dynamic mode cannot make either message lie.
 _AUDIENCE_REQUIRED_ERROR = (
     "obo_audience is required when auth_mode is dynamic "
-    f"({'/'.join(sorted(DYNAMIC_MODEL_AUTH_MODES))})"
+    f"({'/'.join(sorted(_AUDIENCE_MODEL_AUTH_MODES))})"
 )
 _AUDIENCE_FORBIDS_STATIC_ERROR = (
     "obo_audience requires a dynamic auth_mode "
-    f"({'/'.join(sorted(DYNAMIC_MODEL_AUTH_MODES))}); "
-    "omit it when auth_mode is 'static'"
+    f"({'/'.join(sorted(_AUDIENCE_MODEL_AUTH_MODES))}); "
+    "omit it when auth_mode is 'static' or "
+    f"{'/'.join(sorted(CLIENT_CREDENTIALS_MODEL_AUTH_MODES))}"
 )
 # The scopes staging guard's refusal, shared by both twins like its audience
 # siblings above. Mode list derived, same rationale.
@@ -14081,13 +14254,26 @@ class ModelAuthGateDecision:
     the bearer the alias's rows hold), and the handler must fire the purge
     on exactly the comparison the gate made, never a re-derivation that
     could drift.
+
+    For a :data:`CLIENT_CREDENTIALS_MODEL_AUTH_MODES` row the "pair" is the
+    mode plus its token endpoint, client id and secret: a change to any of
+    them re-aims the mint, so it sets ``pair_changed`` (posture event and
+    mint-cache purge) exactly as an audience change does on the other modes.
+    ``client_credentials_error`` is the effective row's load refusal (empty
+    when it loads or the mode is another one, and always empty on a pure
+    disable).
     """
 
     eff_auth_mode: str
     eff_audience: str
+    eff_token_url: str
     audience_required_violation: bool
+    # Despite the name, any mode that never reads an audience (static and the
+    # client-credentials modes) refuses a NEW non-empty one.
     static_new_audience_violation: bool
     scopes_staging_violation: bool
+    client_credentials_staging_violation: bool
+    client_credentials_error: str
     scopes_value_changed: bool
     pair_changed: bool
     dynamic_involved: bool
@@ -14146,13 +14332,22 @@ def _derive_auth_gate(existing: dict[str, Any], updates: dict[str, Any]) -> Mode
     )
     eff_auth_mode = str(updates.get("auth_mode", old_auth_mode))
     eff_audience = str(updates.get("obo_audience", old_audience))
+    # Client-credentials fields: stored side stripped like a submission, so a
+    # full-form re-save of the row's own values is no change.
+    old_cc = {key: str(existing.get(key) or "").strip() for key in _CLIENT_CREDENTIALS_FIELDS}
+    eff_cc = {key: str(updates.get(key, old_cc[key])) for key in _CLIENT_CREDENTIALS_FIELDS}
+    cc_changed_keys = [key for key in _CLIENT_CREDENTIALS_FIELDS if eff_cc[key] != old_cc[key]]
+    cc_involved = (
+        old_auth_mode in CLIENT_CREDENTIALS_MODEL_AUTH_MODES
+        or eff_auth_mode in CLIENT_CREDENTIALS_MODEL_AUTH_MODES
+    )
     # The staging guard, mirrored on the create twin: a row whose effective
     # mode is static must not store a NEW non-empty audience, or an
     # unvalidated value (the validator returns at static, never reaching the
     # allow-list) is staged for a later flip to inherit. VALUE CHANGE only,
     # so a legacy row carrying stale residue keeps saving.
     static_new_audience_violation = (
-        eff_auth_mode == "static"
+        eff_auth_mode not in _AUDIENCE_MODEL_AUTH_MODES
         and "obo_audience" in updates
         and bool(updates["obo_audience"])
         and str(updates["obo_audience"]) != old_audience
@@ -14185,9 +14380,19 @@ def _derive_auth_gate(existing: dict[str, Any], updates: dict[str, Any]) -> Mode
         and scopes_value_changed
         and bool(updates["obo_scopes"])
     )
+    # The client-credentials twin of the staging guards: only that mode may
+    # store a NEW non-empty token URL, client id or secret. Clearing one, or
+    # re-saving residue, is no violation.
+    client_credentials_staging_violation = eff_auth_mode not in (
+        CLIENT_CREDENTIALS_MODEL_AUTH_MODES
+    ) and any(eff_cc[key] for key in cc_changed_keys)
     # One derivation, two consumers: the outer gate and the validator's
     # posture tier.
-    pair_changed = eff_auth_mode != old_auth_mode or eff_audience != old_audience
+    pair_changed = (
+        eff_auth_mode != old_auth_mode
+        or eff_audience != old_audience
+        or (cc_involved and bool(cc_changed_keys))
+    )
     dynamic_involved = (
         old_auth_mode in DYNAMIC_MODEL_AUTH_MODES or eff_auth_mode in DYNAMIC_MODEL_AUTH_MODES
     )
@@ -14200,6 +14405,15 @@ def _derive_auth_gate(existing: dict[str, Any], updates: dict[str, Any]) -> Mode
     caps_changed = "capabilities" in updates and _capabilities_value_changed(
         existing.get("capabilities"), updates["capabilities"]
     )
+    # default_headers compares parsed objects (the stored side is JSON text;
+    # an unreadable stored blob compares as changed), session_headers as
+    # bools; both are gated columns with their own comparators.
+    headers_changed = "default_headers" in updates and _stored_default_headers(
+        existing.get("default_headers")
+    ) != _stored_default_headers(updates["default_headers"])
+    session_headers_changed = "session_headers" in updates and bool(
+        existing.get("session_headers")
+    ) != bool(updates["session_headers"])
     # obo_scopes joins the pair and capabilities in the loop's exclusion
     # list: each excluded column has a dedicated normalization-correct
     # comparator (scopes_value_changed above), and the raw-string loop
@@ -14207,12 +14421,25 @@ def _derive_auth_gate(existing: dict[str, Any], updates: dict[str, Any]) -> Mode
     # change.
     non_caps_gated_changed = (
         any(
-            key not in ("enabled", "capabilities", "auth_mode", "obo_audience", "obo_scopes")
+            key
+            not in (
+                "enabled",
+                "capabilities",
+                "auth_mode",
+                "obo_audience",
+                "obo_scopes",
+                "default_headers",
+                "session_headers",
+                *_CLIENT_CREDENTIALS_FIELDS,
+            )
             and key not in MODEL_AUTH_NEUTRAL_FIELDS
             and str(existing.get(key) or "") != str(value or "")
             for key, value in updates.items()
         )
         or scopes_value_changed
+        or bool(cc_changed_keys)
+        or headers_changed
+        or session_headers_changed
     )
     other_gated_changed = non_caps_gated_changed or caps_changed
     caps_blocks_disarm = (
@@ -14229,17 +14456,32 @@ def _derive_auth_gate(existing: dict[str, Any], updates: dict[str, Any]) -> Mode
     # — except for the pure disable, whose de-escalation must never be
     # blocked (the row is leaving the registry; nothing is armed).
     audience_required_violation = (
-        eff_auth_mode in DYNAMIC_MODEL_AUTH_MODES and not eff_audience and not pure_disable
+        eff_auth_mode in _AUDIENCE_MODEL_AUTH_MODES and not eff_audience and not pure_disable
     )
+    # Same yield to the disarm for an unloadable client-credentials row.
+    client_credentials_error = ""
+    if eff_auth_mode in CLIENT_CREDENTIALS_MODEL_AUTH_MODES and not pure_disable:
+        eff_scopes = str(updates.get("obo_scopes", old_scopes))
+        client_credentials_error = _client_credentials_error(
+            str(updates.get("alias", existing.get("alias") or "")),
+            eff_auth_mode,
+            eff_cc["oauth_token_url"],
+            eff_cc["oauth_client_id"],
+            eff_cc["oauth_client_secret"],
+            eff_scopes,
+        )
     auth_config_changed = pair_changed or (
         dynamic_involved and (other_gated_changed or enabled_flip) and not pure_disable
     )
     return ModelAuthGateDecision(
         eff_auth_mode=eff_auth_mode,
         eff_audience=eff_audience,
+        eff_token_url=eff_cc["oauth_token_url"],
         audience_required_violation=audience_required_violation,
         static_new_audience_violation=static_new_audience_violation,
         scopes_staging_violation=scopes_staging_violation,
+        client_credentials_staging_violation=client_credentials_staging_violation,
+        client_credentials_error=client_credentials_error,
         scopes_value_changed=scopes_value_changed,
         pair_changed=pair_changed,
         dynamic_involved=dynamic_involved,
@@ -14255,6 +14497,7 @@ def _validate_dynamic_model_auth(
     *,
     auth_mode: str,
     audience: str,
+    token_url: str = "",
     posture_event: bool = True,
     pair_changed: bool = True,
 ) -> JSONResponse | None:
@@ -14296,8 +14539,30 @@ def _validate_dynamic_model_auth(
     gates on ``capture_user_credential``, which the model mint never reads
     (pinned: test_entra_obo_allowed_without_user_credential_capture). Any
     rule change here must be weighed against the sibling, and vice versa.
+
+    **Client-credentials modes** (:data:`CLIENT_CREDENTIALS_MODEL_AUTH_MODES`)
+    mint from their own token endpoint and never touch ``[oidc]``, so the
+    audience allow-list, OIDC and grant-profile checks do not apply. Row
+    validity is instead ``token_url`` in ``model.oauth_token_url_allowlist``
+    (every write, value-based like the audience check), and the posture tier
+    keeps only the token-store check: the minted token is cached encrypted.
     """
     if auth_mode == "static":
+        return None
+
+    if auth_mode in CLIENT_CREDENTIALS_MODEL_AUTH_MODES:
+        if token_url not in _model_oauth_token_url_allowlist(request):
+            return JSONResponse({"error": _TOKEN_URL_NOT_ALLOWED_ERROR}, status_code=400)
+        if posture_event and oauth_context(request.app.state).token_store is None:
+            return JSONResponse(
+                {
+                    "error": (
+                        f"auth_mode {auth_mode!r} mints and caches encrypted tokens, but "
+                        f"{STARTUP_KEY_REQUIRED_HINT}"
+                    )
+                },
+                status_code=503,
+            )
         return None
 
     # --- Row validity: every write that touches a dynamic config -----------
@@ -14504,7 +14769,7 @@ _PROVIDER_DEFAULT_URLS: dict[str, str] = {
 
 
 def _mask_model_secrets(model: dict[str, Any]) -> dict[str, Any]:
-    """Replace a literal api_key with '***' (write-only).
+    """Replace a literal api_key or oauth_client_secret with '***' (write-only).
 
     A ``secret://`` reference is not itself a secret: it is returned verbatim so
     the operator can see which store entry the definition uses.
@@ -14512,8 +14777,9 @@ def _mask_model_secrets(model: dict[str, Any]) -> dict[str, Any]:
     from turnstone.core.secret_refs import is_reference
 
     m = dict(model)
-    if m.get("api_key") and not is_reference(m["api_key"]):
-        m["api_key"] = "***"
+    for field in ("api_key", "oauth_client_secret"):
+        if m.get(field) and not is_reference(m[field]):
+            m[field] = "***"
     return m
 
 
@@ -15235,6 +15501,11 @@ async def admin_model_auth_constraints(request: Request) -> JSONResponse:
             # as a deployment identity, every other dynamic mode as per-user.
             "app_identity_auth_modes": sorted(APP_IDENTITY_MODEL_AUTH_MODES),
             "auth_mode_profiles": dict(sorted(MODEL_AUTH_MODE_PROFILES.items())),
+            # The client-credentials modes, which take a token URL / client
+            # id / secret instead of an audience, and the token endpoints
+            # they may use (same enumeration rationale as the audiences).
+            "client_credentials_auth_modes": sorted(CLIENT_CREDENTIALS_MODEL_AUTH_MODES),
+            "oauth_token_url_allowlist": sorted(_model_oauth_token_url_allowlist(request)),
         }
     )
 
@@ -15302,8 +15573,17 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
             {"error": f"base_url is required for provider {provider!r}"}, status_code=400
         )
     api_key = str(body.get("api_key", "")).strip()
+    cc_values: dict[str, str] = {}
+    for field in _CLIENT_CREDENTIALS_FIELDS:
+        cc_value, cc_err = _parse_client_credentials_text(body, field)
+        if cc_err is not None:
+            return cc_err
+        cc_values[field] = cc_value or ""
+    oauth_client_secret = cc_values["oauth_client_secret"]
     # The loader's own check, so a definition saved here is one it would load.
-    placeholder_error = stored_definition_error({"api_key": api_key, "base_url": base_url})
+    placeholder_error = stored_definition_error(
+        {"api_key": api_key, "base_url": base_url, **cc_values}
+    )
     if placeholder_error:
         return JSONResponse({"error": placeholder_error}, status_code=400)
     if is_secret_reference(api_key):
@@ -15375,21 +15655,36 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
     surface_persisted_reasoning = bool(body.get("surface_persisted_reasoning", True))
     replay_reasoning_to_model = bool(body.get("replay_reasoning_to_model", False))
 
+    default_headers: dict[str, str] = {}
+    if "default_headers" in body:
+        parsed_headers, headers_err = _parse_default_headers_field(body["default_headers"])
+        if headers_err is not None:
+            return headers_err
+        default_headers = parsed_headers or {}
+    session_headers = body.get("session_headers", False)
+    if type(session_headers) is not bool:
+        # Strict: coercing the string "false" would turn the headers on.
+        return JSONResponse({"error": "session_headers must be true or false"}, status_code=400)
+
     auth_mode = str(body.get("auth_mode", "static")).strip() or "static"
     if auth_mode not in _MODEL_AUTH_MODES:
         return JSONResponse({"error": f"Invalid auth_mode: {auth_mode!r}"}, status_code=400)
     obo_audience = (
         _clean_oauth_text(body.get("obo_audience"), max_length=MODEL_AUTH_TEXT_MAX_LEN) or ""
     )
-    if auth_mode in DYNAMIC_MODEL_AUTH_MODES and not obo_audience:
+    if auth_mode in _AUDIENCE_MODEL_AUTH_MODES and not obo_audience:
         return JSONResponse({"error": _AUDIENCE_REQUIRED_ERROR}, status_code=400)
     # The staging guard, mirrored on the update twin: a static row must not
     # STORE an audience, or an admin.models-only caller (the escalation gate
     # below is skipped entirely for static) parks an unvalidated one for a
     # later flip to inherit. A request-shape 400, so it may precede the
     # permission gate — it discriminates only on the request's own fields.
-    if auth_mode == "static" and obo_audience:
+    # A client-credentials row never reads an audience either.
+    if auth_mode not in _AUDIENCE_MODEL_AUTH_MODES and obo_audience:
         return JSONResponse({"error": _AUDIENCE_FORBIDS_STATIC_ERROR}, status_code=400)
+    # The client-credentials twin of the staging guard.
+    if auth_mode not in CLIENT_CREDENTIALS_MODEL_AUTH_MODES and any(cc_values.values()):
+        return JSONResponse({"error": _CLIENT_CREDENTIALS_STAGING_ERROR}, status_code=400)
     # Scopes twin of the staging guard, same request-shape rationale: only a
     # scope-reading mode may store scopes. Over-length input is REFUSED
     # (audience keeps its truncate posture — the allow-list membership check
@@ -15402,6 +15697,18 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
     obo_scopes = obo_scopes_value or ""
     if obo_scopes and auth_mode not in SCOPES_MODEL_AUTH_MODES:
         return JSONResponse({"error": _SCOPES_REQUIRE_EXCHANGE_MODE_ERROR}, status_code=400)
+    if auth_mode in CLIENT_CREDENTIALS_MODEL_AUTH_MODES:
+        # The loader's own check on the row as it would be stored.
+        cc_error = _client_credentials_error(
+            alias,
+            auth_mode,
+            cc_values["oauth_token_url"],
+            cc_values["oauth_client_id"],
+            oauth_client_secret,
+            obo_scopes,
+        )
+        if cc_error:
+            return JSONResponse({"error": cc_error}, status_code=400)
     if auth_mode != "static":
         # Redeeming an operator-chosen audience is the same capability as
         # configuring oauth_audience on MCP; service credentials do not bypass
@@ -15415,9 +15722,16 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
         request,
         auth_mode=auth_mode,
         audience=obo_audience,
+        token_url=cc_values["oauth_token_url"],
     )
     if dynamic_auth_error is not None:
         return dynamic_auth_error
+    if is_secret_reference(oauth_client_secret):
+        # Resolved only after the permission gate above (a client-credentials
+        # row is dynamic, so admin.mcp already applies), as for api_key.
+        err = await _check_secret_reference(oauth_client_secret)
+        if err is not None:
+            return err
 
     # Read before the write: the cluster's first chat model becomes its stored
     # default (#1359).
@@ -15442,6 +15756,11 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
         auth_mode=auth_mode,
         obo_audience=obo_audience,
         obo_scopes=obo_scopes,
+        oauth_token_url=cc_values["oauth_token_url"],
+        oauth_client_id=cc_values["oauth_client_id"],
+        oauth_client_secret=oauth_client_secret,
+        default_headers=json.dumps(default_headers),
+        session_headers=session_headers,
     )
 
     # Record the auth pair, as the update path already does: it is a
@@ -15457,6 +15776,17 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
         audit_detail["obo_audience"] = obo_audience
         if obo_scopes:
             audit_detail["obo_scopes"] = obo_scopes
+    if auth_mode in CLIENT_CREDENTIALS_MODEL_AUTH_MODES:
+        audit_detail["oauth_token_url"] = cc_values["oauth_token_url"]
+        audit_detail["oauth_client_id"] = cc_values["oauth_client_id"]
+        # A reference names a store entry; a literal is never recorded.
+        audit_detail["oauth_client_secret"] = (
+            oauth_client_secret if is_secret_reference(oauth_client_secret) else "(set)"
+        )
+    if default_headers:
+        audit_detail["default_headers"] = sorted(default_headers)
+    if session_headers:
+        audit_detail["session_headers"] = True
     record_audit(
         storage,
         audit_uid,
@@ -15580,8 +15910,18 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
     # echoing the stored one is refused too: the loader skips such a row, so a
     # form save names what to fix instead of storing it again. "", "***" and an
     # echoed reference pass, as the key branch below keeps the stored key for them.
+    cc_submitted: dict[str, str] = {}
+    for field in _CLIENT_CREDENTIALS_FIELDS:
+        cc_value, cc_err = _parse_client_credentials_text(body, field)
+        if cc_err is not None:
+            return cc_err
+        if cc_value is not None:
+            cc_submitted[field] = cc_value
     placeholder_error = stored_definition_error(
-        {field: body[field].strip() for field in ("api_key", "base_url") if field in body}
+        {
+            **{field: body[field].strip() for field in ("api_key", "base_url") if field in body},
+            **cc_submitted,
+        }
     )
     if placeholder_error:
         return JSONResponse({"error": placeholder_error}, status_code=400)
@@ -15723,6 +16063,31 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
     if "replay_reasoning_to_model" in body:
         updates["replay_reasoning_to_model"] = bool(body["replay_reasoning_to_model"])
 
+    for field in ("oauth_token_url", "oauth_client_id"):
+        if field in cc_submitted:
+            updates[field] = cc_submitted[field]
+    new_client_secret_ref = ""
+    if "oauth_client_secret" in cc_submitted:
+        secret = cc_submitted["oauth_client_secret"]
+        # api_key's sentinel rules: "", "***" and the stored reference echoed
+        # back unchanged keep the stored secret (GET masks a literal as "***").
+        echoed_secret_ref = is_secret_reference(secret) and secret == str(
+            existing.get("oauth_client_secret") or ""
+        )
+        if secret and secret != "***" and not echoed_secret_ref:
+            updates["oauth_client_secret"] = secret
+            if is_secret_reference(secret):
+                new_client_secret_ref = secret
+    if "default_headers" in body:
+        parsed_headers, headers_err = _parse_default_headers_field(body["default_headers"])
+        if headers_err is not None:
+            return headers_err
+        updates["default_headers"] = json.dumps(parsed_headers or {})
+    if "session_headers" in body:
+        if type(body["session_headers"]) is not bool:
+            return JSONResponse({"error": "session_headers must be true or false"}, status_code=400)
+        updates["session_headers"] = body["session_headers"]
+
     if "auth_mode" in body:
         am = str(body["auth_mode"]).strip() or "static"
         if am not in _MODEL_AUTH_MODES:
@@ -15759,6 +16124,10 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
         return JSONResponse({"error": _AUDIENCE_FORBIDS_STATIC_ERROR}, status_code=400)
     if gate.scopes_staging_violation:
         return JSONResponse({"error": _SCOPES_REQUIRE_EXCHANGE_MODE_ERROR}, status_code=400)
+    if gate.client_credentials_staging_violation:
+        return JSONResponse({"error": _CLIENT_CREDENTIALS_STAGING_ERROR}, status_code=400)
+    if gate.client_credentials_error:
+        return JSONResponse({"error": gate.client_credentials_error}, status_code=400)
     if gate.auth_config_changed:
         # Permission first: the validation 400s below describe deployment OIDC
         # posture and allow-list membership, which a caller lacking this scope
@@ -15773,11 +16142,22 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
             request,
             auth_mode=gate.eff_auth_mode,
             audience=gate.eff_audience,
+            token_url=gate.eff_token_url,
             posture_event=gate.posture_event,
             pair_changed=gate.pair_changed,
         )
         if dynamic_auth_error is not None:
             return dynamic_auth_error
+    if new_client_secret_ref:
+        # A new reference widens what this definition can send, like an
+        # api_key reference: admin.mcp even when the gate above did not run
+        # (a static row refuses it as staging before this point anyway).
+        err = require_permission(request, "admin.mcp", allow_service_bypass=False)
+        if err:
+            return err
+        err = await _check_secret_reference(new_client_secret_ref)
+        if err is not None:
+            return err
 
     # A model a fail-closed routing setting names can't be renamed or disabled
     # out from under it (#1359). Disabling the last enabled model is allowed:
@@ -15816,7 +16196,9 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
         if alias_changed or gate.pair_changed or gate.scopes_value_changed:
             # A rename orphans the OLD alias's identity keys outright; a
             # re-aim or scope change leaves rows whose bearer was minted for
-            # the superseded shape. Either way the rows purge under the old
+            # the superseded shape. On a client-credentials row a token URL,
+            # client id or secret change is a re-aim (pair_changed), so the
+            # cached ``__model_app__:<alias>`` token goes with it. Either way the rows purge under the old
             # alias — the mint-side freshness gate refuses stale rows
             # regardless, so this is at-rest hygiene, not the serving
             # guarantee.
@@ -15824,8 +16206,9 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
 
     audit_uid, ip = _audit_context(request)
     audit_detail = dict(updates)
-    if "api_key" in audit_detail and not is_secret_reference(audit_detail["api_key"]):
-        audit_detail["api_key"] = "(updated)"
+    for secret_field in ("api_key", "oauth_client_secret"):
+        if secret_field in audit_detail and not is_secret_reference(audit_detail[secret_field]):
+            audit_detail[secret_field] = "(updated)"
     if gate.auth_config_changed:
         # Make the gate decision reconstructable from the audit row alone.
         # Inserted FIRST: the audit tab renders only a detail's first three
