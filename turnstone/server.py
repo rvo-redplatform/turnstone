@@ -6457,6 +6457,7 @@ def main() -> None:
         persona_snapshot: PersonaSnapshot | None = None,
         fork_reservation_token: str = "",
         workstream_lease: WorkstreamLease | None = None,
+        run_session_id: str = "",
     ) -> ChatSession:
         assert ui is not None
         # Resolve the effective alias once and use it consistently
@@ -6559,6 +6560,7 @@ def main() -> None:
             persona_snapshot=persona_snapshot,
             fork_reservation_token=fork_reservation_token,
             workstream_lease=workstream_lease,
+            run_session_id=run_session_id,
         )
 
     # Create WatchRunner (periodic command polling, server-level)

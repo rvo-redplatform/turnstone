@@ -107,6 +107,7 @@ def build_console_session_factory(
         persona_snapshot: PersonaSnapshot | None = None,
         fork_reservation_token: str = "",
         workstream_lease: WorkstreamLease | None = None,
+        run_session_id: str = "",
     ) -> ChatSession:
         assert ui is not None, "console session_factory requires a non-None UI"
         if kind != WorkstreamKind.COORDINATOR:
@@ -227,6 +228,7 @@ def build_console_session_factory(
             persona_snapshot=persona_snapshot,
             fork_reservation_token=fork_reservation_token,
             workstream_lease=workstream_lease,
+            run_session_id=run_session_id,
         )
 
     return factory

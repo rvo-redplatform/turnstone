@@ -1758,7 +1758,9 @@ The run id is the id of the root (coordinator) workstream. Children get it
 through `parent_ws_id`, so the coordinator and all its children send the same
 session id. A workstream create body can set an optional `session_id` to
 override the run id; for example, a calling application can pass its own run
-UUID. Judge calls made for the run send the same headers. With the switch
+UUID; it must be 1 to 128 characters from `A-Z a-z 0-9 . _ : -`, starting
+with a letter or digit, or the create is refused with 400. Judge calls made
+for the run send the same headers. With the switch
 off, none of these headers is sent.
 
 ```toml

@@ -1083,21 +1083,39 @@ def resolve_judge_binding(
     never replaced by another model (#1529).
     """
     if not alias:
-        return _judge_binding_from_session(session_binding, config_store)
-    registry = session_binding.lane.registry
-    if registry is None:
-        raise JudgeModelUnavailableError(f"judge model {alias!r} has no model registry")
-    try:
-        return resolve_model_binding(
-            registry,
-            alias,
-            config_store=config_store,
-            backend_auth_resolver=session_binding.lane.backend_auth_resolver,
-        )
-    except (ValueError, KeyError) as exc:
-        # ``UnknownModelAliasError`` and ``ModelClientConstructionError`` are both
-        # ValueErrors; anything else is a bug and propagates as itself.
-        raise JudgeModelUnavailableError(f"judge model {alias!r}: {exc}") from exc
+        binding = _judge_binding_from_session(session_binding, config_store)
+    else:
+        registry = session_binding.lane.registry
+        if registry is None:
+            raise JudgeModelUnavailableError(f"judge model {alias!r} has no model registry")
+        try:
+            binding = resolve_model_binding(
+                registry,
+                alias,
+                config_store=config_store,
+                backend_auth_resolver=session_binding.lane.backend_auth_resolver,
+            )
+        except (ValueError, KeyError) as exc:
+            # ``UnknownModelAliasError`` and ``ModelClientConstructionError`` are both
+            # ValueErrors; anything else is a bug and propagates as itself.
+            raise JudgeModelUnavailableError(f"judge model {alias!r}: {exc}") from exc
+    # Judge calls belong to the session's run: they send its run session
+    # headers when the judge's own definition has ``session_headers`` on.
+    run_identity = session_binding.lane.run_identity
+    if run_identity is None:
+        return binding
+    return replace(binding, lane=replace(binding.lane, run_identity=run_identity))
+
+
+def judge_client_default_headers(config: Any | None) -> dict[str, str]:
+    """The definition's ``default_headers`` a judge's rebuilt client must carry.
+
+    A judge builds its own SDK client from the bound one's connection details;
+    without these the rebuilt client would drop the headers every other call
+    of the definition sends.
+    """
+    headers = getattr(config, "default_headers", None)
+    return dict(headers) if isinstance(headers, dict) else {}
 
 
 @dataclass
@@ -1375,6 +1393,7 @@ class IntentJudge:
         self._client_factory_args = self._extract_client_config(
             self._lane.client,
             self._lane.provider.provider_name,
+            default_headers=judge_client_default_headers(binding.config),
         )
         self._judge_context_window = _positive_window(
             getattr(binding.config, "context_window", None),
@@ -1410,8 +1429,17 @@ class IntentJudge:
     # -- Client lifecycle helpers -------------------------------------------
 
     @staticmethod
-    def _extract_client_config(client: Any, provider_name: str) -> dict[str, Any]:
-        """Extract connection config from an existing SDK client for re-creation."""
+    def _extract_client_config(
+        client: Any,
+        provider_name: str,
+        *,
+        default_headers: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Extract connection config from an existing SDK client for re-creation.
+
+        *default_headers* are the definition's ``default_headers``, passed on to
+        :func:`~turnstone.core.providers.create_client`.
+        """
         from turnstone.core.providers import ANTHROPIC_WORKSPACE_HEADER
 
         base_url = str(getattr(client, "base_url", getattr(client, "_base_url", "")))
@@ -1427,6 +1455,7 @@ class IntentJudge:
             "base_url": base_url,
             "api_key": api_key,
             "workspace_id": scope if isinstance(scope, str) else "",
+            "default_headers": dict(default_headers or {}),
         }
 
     def _create_client(self) -> Any:

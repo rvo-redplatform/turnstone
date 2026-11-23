@@ -109,6 +109,7 @@ from turnstone.core.providers._protocol import (
 from turnstone.core.providers._protocol import (
     serialized_tool_chars as serialized_tool_chars,
 )
+from turnstone.core.run_session import RunIdentity, session_request_headers
 from turnstone.core.storage._utils import (
     _CLIENT_TOOL_CALL_BLOCK_TYPES,
     strip_orphan_client_tool_blocks,
@@ -547,6 +548,10 @@ class ModelLane:
     # Stable per-alias registry gate.  The gate object survives hot-resizes,
     # so old and newly resolved lanes coordinate through one FIFO.
     admission: ModelAdmission | None = None
+    # The run this lane's calls belong to.  When ``backend_auth_config`` has
+    # ``session_headers`` on, :func:`lane_call_client` sends the run session
+    # headers on every request (see :mod:`turnstone.core.run_session`).
+    run_identity: RunIdentity | None = None
 
 
 @dataclass(frozen=True)
@@ -1267,11 +1272,18 @@ def lane_call_client(
             _raise_if_aborted(cancel_ref, lane)
             raise
         _raise_if_aborted(cancel_ref, lane)
-    call_client = (
-        lane.client.with_options(api_key=resolved_backend_auth)
-        if resolved_backend_auth
-        else lane.client
-    )
+    options: dict[str, Any] = {}
+    if resolved_backend_auth:
+        options["api_key"] = resolved_backend_auth
+    # Run session headers ride the per-call copy, not the shared registry
+    # client: both SDKs merge ``default_headers`` over the client's own, so the
+    # definition's ``default_headers`` stay.  Every attempt (including the
+    # re-sent request after a backend 401) passes through here, so each one
+    # carries the same values.
+    session_headers = session_request_headers(lane.backend_auth_config, lane.run_identity)
+    if session_headers:
+        options["default_headers"] = session_headers
+    call_client = lane.client.with_options(**options) if options else lane.client
     _raise_if_aborted(cancel_ref, lane)
     return call_client
 
