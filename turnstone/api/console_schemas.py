@@ -1128,11 +1128,24 @@ class ModelDefinitionInfo(BaseModel):
     surface_persisted_reasoning: bool = True
     replay_reasoning_to_model: bool = False
     # "static" (send api_key), "entra_obo" / "rfc8693_obo" (delegated-user
-    # token), or "entra_app" (shared app token) for obo_audience at call
-    # time; obo_scopes is the rfc8693 exchange-leg scope request.
+    # token), "entra_app" (shared app token) for obo_audience at call
+    # time, or "oauth_client_credentials" (shared token minted from the
+    # definition's own oauth_token_url); obo_scopes is the rfc8693
+    # exchange-leg scope request, or the client-credentials grant's scope.
     auth_mode: str = "static"
     obo_audience: str = ""
     obo_scopes: str = ""
+    oauth_token_url: str = ""
+    oauth_client_id: str = ""
+    oauth_client_secret: str = Field(
+        default="",
+        description="A literal secret is returned as '***'; a secret:// reference verbatim.",
+    )
+    default_headers: str = Field(
+        default="{}",
+        description="JSON object text of the extra headers sent on every call.",
+    )
+    session_headers: bool = False
     source: str = ""
     created_by: str = ""
     created: str = ""
@@ -1194,6 +1207,32 @@ class CreateModelDefinitionRequest(BaseModel):
     auth_mode: str = "static"
     obo_audience: str = ""
     obo_scopes: str = ""
+    oauth_token_url: str = Field(
+        default="",
+        description=(
+            "oauth_client_credentials only: the token endpoint. Must be listed in "
+            "model.oauth_token_url_allowlist (400 otherwise)."
+        ),
+    )
+    oauth_client_id: str = Field(default="", description="oauth_client_credentials only.")
+    oauth_client_secret: str = Field(
+        default="",
+        description=(
+            "oauth_client_credentials only: a literal secret or a secret:// reference. "
+            "Returned as '***' when literal."
+        ),
+    )
+    default_headers: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Extra headers sent on every call. Credential headers (authorization, "
+            "x-api-key, ...) and headers Turnstone sets are refused (400)."
+        ),
+    )
+    session_headers: bool = Field(
+        default=False,
+        description="Send the per-run Switchyard session headers on every call of a run.",
+    )
 
 
 class UpdateModelDefinitionRequest(BaseModel):
@@ -1243,6 +1282,21 @@ class UpdateModelDefinitionRequest(BaseModel):
     auth_mode: str | None = None
     obo_audience: str | None = None
     obo_scopes: str | None = None
+    # Presence-keyed; JSON null is refused (400), so it is not advertised.
+    oauth_token_url: str | SkipJsonSchema[None] = Field(default_factory=lambda: None)
+    oauth_client_id: str | SkipJsonSchema[None] = Field(default_factory=lambda: None)
+    oauth_client_secret: str | SkipJsonSchema[None] = Field(
+        default_factory=lambda: None,
+        description=(
+            "Omit, or send '' or '***', to keep the stored secret; the stored "
+            "secret:// reference echoed back unchanged also keeps it."
+        ),
+    )
+    default_headers: dict[str, str] | SkipJsonSchema[None] = Field(
+        default=None,
+        description="Full replacement headers object. Omit to leave unchanged.",
+    )
+    session_headers: bool | SkipJsonSchema[None] = Field(default_factory=lambda: None)
 
 
 class ListModelDefinitionsResponse(BaseModel):
@@ -1316,6 +1370,19 @@ class ModelAuthConstraintsResponse(BaseModel):
             "Required [oidc] obo_grant_profile per dynamic auth_mode. "
             "Affordance for greying options that cannot validate under this "
             "deployment's profile; the write validator remains the authority."
+        ),
+    )
+    client_credentials_auth_modes: list[str] = Field(
+        description=(
+            "auth_mode values that mint from the definition's own token endpoint "
+            "(oauth_token_url / oauth_client_id / oauth_client_secret) and need no "
+            "audience or [oidc] profile; drives those inputs' visibility."
+        ),
+    )
+    oauth_token_url_allowlist: list[str] = Field(
+        description=(
+            "Exact token endpoints a client-credentials definition may use, from "
+            "model.oauth_token_url_allowlist; empty means every one is refused."
         ),
     )
 

@@ -13844,6 +13844,33 @@
             "title": "Obo Scopes",
             "type": "string"
           },
+          "oauth_token_url": {
+            "default": "",
+            "title": "Oauth Token Url",
+            "type": "string"
+          },
+          "oauth_client_id": {
+            "default": "",
+            "title": "Oauth Client Id",
+            "type": "string"
+          },
+          "oauth_client_secret": {
+            "default": "",
+            "description": "A literal secret is returned as '***'; a secret:// reference verbatim.",
+            "title": "Oauth Client Secret",
+            "type": "string"
+          },
+          "default_headers": {
+            "default": "{}",
+            "description": "JSON object text of the extra headers sent on every call.",
+            "title": "Default Headers",
+            "type": "string"
+          },
+          "session_headers": {
+            "default": false,
+            "title": "Session Headers",
+            "type": "boolean"
+          },
           "source": {
             "default": "",
             "title": "Source",
@@ -13989,6 +14016,33 @@
             "title": "Obo Scopes",
             "type": "string"
           },
+          "oauth_token_url": {
+            "default": "",
+            "title": "Oauth Token Url",
+            "type": "string"
+          },
+          "oauth_client_id": {
+            "default": "",
+            "title": "Oauth Client Id",
+            "type": "string"
+          },
+          "oauth_client_secret": {
+            "default": "",
+            "description": "A literal secret is returned as '***'; a secret:// reference verbatim.",
+            "title": "Oauth Client Secret",
+            "type": "string"
+          },
+          "default_headers": {
+            "default": "{}",
+            "description": "JSON object text of the extra headers sent on every call.",
+            "title": "Default Headers",
+            "type": "string"
+          },
+          "session_headers": {
+            "default": false,
+            "title": "Session Headers",
+            "type": "boolean"
+          },
           "source": {
             "default": "",
             "title": "Source",
@@ -14130,6 +14184,38 @@
             "default": "",
             "title": "Obo Scopes",
             "type": "string"
+          },
+          "oauth_token_url": {
+            "default": "",
+            "description": "oauth_client_credentials only: the token endpoint. Must be listed in model.oauth_token_url_allowlist (400 otherwise).",
+            "title": "Oauth Token Url",
+            "type": "string"
+          },
+          "oauth_client_id": {
+            "default": "",
+            "description": "oauth_client_credentials only.",
+            "title": "Oauth Client Id",
+            "type": "string"
+          },
+          "oauth_client_secret": {
+            "default": "",
+            "description": "oauth_client_credentials only: a literal secret or a secret:// reference. Returned as '***' when literal.",
+            "title": "Oauth Client Secret",
+            "type": "string"
+          },
+          "default_headers": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Extra headers sent on every call. Credential headers (authorization, x-api-key, ...) and headers Turnstone sets are refused (400).",
+            "title": "Default Headers",
+            "type": "object"
+          },
+          "session_headers": {
+            "default": false,
+            "description": "Send the per-run Switchyard session headers on every call of a run.",
+            "title": "Session Headers",
+            "type": "boolean"
           }
         },
         "required": [
@@ -14317,6 +14403,32 @@
             ],
             "default": null,
             "title": "Obo Scopes"
+          },
+          "oauth_token_url": {
+            "title": "Oauth Token Url",
+            "type": "string"
+          },
+          "oauth_client_id": {
+            "title": "Oauth Client Id",
+            "type": "string"
+          },
+          "oauth_client_secret": {
+            "description": "Omit, or send '' or '***', to keep the stored secret; the stored secret:// reference echoed back unchanged also keeps it.",
+            "title": "Oauth Client Secret",
+            "type": "string"
+          },
+          "default_headers": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "default": null,
+            "description": "Full replacement headers object. Omit to leave unchanged.",
+            "title": "Default Headers",
+            "type": "object"
+          },
+          "session_headers": {
+            "title": "Session Headers",
+            "type": "boolean"
           }
         },
         "title": "UpdateModelDefinitionRequest",
@@ -14404,6 +14516,22 @@
             "description": "Required [oidc] obo_grant_profile per dynamic auth_mode. Affordance for greying options that cannot validate under this deployment's profile; the write validator remains the authority.",
             "title": "Auth Mode Profiles",
             "type": "object"
+          },
+          "client_credentials_auth_modes": {
+            "description": "auth_mode values that mint from the definition's own token endpoint (oauth_token_url / oauth_client_id / oauth_client_secret) and need no audience or [oidc] profile; drives those inputs' visibility.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Client Credentials Auth Modes",
+            "type": "array"
+          },
+          "oauth_token_url_allowlist": {
+            "description": "Exact token endpoints a client-credentials definition may use, from model.oauth_token_url_allowlist; empty means every one is refused.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Oauth Token Url Allowlist",
+            "type": "array"
           }
         },
         "required": [
@@ -14412,7 +14540,9 @@
           "dynamic_auth_modes",
           "scopes_auth_modes",
           "app_identity_auth_modes",
-          "auth_mode_profiles"
+          "auth_mode_profiles",
+          "client_credentials_auth_modes",
+          "oauth_token_url_allowlist"
         ],
         "title": "ModelAuthConstraintsResponse",
         "type": "object"

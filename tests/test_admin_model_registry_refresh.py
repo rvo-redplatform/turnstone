@@ -33,6 +33,7 @@ from turnstone.console.server import (
     admin_create_model_definition,
     admin_delete_model_definition,
     admin_detect_model,
+    admin_get_model_definition,
     admin_list_model_definitions,
     admin_model_auth_constraints,
     admin_model_reload,
@@ -130,6 +131,9 @@ def _seed_model_def(
     obo_scopes: str = "",
     capabilities: str = "{}",
     max_concurrency: int = 0,
+    oauth_token_url: str = "",
+    oauth_client_id: str = "",
+    oauth_client_secret: str = "",
 ) -> None:
     """Insert a model definition row directly via the storage API."""
     storage.create_model_definition(
@@ -147,6 +151,9 @@ def _seed_model_def(
         obo_audience=obo_audience,
         obo_scopes=obo_scopes,
         max_concurrency=max_concurrency,
+        oauth_token_url=oauth_token_url,
+        oauth_client_id=oauth_client_id,
+        oauth_client_secret=oauth_client_secret,
     )
 
 
@@ -1037,6 +1044,11 @@ def _make_client(
                 "/v1/api/admin/model-definitions/reload",
                 admin_model_reload,
                 methods=["POST"],
+            ),
+            Route(
+                "/v1/api/admin/model-definitions/{definition_id}",
+                admin_get_model_definition,
+                methods=["GET"],
             ),
             Route(
                 "/v1/api/admin/model-definitions/{definition_id}",
@@ -4380,34 +4392,35 @@ def test_every_mutable_column_probes_its_classification(
         "a mutable column has no probe value — add one so its classification "
         "is exercised, not just declared"
     )
-    # Migration 090 columns the console write path does not accept yet: it
-    # drops them, so no caller can write them at all. AI-DP-3009 (console API
-    # for oauth_client_credentials) gates them and empties this set.
-    console_pending = {
-        "oauth_token_url",
-        "oauth_client_id",
-        "oauth_client_secret",
-        "default_headers",
-        "session_headers",
-    }
-    assert console_pending <= MODEL_DEFINITION_MUTABLE
-    assert not (console_pending & MODEL_AUTH_NEUTRAL_FIELDS)
     _stub_console_mcp(monkeypatch)
 
-    for column in sorted(MODEL_DEFINITION_MUTABLE - console_pending):
+    client_credentials_columns = {"oauth_token_url", "oauth_client_id", "oauth_client_secret"}
+    for column in sorted(MODEL_DEFINITION_MUTABLE):
         definition_id = f"probe-{column.replace('_', '-')}"
-        _seed_model_def(
-            storage,
-            definition_id=definition_id,
-            alias=f"gw-{column}",
-            model="m",
-            enabled=(column != "enabled"),
-            # The scopes probe seeds the one mode that accepts a scopes
-            # value, so the 403 (permission enforced) is what the probe
-            # observes rather than the earlier staging-shape 400.
-            auth_mode="rfc8693_obo" if column == "obo_scopes" else "entra_obo",
-            obo_audience="api://approved",
-        )
+        if column in client_credentials_columns:
+            # The client-credentials probes seed the one mode that reads
+            # those columns, so the probe observes the 403 rather than the
+            # earlier staging-shape 400.
+            _seed_model_def(
+                storage,
+                definition_id=definition_id,
+                alias=f"gw-{column}",
+                model="m",
+                **_CC_SEED,
+            )
+        else:
+            _seed_model_def(
+                storage,
+                definition_id=definition_id,
+                alias=f"gw-{column}",
+                model="m",
+                enabled=(column != "enabled"),
+                # The scopes probe seeds the one mode that accepts a scopes
+                # value, so the 403 (permission enforced) is what the probe
+                # observes rather than the earlier staging-shape 400.
+                auth_mode="rfc8693_obo" if column == "obo_scopes" else "entra_obo",
+                obo_audience="api://approved",
+            )
         client = _make_client(storage, _make_registry(alias=f"gw-{column}", model="m"))
         resp = client.put(
             f"/v1/api/admin/model-definitions/{definition_id}",
@@ -5308,3 +5321,444 @@ def test_the_models_tab_pick_skips_a_reranker(storage: SQLiteBackend) -> None:
     client = _routing_client(storage, _make_registry(alias="b-chat"))
 
     assert client.get("/v1/api/admin/model-definitions").json()["default_alias"] == "b-chat"
+
+
+# ---------------------------------------------------------------------------
+# oauth_client_credentials definitions on the console API (AI-DP-3009)
+# ---------------------------------------------------------------------------
+
+_CC_TOKEN_URL = "https://auth.example/oauth2/token"
+_CC_OTHER_TOKEN_URL = "https://auth2.example/oauth2/token"
+_CC_SEED: dict[str, Any] = {
+    "auth_mode": "oauth_client_credentials",
+    "obo_scopes": "ai-gateway/invoke",
+    "oauth_token_url": _CC_TOKEN_URL,
+    "oauth_client_id": "client-1",
+    "oauth_client_secret": "secret-1",
+}
+
+
+def _cc_client(
+    storage: SQLiteBackend,
+    *,
+    perms: str = "admin.models,admin.mcp",
+    token_url_allowlist: str = f"{_CC_TOKEN_URL}\n{_CC_OTHER_TOKEN_URL}",
+    alias: str = "local",
+) -> TestClient:
+    """_make_client with ``model.oauth_token_url_allowlist`` answered."""
+    client = _make_client(storage, _make_registry(alias=alias, model="m"), perms=perms)
+    answers = {
+        "model.auth_audience_allowlist": "api://approved",
+        "model.default_alias": alias,
+        "model.oauth_token_url_allowlist": token_url_allowlist,
+    }
+    client.app.state.config_store.get.side_effect = lambda key, default=None: answers.get(
+        key, default
+    )
+    return client
+
+
+def _cc_create(client: TestClient, **overrides: Any) -> Any:
+    body: dict[str, Any] = {
+        "alias": "aidp",
+        "model": "aiq-agent",
+        "base_url": "https://aidp.example/v1",
+        "auth_mode": "oauth_client_credentials",
+        "obo_scopes": "ai-gateway/invoke",
+        "oauth_token_url": _CC_TOKEN_URL,
+        "oauth_client_id": "client-1",
+        "oauth_client_secret": "secret-1",
+    }
+    body.update(overrides)
+    return client.post("/v1/api/admin/model-definitions", json=body)
+
+
+def test_cc_create_get_update_round_trip_masks_the_secret(
+    storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Create, get, list and update all carry the five migration 090 fields,
+    and a literal client secret only ever leaves the console as ``***``."""
+    client = _cc_client(storage)
+    _stub_console_mcp(monkeypatch)
+
+    created = _cc_create(
+        client, default_headers={"x-team": "aiq"}, session_headers=True, obo_audience=""
+    )
+    assert created.status_code == 200, created.text
+    body = created.json()
+    assert body["oauth_client_secret"] == "***"
+    assert body["oauth_token_url"] == _CC_TOKEN_URL
+    assert body["oauth_client_id"] == "client-1"
+    assert json.loads(body["default_headers"]) == {"x-team": "aiq"}
+    assert body["session_headers"] is True
+    definition_id = body["definition_id"]
+    row = storage.get_model_definition(definition_id)
+    assert row["oauth_client_secret"] == "secret-1"
+
+    got = client.get(f"/v1/api/admin/model-definitions/{definition_id}")
+    assert got.status_code == 200, got.text
+    assert got.json()["oauth_client_secret"] == "***"
+    assert got.json()["auth_mode"] == "oauth_client_credentials"
+    listed = client.get("/v1/api/admin/model-definitions").json()["models"]
+    assert [m["oauth_client_secret"] for m in listed if m["alias"] == "aidp"] == ["***"]
+
+    # A read-modify-write echo of the masked form keeps the stored secret.
+    echoed = {k: v for k, v in got.json().items() if k not in ("definition_id", "source")}
+    echoed["capabilities"] = json.loads(echoed["capabilities"])
+    echoed["default_headers"] = json.loads(echoed["default_headers"])
+    for key in ("created_by", "created", "updated"):
+        echoed.pop(key, None)
+    resp = client.put(f"/v1/api/admin/model-definitions/{definition_id}", json=echoed)
+    assert resp.status_code == 200, resp.text
+    assert storage.get_model_definition(definition_id)["oauth_client_secret"] == "secret-1"
+
+    resp = client.put(
+        f"/v1/api/admin/model-definitions/{definition_id}",
+        json={"oauth_client_secret": "secret-2", "session_headers": False},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["oauth_client_secret"] == "***"
+    assert resp.json()["session_headers"] is False
+    assert storage.get_model_definition(definition_id)["oauth_client_secret"] == "secret-2"
+
+
+def test_cc_secret_reference_is_returned_verbatim(
+    storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from turnstone.console import server as server_module
+
+    async def _resolves(_value: str) -> None:
+        return None
+
+    monkeypatch.setattr(server_module, "_check_secret_reference", _resolves)
+    client = _cc_client(storage)
+    _stub_console_mcp(monkeypatch)
+
+    ref = "secret://file/aidp/client-secret"
+    resp = _cc_create(client, oauth_client_secret=ref)
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["oauth_client_secret"] == ref
+
+
+def test_cc_create_needs_no_oidc_profile_or_audience(
+    storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The mode mints from its own endpoint: no [oidc], no grant profile, no
+    audience allow-list entry."""
+    client = _cc_client(storage)
+    oauth_context(client.app.state).oidc_config = make_oidc_config(enabled=False)
+    _stub_console_mcp(monkeypatch)
+
+    resp = _cc_create(client)
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["obo_audience"] == ""
+
+
+@pytest.mark.parametrize(
+    "allowlist",
+    [_CC_OTHER_TOKEN_URL, ""],
+    ids=["not-listed", "empty-allowlist"],
+)
+def test_cc_non_allowlisted_token_url_is_400(
+    storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch, allowlist: str
+) -> None:
+    client = _cc_client(storage, token_url_allowlist=allowlist)
+    _stub_console_mcp(monkeypatch)
+
+    resp = _cc_create(client)
+
+    assert resp.status_code == 400, resp.text
+    assert "model.oauth_token_url_allowlist" in resp.json()["error"]
+    assert storage.get_model_definition_by_alias("aidp") is None
+
+
+def test_cc_update_to_non_allowlisted_token_url_is_400(
+    storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_model_def(storage, definition_id="cc1", alias="local", model="m", **_CC_SEED)
+    client = _cc_client(storage)
+    _stub_console_mcp(monkeypatch)
+
+    resp = client.put(
+        "/v1/api/admin/model-definitions/cc1",
+        json={"oauth_token_url": "https://evil.example/oauth2/token"},
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert "model.oauth_token_url_allowlist" in resp.json()["error"]
+    assert storage.get_model_definition("cc1")["oauth_token_url"] == _CC_TOKEN_URL
+
+
+def test_cc_delisted_token_url_blocks_an_unrelated_gated_edit(
+    storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Row validity is value-based, like the audience check: a token URL that
+    left the allow-list cannot be re-aimed at a new base_url."""
+    _seed_model_def(storage, definition_id="cc1", alias="local", model="m", **_CC_SEED)
+    client = _cc_client(storage, token_url_allowlist=_CC_OTHER_TOKEN_URL)
+    _stub_console_mcp(monkeypatch)
+
+    resp = client.put(
+        "/v1/api/admin/model-definitions/cc1", json={"base_url": "https://other.example/v1"}
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert "model.oauth_token_url_allowlist" in resp.json()["error"]
+
+
+@pytest.mark.parametrize(
+    ("overrides", "needle"),
+    [
+        ({"oauth_client_secret": ""}, "oauth_client_secret"),
+        ({"oauth_client_id": ""}, "oauth_client_id"),
+        ({"obo_scopes": ""}, "obo_scopes"),
+        ({"oauth_token_url": "ftp://idp.example/token"}, "oauth_token_url"),
+        ({"oauth_client_secret": "${AIDP_SECRET}"}, "oauth_client_secret"),
+        ({"obo_audience": "api://approved"}, "obo_audience"),
+        ({"oauth_client_id": 7}, "oauth_client_id must be a string"),
+    ],
+    ids=["no-secret", "no-client-id", "no-scope", "bad-url", "placeholder", "audience", "type"],
+)
+def test_cc_create_refuses_an_unloadable_row(
+    storage: SQLiteBackend,
+    monkeypatch: pytest.MonkeyPatch,
+    overrides: dict[str, Any],
+    needle: str,
+) -> None:
+    client = _cc_client(storage)
+    _stub_console_mcp(monkeypatch)
+
+    resp = _cc_create(client, **overrides)
+
+    assert resp.status_code == 400, resp.text
+    assert needle in resp.json()["error"]
+    assert storage.get_model_definition_by_alias("aidp") is None
+
+
+def test_cc_fields_cannot_be_staged_on_other_modes(
+    storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Twin of the audience/scopes staging guards, on create and update."""
+    _seed_model_def(storage, definition_id="m1", alias="local", model="m")
+    client = _cc_client(storage)
+    _stub_console_mcp(monkeypatch)
+
+    created = client.post(
+        "/v1/api/admin/model-definitions",
+        json={"alias": "plain", "model": "x", "oauth_token_url": _CC_TOKEN_URL},
+    )
+    updated = client.put(
+        "/v1/api/admin/model-definitions/m1", json={"oauth_client_secret": "parked"}
+    )
+    cleared = client.put("/v1/api/admin/model-definitions/m1", json={"oauth_client_id": ""})
+
+    for resp in (created, updated):
+        assert resp.status_code == 400, resp.text
+        assert "only used by auth_mode" in resp.json()["error"]
+    assert cleared.status_code == 200, cleared.text
+    assert storage.get_model_definition("m1")["oauth_client_secret"] == ""
+
+
+def test_cc_create_and_edit_require_admin_mcp(
+    storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_model_def(storage, definition_id="cc1", alias="local", model="m", **_CC_SEED)
+    client = _cc_client(storage, perms="admin.models")
+    _stub_console_mcp(monkeypatch)
+
+    created = _cc_create(client)
+    edited = client.put("/v1/api/admin/model-definitions/cc1", json={"oauth_client_id": "client-2"})
+    neutral = client.put("/v1/api/admin/model-definitions/cc1", json={"temperature": 0.5})
+
+    for resp in (created, edited):
+        assert resp.status_code == 403, resp.text
+        assert "admin.mcp" in resp.json()["error"]
+    assert neutral.status_code == 200, neutral.text
+    assert storage.get_model_definition("cc1")["oauth_client_id"] == "client-1"
+
+
+def test_cc_pure_disable_needs_only_admin_models_even_when_unloadable(
+    storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The disarm carve-out holds for this mode: a row missing its secret
+    (DB-direct) can still be disabled under admin.models."""
+    seed = {**_CC_SEED, "oauth_client_secret": ""}
+    _seed_model_def(storage, definition_id="cc1", alias="local", model="m", **seed)
+    client = _cc_client(storage, perms="admin.models", token_url_allowlist="")
+    _stub_console_mcp(monkeypatch)
+
+    resp = client.put("/v1/api/admin/model-definitions/cc1", json={"enabled": False})
+
+    assert resp.status_code == 200, resp.text
+    assert not storage.get_model_definition("cc1")["enabled"]
+
+
+@pytest.mark.parametrize(
+    ("headers", "needle"),
+    [
+        ({"Authorization": "Bearer x"}, "credential"),
+        ({"X-Api-Key": "k"}, "credential"),
+        ({"x-switchyard-session-id": "s"}, "set by Turnstone"),
+        ({"bad header": "v"}, "not a valid header name"),
+        ({"x-ok": "line\r\nx-injected: 1"}, "control characters"),
+        ({"x-ok": "secret://file/a"}, "secret://"),
+        ({"x-ok": 1}, "string value"),
+        ({"X-Team": "a", "x-team": "b"}, "more than once"),
+        (["x-team"], "must be an object"),
+    ],
+    ids=[
+        "authorization",
+        "api-key",
+        "turnstone-owned",
+        "bad-name",
+        "crlf",
+        "reference",
+        "non-string",
+        "duplicate",
+        "not-object",
+    ],
+)
+def test_default_headers_are_validated(
+    storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch, headers: Any, needle: str
+) -> None:
+    _seed_model_def(storage, definition_id="m1", alias="local", model="m")
+    client = _cc_client(storage)
+    _stub_console_mcp(monkeypatch)
+
+    created = _cc_create(client, default_headers=headers)
+    updated = client.put("/v1/api/admin/model-definitions/m1", json={"default_headers": headers})
+
+    for resp in (created, updated):
+        assert resp.status_code == 400, resp.text
+        assert needle in resp.json()["error"]
+
+
+def test_session_headers_must_be_a_json_boolean(
+    storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_model_def(storage, definition_id="m1", alias="local", model="m")
+    client = _cc_client(storage)
+    _stub_console_mcp(monkeypatch)
+
+    created = _cc_create(client, session_headers="false")
+    updated = client.put("/v1/api/admin/model-definitions/m1", json={"session_headers": 1})
+
+    for resp in (created, updated):
+        assert resp.status_code == 400, resp.text
+        assert "session_headers" in resp.json()["error"]
+
+
+def test_headers_on_a_static_row_need_only_admin_models(
+    storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Headers are gated only where a minted credential is involved."""
+    _seed_model_def(storage, definition_id="m1", alias="local", model="m")
+    client = _cc_client(storage, perms="admin.models")
+    _stub_console_mcp(monkeypatch)
+
+    resp = client.put(
+        "/v1/api/admin/model-definitions/m1",
+        json={"default_headers": {"x-team": "aiq"}, "session_headers": True},
+    )
+
+    assert resp.status_code == 200, resp.text
+    row = storage.get_model_definition("m1")
+    assert json.loads(row["default_headers"]) == {"x-team": "aiq"}
+    assert row["session_headers"] is True
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [
+        {"oauth_token_url": _CC_OTHER_TOKEN_URL},
+        {"oauth_client_id": "client-2"},
+        {"oauth_client_secret": "secret-2"},
+        {"obo_scopes": "ai-gateway/invoke openid"},
+    ],
+    ids=["token-url", "client-id", "client-secret", "scope"],
+)
+def test_cc_auth_edit_purges_the_cached_token_and_reloads_the_alias(
+    storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch, edit: dict[str, str]
+) -> None:
+    """Editing any auth field drops the alias's cached app token (the
+    ``__model_app__:<alias>`` row the mint reuses) — never a sibling's — and
+    the registry reload adopts the new auth config for that alias."""
+    from turnstone.core.model_oauth import model_app_cache_server
+
+    _seed_model_def(storage, definition_id="cc1", alias="local", model="m", **_CC_SEED)
+    own = model_app_cache_server("local")
+    sibling = model_app_cache_server("sibling")
+    for key in (own, sibling):
+        _seed_mint_cache_row(storage, "__app__", key)
+    client = _cc_client(storage)
+    _stub_console_mcp(monkeypatch)
+
+    resp = client.put("/v1/api/admin/model-definitions/cc1", json=edit)
+
+    assert resp.status_code == 200, resp.text
+    assert storage.get_oauth_token("__app__", own) is None
+    assert storage.get_oauth_token("__app__", sibling) is not None
+    cfg = client.app.state.coord_registry.get_config("local")
+    field, value = next(iter(edit.items()))
+    if field == "oauth_client_secret":
+        assert cfg.oauth_client_secret == value
+    elif field == "obo_scopes":
+        assert cfg.obo_scopes == value
+    else:
+        assert getattr(cfg, field) == value
+
+
+def test_cc_non_auth_edit_keeps_the_cached_token(
+    storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from turnstone.core.model_oauth import model_app_cache_server
+
+    _seed_model_def(storage, definition_id="cc1", alias="local", model="m", **_CC_SEED)
+    own = model_app_cache_server("local")
+    _seed_mint_cache_row(storage, "__app__", own)
+    client = _cc_client(storage)
+    _stub_console_mcp(monkeypatch)
+
+    # The masked secret echoed back is no change either.
+    resp = client.put(
+        "/v1/api/admin/model-definitions/cc1",
+        json={"temperature": 0.4, "oauth_client_secret": "***"},
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert storage.get_oauth_token("__app__", own) is not None
+
+
+def test_cc_update_audit_never_records_a_literal_secret(
+    storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_model_def(storage, definition_id="cc1", alias="local", model="m", **_CC_SEED)
+    client = _cc_client(storage)
+    _stub_console_mcp(monkeypatch)
+    recorded: list[dict[str, Any]] = []
+    from turnstone.core import audit as audit_module
+
+    monkeypatch.setattr(audit_module, "record_audit", lambda *args, **_kw: recorded.append(args[5]))
+
+    resp = client.put(
+        "/v1/api/admin/model-definitions/cc1", json={"oauth_client_secret": "secret-2"}
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert recorded and recorded[-1]["oauth_client_secret"] == "(updated)"
+    assert "secret-2" not in json.dumps(recorded)
+
+
+def test_auth_constraints_lists_client_credentials_modes_and_token_urls(
+    storage: SQLiteBackend,
+) -> None:
+    from turnstone.core.model_registry import CLIENT_CREDENTIALS_MODEL_AUTH_MODES
+
+    client = _cc_client(storage, token_url_allowlist=f"{_CC_TOKEN_URL}, {_CC_OTHER_TOKEN_URL}")
+
+    body = client.get("/v1/api/admin/model-definitions/auth-constraints").json()
+
+    assert body["client_credentials_auth_modes"] == sorted(CLIENT_CREDENTIALS_MODEL_AUTH_MODES)
+    assert body["oauth_token_url_allowlist"] == sorted([_CC_TOKEN_URL, _CC_OTHER_TOKEN_URL])
