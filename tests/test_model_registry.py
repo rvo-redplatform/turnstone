@@ -6121,7 +6121,16 @@ def test_model_auth_mode_profile_map_matches_mint_legs() -> None:
     # Every dynamic mode names its required profile — a mode missing here is
     # never posture-approvable and never mints, which is fail-closed but
     # must be a deliberate state, not an oversight.
-    assert set(mr_module.MODEL_AUTH_MODE_PROFILES) == set(mr_module.DYNAMIC_MODEL_AUTH_MODES)
+    # The client-credentials modes are the one deliberate exemption: they
+    # mint from their own per-definition token endpoint and never read
+    # ``[oidc]``, so they pair with no profile. A mode is in exactly one of
+    # the two.
+    exempt = mr_module.CLIENT_CREDENTIALS_MODEL_AUTH_MODES
+    assert exempt <= mr_module.DYNAMIC_MODEL_AUTH_MODES
+    assert not (set(mr_module.MODEL_AUTH_MODE_PROFILES) & exempt)
+    assert (
+        set(mr_module.MODEL_AUTH_MODE_PROFILES) == set(mr_module.DYNAMIC_MODEL_AUTH_MODES) - exempt
+    )
     # And every named profile has a real mint leg.
     assert set(mr_module.MODEL_AUTH_MODE_PROFILES.values()) <= OBO_GRANT_PROFILES
 
@@ -6129,9 +6138,15 @@ def test_model_auth_mode_profile_map_matches_mint_legs() -> None:
 def test_auth_mode_classification_sets_are_subsets_of_dynamic() -> None:
     assert mr_module.SCOPES_MODEL_AUTH_MODES <= mr_module.DYNAMIC_MODEL_AUTH_MODES
     assert mr_module.APP_IDENTITY_MODEL_AUTH_MODES <= mr_module.DYNAMIC_MODEL_AUTH_MODES
-    # The scopes-reading and app-identity classes are disjoint: an app mode
-    # that read user-facing exchange scopes would have no coherent principal.
-    assert not (mr_module.SCOPES_MODEL_AUTH_MODES & mr_module.APP_IDENTITY_MODEL_AUTH_MODES)
+    # The scopes-reading and app-identity classes overlap only on the
+    # client-credentials modes, whose obo_scopes is the raw scope of their
+    # OWN app grant (no user involved). An Entra app mode that read
+    # user-facing exchange scopes would have no coherent principal.
+    assert (
+        mr_module.SCOPES_MODEL_AUTH_MODES & mr_module.APP_IDENTITY_MODEL_AUTH_MODES
+        == mr_module.CLIENT_CREDENTIALS_MODEL_AUTH_MODES
+    )
+    assert mr_module.CLIENT_CREDENTIALS_MODEL_AUTH_MODES <= mr_module.APP_IDENTITY_MODEL_AUTH_MODES
 
 
 def test_obo_scopes_normalizers_agree_across_modules() -> None:
@@ -7462,3 +7477,295 @@ class TestOfferedAliases:
             "Error: the model 'typo' is not available: no enabled model definition by that name "
             "is loaded."
         )
+
+
+# ---------------------------------------------------------------------------
+# oauth_client_credentials auth mode (AI-DP-3007)
+# ---------------------------------------------------------------------------
+
+_CC_URL = "https://pool.auth.us-east-1.amazoncognito.com/oauth2/token"
+
+
+def _cc_row(**overrides: Any) -> dict[str, Any]:
+    row: dict[str, Any] = {
+        "alias": "aidp",
+        "model": "aiq-agent",
+        "provider": "openai-compatible",
+        "base_url": "https://aidp.example/v1",
+        "api_key": "",
+        "context_window": 200000,
+        "capabilities": "{}",
+        "enabled": True,
+        "auth_mode": "oauth_client_credentials",
+        "obo_audience": "",
+        "obo_scopes": "ai-gateway/invoke",
+        "oauth_token_url": _CC_URL,
+        "oauth_client_id": "client-123",
+        "oauth_client_secret": "secret://file/aidp/client#secret",
+        "default_headers": '{"x-team": "aiq"}',
+        "session_headers": True,
+    }
+    row.update(overrides)
+    return row
+
+
+def _cc_entry(**overrides: Any) -> dict[str, Any]:
+    entry: dict[str, Any] = {
+        "model": "aiq-agent",
+        "provider": "openai-compatible",
+        "base_url": "https://aidp.example/v1",
+        "context_window": 200000,
+        "auth_mode": "oauth_client_credentials",
+        "obo_scopes": "ai-gateway/invoke",
+        "oauth_token_url": _CC_URL,
+        "oauth_client_id": "client-123",
+        "oauth_client_secret": "literal-secret",
+        "default_headers": {"x-team": "aiq"},
+        "session_headers": True,
+    }
+    entry.update(overrides)
+    return entry
+
+
+def _load_db(*rows: dict[str, Any]) -> ModelRegistry:
+    with patch("turnstone.core.model_registry.load_config", return_value={}):
+        return load_model_registry("http://x/v1", "x", "x", storage=_MockStorage(list(rows)))
+
+
+def _load_toml(**models: dict[str, Any]) -> ModelRegistry:
+    with patch("turnstone.core.model_registry.load_config", return_value={"models": models}):
+        return load_model_registry("http://x/v1", "x", "x")
+
+
+class TestOAuthClientCredentialsMode:
+    def test_mode_classification(self) -> None:
+        mode = "oauth_client_credentials"
+        assert mode in mr_module.MODEL_AUTH_MODES
+        assert mode in mr_module.DYNAMIC_MODEL_AUTH_MODES
+        assert mode in mr_module.SCOPES_MODEL_AUTH_MODES
+        assert mode in mr_module.APP_IDENTITY_MODEL_AUTH_MODES
+        assert mode in mr_module.CLIENT_CREDENTIALS_MODEL_AUTH_MODES
+        assert mode not in mr_module.MODEL_AUTH_MODE_PROFILES
+
+    def test_loads_from_db(self) -> None:
+        cfg = _load_db(_cc_row()).get_config("aidp")
+        assert cfg.auth_mode == "oauth_client_credentials"
+        assert cfg.obo_audience == ""
+        assert cfg.obo_scopes == "ai-gateway/invoke"
+        assert cfg.oauth_token_url == _CC_URL
+        assert cfg.oauth_client_id == "client-123"
+        assert cfg.oauth_client_secret == "secret://file/aidp/client#secret"
+        assert cfg.default_headers == {"x-team": "aiq"}
+        assert cfg.session_headers is True
+
+    def test_loads_from_toml(self) -> None:
+        cfg = _load_toml(aidp=_cc_entry()).get_config("aidp")
+        assert cfg.source == "config"
+        assert cfg.auth_mode == "oauth_client_credentials"
+        assert cfg.obo_scopes == "ai-gateway/invoke"
+        assert cfg.oauth_token_url == _CC_URL
+        assert cfg.oauth_client_id == "client-123"
+        # Kept raw: resolved at mint time so rotation needs no reload.
+        assert cfg.oauth_client_secret == "literal-secret"
+        assert cfg.default_headers == {"x-team": "aiq"}
+        assert cfg.session_headers is True
+
+    def test_secret_not_in_repr(self) -> None:
+        cfg = _load_toml(aidp=_cc_entry()).get_config("aidp")
+        assert "literal-secret" not in repr(cfg)
+
+    def test_static_row_defaults(self) -> None:
+        cfg = _load_db(
+            {
+                "alias": "plain",
+                "model": "m",
+                "provider": "openai",
+                "base_url": "https://api.example/v1",
+                "api_key": "sk",
+                "context_window": 1000,
+                "capabilities": "{}",
+                "enabled": True,
+            }
+        ).get_config("plain")
+        assert (cfg.oauth_token_url, cfg.oauth_client_id, cfg.oauth_client_secret) == ("", "", "")
+        assert cfg.default_headers == {}
+        assert cfg.session_headers is False
+
+    @pytest.mark.parametrize(
+        ("field", "label"),
+        [
+            ("oauth_token_url", "oauth_token_url"),
+            ("oauth_client_id", "oauth_client_id"),
+            ("oauth_client_secret", "oauth_client_secret"),
+            ("obo_scopes", "obo_scopes"),
+        ],
+    )
+    @pytest.mark.parametrize("source", ["db", "toml"])
+    def test_missing_required_field_fails_clearly(
+        self, field: str, label: str, source: str
+    ) -> None:
+        with pytest.raises(mr_module.ModelAuthConfigError) as exc:
+            if source == "db":
+                _load_db(_cc_row(**{field: ""}))
+            else:
+                _load_toml(aidp=_cc_entry(**{field: ""}))
+        message = str(exc.value)
+        assert "'aidp'" in message
+        assert label in message
+        assert "oauth_client_credentials" in message
+
+    def test_missing_fields_are_all_named(self) -> None:
+        with pytest.raises(
+            mr_module.ModelAuthConfigError,
+            match="requires oauth_token_url, oauth_client_id, oauth_client_secret",
+        ):
+            _load_toml(
+                aidp=_cc_entry(oauth_token_url="", oauth_client_id="", oauth_client_secret="")
+            )
+
+    def test_audience_not_required_and_stale_one_dropped(self) -> None:
+        cfg = _load_db(_cc_row(obo_audience="api://old-entra")).get_config("aidp")
+        assert cfg.obo_audience == ""
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "ftp://pool.example/oauth2/token",
+            "/oauth2/token",
+            "https://user:pw@pool.example/oauth2/token",
+            "https://pool.example/oauth2/token#frag",
+        ],
+    )
+    def test_bad_token_url_refused(self, url: str) -> None:
+        with pytest.raises(mr_module.ModelAuthConfigError, match="oauth_token_url must be"):
+            _load_toml(aidp=_cc_entry(oauth_token_url=url))
+
+    def test_bad_secret_reference_refused(self) -> None:
+        with pytest.raises(mr_module.ModelAuthConfigError, match="not a valid secret://"):
+            _load_toml(aidp=_cc_entry(oauth_client_secret="secret://file/../escape"))
+
+    def test_secret_error_never_quotes_a_literal(self) -> None:
+        with pytest.raises(mr_module.ModelAuthConfigError) as exc:
+            _load_toml(aidp=_cc_entry(oauth_client_secret="sek\x01ret"))
+        assert "sek" not in str(exc.value)
+
+    def test_control_characters_refused(self) -> None:
+        with pytest.raises(mr_module.ModelAuthConfigError, match="oauth_client_id contains"):
+            _load_toml(aidp=_cc_entry(oauth_client_id="client\x00"))
+
+    def test_stored_secret_placeholder_skipped_but_reference_allowed(self) -> None:
+        assert "oauth_client_secret contains ${SECRET}" in mr_module.stored_definition_error(
+            {"oauth_client_secret": "${SECRET}"}
+        )
+        assert mr_module.stored_definition_error({"oauth_client_secret": "secret://file/x"}) == ""
+        assert "oauth_token_url contains ${HOST}" in mr_module.stored_definition_error(
+            {"oauth_token_url": "https://${HOST}/token"}
+        )
+        reg = _load_db(_cc_row(oauth_client_secret="${SECRET}"), _cc_row(alias="ok"))
+        assert not reg.has_alias("aidp")
+        assert reg.has_alias("ok")
+
+    def test_inert_fields_on_other_modes_load(self) -> None:
+        cfg = _load_db(
+            _cc_row(auth_mode="static", api_key="sk", obo_scopes="", oauth_token_url="")
+        ).get_config("aidp")
+        assert cfg.auth_mode == "static"
+        assert cfg.oauth_client_id == "client-123"
+
+    @pytest.mark.parametrize(
+        ("headers", "session"),
+        [
+            ("not json", False),
+            ("[1, 2]", False),
+            ('{"x-a": 1}', False),
+            ("{}", "yes"),
+        ],
+    )
+    def test_bad_header_settings_refused(self, headers: str, session: Any) -> None:
+        with pytest.raises(
+            mr_module.ModelAuthConfigError, match="'aidp' (default|session)_headers"
+        ):
+            _load_db(_cc_row(default_headers=headers, session_headers=session))
+
+    def test_toml_default_headers_table_and_bool(self) -> None:
+        with pytest.raises(mr_module.ModelAuthConfigError, match="session_headers"):
+            _load_toml(aidp=_cc_entry(session_headers="true"))
+        with pytest.raises(mr_module.ModelAuthConfigError, match="default_headers"):
+            _load_toml(aidp=_cc_entry(default_headers={"x-a": ["b"]}))
+
+
+def _cc_cfg(**overrides: Any) -> ModelConfig:
+    values: dict[str, Any] = {
+        "provider": "openai-compatible",
+        "auth_mode": "oauth_client_credentials",
+        "obo_scopes": "ai-gateway/invoke",
+        "oauth_token_url": _CC_URL,
+        "oauth_client_id": "client-123",
+        "oauth_client_secret": "secret://file/aidp/client",
+        "default_headers": {"x-team": "aiq"},
+        "session_headers": False,
+    }
+    values.update(overrides)
+    return ModelConfig("aidp", "https://aidp.example/v1", "", "aiq-agent", **values)
+
+
+class TestOAuthClientCredentialsReload:
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("oauth_token_url", "https://other.example/oauth2/token"),
+            ("oauth_client_id", "client-456"),
+            ("oauth_client_secret", "secret://file/aidp/rotated"),
+            ("obo_scopes", "ai-gateway/admin"),
+            ("default_headers", {"x-team": "other"}),
+            ("session_headers", True),
+        ],
+    )
+    def test_changing_a_field_rebuilds_the_client(self, field: str, value: Any) -> None:
+        reg = ModelRegistry(models={"aidp": _cc_cfg()}, default="aidp")
+        old_client = MagicMock()
+        reg._clients["aidp"] = old_client
+
+        reg.reload({"aidp": _cc_cfg(**{field: value})}, "aidp", app_state=_KEYED_STATE)
+
+        assert "aidp" not in reg._clients
+        old_client.close.assert_called_once()
+
+    def test_unchanged_fields_keep_the_client(self) -> None:
+        reg = ModelRegistry(models={"aidp": _cc_cfg()}, default="aidp")
+        client = MagicMock()
+        reg._clients["aidp"] = client
+
+        reg.reload({"aidp": _cc_cfg(temperature=0.2)}, "aidp", app_state=_KEYED_STATE)
+
+        assert reg._clients["aidp"] is client
+        client.close.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("oauth_token_url", "https://other.example/oauth2/token"),
+            ("oauth_client_id", "client-456"),
+            ("default_headers", {"x-team": "other"}),
+        ],
+    )
+    def test_same_endpoint_distinguishes_backend_selectors(self, field: str, value: Any) -> None:
+        assert mr_module._same_endpoint(_cc_cfg(), _cc_cfg())
+        assert not mr_module._same_endpoint(_cc_cfg(), _cc_cfg(**{field: value}))
+
+    def test_same_endpoint_ignores_secret_rotation(self) -> None:
+        assert mr_module._same_endpoint(
+            _cc_cfg(), _cc_cfg(oauth_client_secret="secret://file/aidp/rotated")
+        )
+
+    def test_rerank_runtime_config_tracks_new_fields(self) -> None:
+        base = mr_module._rerank_runtime_config(_cc_cfg(), "")
+        assert base == mr_module._rerank_runtime_config(_cc_cfg(), "")
+        for field, value in (
+            ("oauth_token_url", "https://other.example/oauth2/token"),
+            ("oauth_client_id", "client-456"),
+            ("oauth_client_secret", "secret://file/aidp/rotated"),
+            ("default_headers", {"x-team": "other"}),
+        ):
+            assert base != mr_module._rerank_runtime_config(_cc_cfg(**{field: value}), "")
+        assert "secret://file" not in repr(base)
