@@ -5602,7 +5602,11 @@ def test_cc_pure_disable_needs_only_admin_models_even_when_unloadable(
         ({"X-Api-Key": "k"}, "credential"),
         ({"x-switchyard-session-id": "s"}, "set by Turnstone"),
         ({"bad header": "v"}, "not a valid header name"),
-        ({"x-ok": "line\r\nx-injected: 1"}, "control characters"),
+        ({"x-ok": "line\r\nx-injected: 1"}, "control character"),
+        ({"anthropic-beta": "b"}, "set by Turnstone"),
+        ({"X-Amz-Security-Token": "t"}, "credential"),
+        ({"x-ok": "caf\u00e9"}, "outside ASCII"),
+        ({"x-ok": " padded"}, "space at either end"),
         ({"x-ok": "secret://file/a"}, "secret://"),
         ({"x-ok": 1}, "string value"),
         ({"X-Team": "a", "x-team": "b"}, "more than once"),
@@ -5614,6 +5618,10 @@ def test_cc_pure_disable_needs_only_admin_models_even_when_unloadable(
         "turnstone-owned",
         "bad-name",
         "crlf",
+        "core-only-reserved",
+        "core-only-credential",
+        "non-ascii",
+        "edge-space",
         "reference",
         "non-string",
         "duplicate",
@@ -5633,6 +5641,11 @@ def test_default_headers_are_validated(
     for resp in (created, updated):
         assert resp.status_code == 400, resp.text
         assert needle in resp.json()["error"]
+        # The refusal names the header, never the value it was given.
+        if isinstance(headers, dict):
+            for value in headers.values():
+                if isinstance(value, str) and len(value) > 1:
+                    assert value not in resp.json()["error"]
 
 
 def test_session_headers_must_be_a_json_boolean(

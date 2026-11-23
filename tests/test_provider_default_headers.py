@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 from unittest.mock import patch
 
@@ -96,13 +97,41 @@ class TestValidateDefaultHeaders:
     def test_is_a_value_error(self) -> None:
         assert issubclass(DefaultHeadersError, ValueError)
 
-    def test_console_reserved_names_are_covered_by_the_core_list(self) -> None:
-        """The console's save-time list (B6) must never allow a name the
-        registry would then refuse at load, or a saved definition would fail
-        to load."""
-        from turnstone.console.server import _RESERVED_DEFAULT_HEADER_NAMES
+    def test_console_has_no_reserved_list_of_its_own(self) -> None:
+        """AI-DP-3073: the console's save check is the core rule, so it can
+        never save a definition the registry then refuses at load."""
+        from turnstone.console import server
 
-        assert set(_RESERVED_DEFAULT_HEADER_NAMES) <= RESERVED_DEFAULT_HEADER_NAMES
+        assert not hasattr(server, "_RESERVED_DEFAULT_HEADER_NAMES")
+
+    @pytest.mark.parametrize("name", sorted(RESERVED_DEFAULT_HEADER_NAMES))
+    def test_console_refuses_every_core_reserved_name(self, name: str) -> None:
+        from turnstone.console.server import _parse_default_headers_field
+
+        parsed, err = _parse_default_headers_field({name.title(): "v"})
+        assert parsed is None
+        assert err is not None and err.status_code == 400
+
+    @pytest.mark.parametrize(
+        "headers",
+        [{"x-ok": "caf\u00e9"}, {"x-ok": " v"}, {"x-ok": "v "}, {"x-ok": "secret://file/a"}],
+        ids=["non-ascii", "leading-space", "trailing-space", "reference"],
+    )
+    def test_console_refuses_what_core_refuses(self, headers: dict[str, str]) -> None:
+        from turnstone.console.server import _parse_default_headers_field
+
+        with pytest.raises(DefaultHeadersError) as core:
+            validate_default_headers(headers)
+        parsed, err = _parse_default_headers_field(headers)
+        assert parsed is None and err is not None
+        assert err.status_code == 400
+        assert json.loads(bytes(err.body)) == {"error": str(core.value)}
+
+    def test_console_accepts_what_core_accepts(self) -> None:
+        from turnstone.console.server import _parse_default_headers_field
+
+        headers = {"X-Team": "aiq", "x-switchyard-route": "claude"}
+        assert _parse_default_headers_field(headers) == (validate_default_headers(headers), None)
 
     def test_reserved_names_are_lower_case(self) -> None:
         assert all(name == name.lower() for name in RESERVED_DEFAULT_HEADER_NAMES)

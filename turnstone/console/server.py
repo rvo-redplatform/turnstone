@@ -13979,39 +13979,6 @@ _TOKEN_URL_NOT_ALLOWED_ERROR = (
     "oauth_token_url is not in the operator-configured model.oauth_token_url_allowlist"
 )
 
-# Header names a definition's ``default_headers`` may not set: credentials
-# (the backend credential is the auth mode's job, and a static header would
-# bypass every gate on it), the headers Turnstone itself sends, and transport
-# headers the HTTP client owns. Compared case-insensitively.
-_RESERVED_DEFAULT_HEADER_NAMES = frozenset(
-    {
-        # Credentials.
-        "authorization",
-        "proxy-authorization",
-        "x-api-key",
-        "api-key",
-        "x-goog-api-key",
-        "cookie",
-        # Sent by Turnstone.
-        "anthropic-workspace-id",
-        "x-switchyard-session-id",
-        "x-switchyard-agent-id",
-        "x-switchyard-is-subagent",
-        "agent-session-id",
-        # Transport.
-        "host",
-        "content-length",
-        "content-type",
-        "transfer-encoding",
-        "connection",
-    }
-)
-_DEFAULT_HEADERS_MAX_COUNT = 32
-_DEFAULT_HEADER_NAME_MAX_LEN = 128
-_DEFAULT_HEADER_VALUE_MAX_LEN = 2048
-# RFC 9110 field-name token.
-_HEADER_NAME_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
-
 
 def _parse_client_credentials_text(
     body: dict[str, Any], field: str
@@ -14058,50 +14025,26 @@ def _client_credentials_error(
 
 
 def _parse_default_headers_field(raw: Any) -> tuple[dict[str, str] | None, JSONResponse | None]:
-    """Validate a submitted ``default_headers`` object.
+    """Validate a submitted ``default_headers`` object with the registry's rule.
 
-    Names must be RFC 9110 tokens and not reserved
-    (:data:`_RESERVED_DEFAULT_HEADER_NAMES`, case-insensitive, no duplicates
-    by case); values must be strings without control characters and without
-    ``secret://`` text (a header value is sent verbatim, never resolved).
+    Runs :func:`turnstone.core.providers.headers.validate_default_headers`,
+    the same check the registry applies when it loads the row, so a saved
+    definition is one it will load. A refusal is a 400 carrying the
+    :class:`~turnstone.core.providers.headers.DefaultHeadersError` message,
+    which never quotes a value. ``null`` is refused here (the core helper
+    reads it as the empty map); send ``{}`` to clear the headers.
     """
-    from turnstone.core.secret_refs import REFERENCE_SCHEME
-
-    def _bad(message: str) -> tuple[None, JSONResponse]:
-        return None, JSONResponse({"error": f"default_headers: {message}"}, status_code=400)
+    from turnstone.core.providers.headers import DefaultHeadersError, validate_default_headers
 
     if not isinstance(raw, dict):
-        return _bad("must be an object of header names to string values")
-    if len(raw) > _DEFAULT_HEADERS_MAX_COUNT:
-        return _bad(f"at most {_DEFAULT_HEADERS_MAX_COUNT} headers")
-    headers: dict[str, str] = {}
-    seen: set[str] = set()
-    for name, value in raw.items():
-        if (
-            not isinstance(name, str)
-            or len(name) > _DEFAULT_HEADER_NAME_MAX_LEN
-            or not _HEADER_NAME_RE.match(name)
-        ):
-            return _bad(f"{str(name)[:64]!r} is not a valid header name")
-        lowered = name.lower()
-        if lowered in _RESERVED_DEFAULT_HEADER_NAMES:
-            return _bad(
-                f"{name!r} is set by Turnstone or carries a credential; use the auth mode "
-                "for credentials"
-            )
-        if lowered in seen:
-            return _bad(f"{name!r} appears more than once")
-        seen.add(lowered)
-        if not isinstance(value, str):
-            return _bad(f"{name!r} must have a string value")
-        if len(value) > _DEFAULT_HEADER_VALUE_MAX_LEN:
-            return _bad(f"{name!r} value exceeds {_DEFAULT_HEADER_VALUE_MAX_LEN} characters")
-        if strip_control_characters(value) != value:
-            return _bad(f"{name!r} value contains control characters")
-        if REFERENCE_SCHEME in value:
-            return _bad(f"{name!r} value cannot be a secret:// reference")
-        headers[name] = value
-    return headers, None
+        return None, JSONResponse(
+            {"error": "default_headers must be an object of header names to values"},
+            status_code=400,
+        )
+    try:
+        return validate_default_headers(raw), None
+    except DefaultHeadersError as exc:
+        return None, JSONResponse({"error": str(exc)}, status_code=400)
 
 
 def _stored_default_headers(raw: Any) -> dict[str, Any] | None:
