@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import re
+import threading
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -141,6 +143,8 @@ def reset_model_mint_warn_state_for_tests() -> None:
     _MODEL_OBO_MISSING_CRED_WARNED.clear()
     oauth_grants._ENTRA_SCOPE_IGNORED_WARNED.clear()
     _MODEL_MINT_LAST_CAUSE.clear()
+    with _CC_REJECTED_LOCK:
+        _CC_REJECTED_TOKENS.clear()
 
 
 def _warn_model_mint_misconfig_once(
@@ -278,6 +282,29 @@ def _memo_expiry(expires_at: str | None) -> str:
     return cap.replace(tzinfo=None).isoformat(timespec="seconds")
 
 
+def _outside_refresh_margin(
+    plain: token_store_store.UserTokenPlain, refresh_margin_seconds: int
+) -> bool:
+    """Whether a cached token still has more than the refresh margin left.
+
+    A margin of zero always passes. Otherwise the row needs a parseable expiry. The margin is
+    capped at half the token's lifetime (expiry minus the row's ``created`` stamp): an IdP that
+    issues tokens shorter than the margin would otherwise re-mint on every call. Memo entries
+    carry an expiry capped at ``_MEMO_MAX_AGE_S``, which only ever makes them read as nearer
+    expiry, so they fall through to the DB row's true expiry.
+    """
+    if refresh_margin_seconds <= 0:
+        return True
+    expires = oauth_tokens._parse_iso_to_utc(plain.get("expires_at") or "")
+    if expires is None:
+        return False
+    margin = float(refresh_margin_seconds)
+    created = oauth_tokens._parse_iso_to_utc(str(plain.get("created") or "")[:19])
+    if created is not None and expires > created:
+        margin = min(margin, (expires - created).total_seconds() / 2)
+    return (expires - datetime.now(UTC)).total_seconds() > margin
+
+
 async def _serve_fresh_mint_cache(
     *,
     app_state: Any,
@@ -286,12 +313,21 @@ async def _serve_fresh_mint_cache(
     cache_server: str,
     audience: str,
     scopes: str,
+    refresh_margin_seconds: int = 0,
 ) -> str | None:
-    """Serve a fresh model-mint token from the loop memo or encrypted DB row."""
+    """Serve a fresh model-mint token from the loop memo or encrypted DB row.
+
+    *refresh_margin_seconds* > 0 also refuses a token with less than that long left
+    (:func:`_outside_refresh_margin`); the default keeps the shared freshness gate only.
+    """
     key = (user_id, cache_server)
     memo = _model_mint_memo(app_state)
     plain = memo.get(key)
-    if oauth_tokens._is_fresh_obo_cache_row(plain, audience, scopes) and plain is not None:
+    if (
+        oauth_tokens._is_fresh_obo_cache_row(plain, audience, scopes)
+        and plain is not None
+        and _outside_refresh_margin(plain, refresh_margin_seconds)
+    ):
         return plain["access_token"]
     memo.pop(key, None)
     generation = _memo_generation(app_state, user_id)
@@ -300,7 +336,11 @@ async def _serve_fresh_mint_cache(
     except token_store_crypto.TokenDecryptError:
         # A mint-cache row encrypted under a retired key is only a cache miss.
         return None
-    if not oauth_tokens._is_fresh_obo_cache_row(plain, audience, scopes) or plain is None:
+    if (
+        not oauth_tokens._is_fresh_obo_cache_row(plain, audience, scopes)
+        or plain is None
+        or not _outside_refresh_margin(plain, refresh_margin_seconds)
+    ):
         return None
     if _memo_generation(app_state, user_id) != generation:
         # Evicted while the row was being read: the read may predate a revocation.
@@ -1038,6 +1078,306 @@ async def _mint_app_access_token(
         )
 
 
+# ---------------------------------------------------------------------------
+# auth_mode='oauth_client_credentials' — per-definition client-credentials mint
+# ---------------------------------------------------------------------------
+# The definition carries its own token endpoint, client id, secret and scope
+# (obo_scopes), so this mint never reads ``[oidc]``. It shares the entra_app
+# mint's ``__model_app__:<alias>`` cache row under the ``__app__`` principal,
+# its per-alias single-flight lock and its 30 s failure cooldown, which is what
+# keeps a rejected client (Cognito ``invalid_client``, classified TRANSIENT)
+# from being retried in a tight loop: every call inside the window refuses
+# without a token-endpoint round trip.
+#
+# CACHE KEYING. The row's ``audience`` column holds the token URL plus a
+# fingerprint of (token URL, client id, secret); its ``scopes`` column holds the
+# scope. The shared freshness gate compares both against the definition's
+# current values on every read, so a changed token URL, client id, secret or
+# scope can never be served a token minted for the old values, even when the
+# reload teardown or a purge did not run. The fingerprint is a truncated SHA-256
+# over a high-entropy client secret plus the other fields; the token itself is
+# encrypted at rest as before.
+
+_CC_FINGERPRINT_SEP = "#cc:"
+
+# Last token a backend rejected with 401, per cache row, as a SHA-256 digest
+# (never the token). The next mint for that row treats a cached token with that
+# digest as absent, so exactly one re-mint follows a 401 however many callers
+# saw it: once the row holds a new token, the digest no longer matches. Written
+# from model-call threads, read on the OAuth loop, hence the lock.
+_CC_REJECTED_TOKENS: dict[str, str] = {}
+_CC_REJECTED_LOCK = threading.Lock()
+_CC_REJECTED_CAP = 1024
+
+
+def _token_digest(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def client_credentials_cache_audience(token_url: str, client_id: str, client_secret: str) -> str:
+    """The ``audience`` column value that keys a client-credentials mint-cache row.
+
+    ``<token_url>#cc:<fingerprint>``: legible endpoint, plus 32 hex characters of SHA-256
+    over the token URL, client id and resolved secret. Any change to the three yields a
+    different value, so the freshness gate refuses rows minted under the old ones.
+    """
+    material = _SYNTHETIC_KEY_SEP.join(
+        ("oauth_client_credentials", token_url, client_id, client_secret)
+    )
+    fingerprint = hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
+    return f"{token_url}{_CC_FINGERPRINT_SEP}{fingerprint}"
+
+
+def parse_token_url_allowlist(raw: Any) -> frozenset[str]:
+    """``model.oauth_token_url_allowlist`` as a set of exact URLs (comma or newline separated).
+
+    Empty means deny all. Matching is literal: no wildcard, host or prefix matching.
+    """
+    return frozenset(item.strip() for item in re.split(r"[,\n]", str(raw or "")) if item.strip())
+
+
+def note_client_credentials_token_rejected(alias: str, token: str) -> None:
+    """Record that a backend answered *token* for *alias* with a 401.
+
+    The next client-credentials mint for the alias bypasses a cached token equal to *token*
+    and mints a new one. Callers retry their request once afterwards.
+    """
+    alias = str(alias or "").strip()
+    if not alias or not token:
+        return
+    cache_server = model_app_cache_server(alias)
+    with _CC_REJECTED_LOCK:
+        _CC_REJECTED_TOKENS.pop(cache_server, None)
+        if len(_CC_REJECTED_TOKENS) >= _CC_REJECTED_CAP:
+            del _CC_REJECTED_TOKENS[next(iter(_CC_REJECTED_TOKENS))]
+        _CC_REJECTED_TOKENS[cache_server] = _token_digest(token)
+
+
+def _cached_token_rejected(cache_server: str, token: str | None) -> bool:
+    if not token:
+        return False
+    with _CC_REJECTED_LOCK:
+        return _CC_REJECTED_TOKENS.get(cache_server) == _token_digest(token)
+
+
+def _clear_rejected_token(cache_server: str) -> None:
+    with _CC_REJECTED_LOCK:
+        _CC_REJECTED_TOKENS.pop(cache_server, None)
+
+
+async def _mint_client_credentials_access_token(
+    *,
+    app_state: Any,
+    alias: str,
+    token_url: str,
+    client_id: str,
+    client_secret: str,
+    scope: str,
+    allowlist: frozenset[str],
+    refresh_margin_seconds: int,
+    force_refresh: bool = False,
+) -> str | None:
+    """Access token for an ``oauth_client_credentials`` definition, minted or cached.
+
+    *client_secret* is the RESOLVED secret (callers resolve ``secret://`` and ``${VAR}`` at
+    mint time, so rotation needs no reload). Returns ``None`` on every refusal, with the cause
+    recorded under ``model_app`` / :func:`model_app_cache_server` like the entra_app mint;
+    the caller fails closed on ``None``, there is no static-key fallback for this mode.
+
+    Refusals, in order: an empty field; a token URL not in *allowlist* (checked before the
+    cache, so de-listing an endpoint stops its cached tokens too); no token store; the
+    failure cooldown. A cached token is served while more than *refresh_margin_seconds*
+    remain and it was not rejected by a 401 (:func:`note_client_credentials_token_rejected`).
+    """
+    alias = str(alias or "").strip()
+    token_url = strip_control_characters(str(token_url or "")).strip()
+    client_id = strip_control_characters(str(client_id or "")).strip()
+    scope = _normalized_mint_scopes(scope)
+    if not alias:
+        return None
+    cause_key = model_app_cache_server(alias)
+    cache_server = cause_key
+    if not (token_url and client_id and client_secret and scope):
+        _record_mint_refusal_cause(
+            "model_app", cause_key, _APP_CACHE_USER, "credentials_unavailable"
+        )
+        log.warning(
+            "model_cc.credentials_unavailable",
+            alias=alias,
+            has_token_url=bool(token_url),
+            has_client_id=bool(client_id),
+            has_client_secret=bool(client_secret),
+            has_scope=bool(scope),
+        )
+        return None
+    if token_url not in allowlist:
+        _record_mint_refusal_cause(
+            "model_app", cause_key, _APP_CACHE_USER, "token_url_not_allowlisted"
+        )
+        oauth_grants._warn_dedup_once(
+            _MODEL_MINT_MISCONFIG_WARNED,
+            f"model_cc.token_url_not_allowlisted:{alias}:{token_url}",
+            "model_cc.token_url_not_allowlisted",
+            alias=alias,
+            token_url=token_url,
+        )
+        return None
+    token_store: token_store_store.TokenStore | None = oauth_context(app_state).token_store
+    storage = oauth_tokens._get_storage(app_state)
+    if token_store is None or storage is None:
+        _warn_mint_store_unavailable(
+            "model_app", token_url, _APP_CACHE_USER, token_store, storage, cause_key=cause_key
+        )
+        return None
+
+    audience = client_credentials_cache_audience(token_url, client_id, client_secret)
+    coordination = oauth_context(app_state).coordination
+    # Cooldown keys on the alias AND the shape, as the other mints do: a corrected
+    # endpoint, client, secret or scope is a clean slate.
+    cooldown_key = f"{cache_server}{_SYNTHETIC_KEY_SEP}{audience}{_SYNTHETIC_KEY_SEP}{scope}"
+
+    async def serve_cached() -> str | None:
+        token = await _serve_fresh_mint_cache(
+            app_state=app_state,
+            token_store=token_store,
+            user_id=_APP_CACHE_USER,
+            cache_server=cache_server,
+            audience=audience,
+            scopes=scope,
+            refresh_margin_seconds=refresh_margin_seconds,
+        )
+        if force_refresh or _cached_token_rejected(cache_server, token):
+            return None
+        return token
+
+    cached_token = await serve_cached()
+    if cached_token:
+        oauth_tokens._clear_refresh_backoff(coordination, _APP_CACHE_USER, cooldown_key)
+        return cached_token
+    if oauth_tokens._refresh_in_cooldown(coordination, _APP_CACHE_USER, cooldown_key):
+        return None
+
+    lock = oauth_locking._refresh_lock_for(coordination, _APP_CACHE_USER, cache_server)
+    pg_lock = await oauth_locking._acquire_pg_refresh_lock(storage, _APP_CACHE_USER, cache_server)
+    try:
+        async with lock, pg_lock:
+            # Single flight: a caller that queued behind the minting one finds its token here.
+            # A forced caller re-mints only if the row still holds the token it was forced past.
+            cached_token = await serve_cached()
+            if cached_token:
+                oauth_tokens._clear_refresh_backoff(coordination, _APP_CACHE_USER, cooldown_key)
+                return cached_token
+            if oauth_tokens._refresh_in_cooldown(coordination, _APP_CACHE_USER, cooldown_key):
+                return None
+            app_generation = _memo_generation(app_state, _APP_CACHE_USER)
+            try:
+                async with oauth_http._enter_mint_client(app_state) as mint_client:
+                    tokens = await oauth_grants.mint_client_credentials_basic(
+                        token_endpoint=token_url,
+                        client_id=client_id,
+                        client_secret=client_secret,
+                        scope=scope,
+                        http_client=mint_client,
+                    )
+            except oauth_http.OAuthRefreshError as exc:
+                oauth_tokens._arm_cooldown(coordination, _APP_CACHE_USER, cooldown_key)
+                _record_mint_refusal_cause("model_app", cause_key, _APP_CACHE_USER, "mint_failed")
+                # The grant's message is already redacted; no exc_info, so nothing else rides.
+                log.warning(
+                    "model_cc.mint_failed",
+                    alias=alias,
+                    token_url=token_url,
+                    failure_class=str(getattr(exc, "failure_class", "") or ""),
+                    error=str(exc),
+                )
+                return None
+            access_token = tokens.get("access_token")
+            if not isinstance(access_token, str) or not access_token:
+                oauth_tokens._arm_cooldown(coordination, _APP_CACHE_USER, cooldown_key)
+                _record_mint_refusal_cause(
+                    "model_app", cause_key, _APP_CACHE_USER, "mint_missing_access_token"
+                )
+                log.warning("model_cc.mint_missing_access_token", alias=alias, token_url=token_url)
+                return None
+            expires_at = oauth_tokens._expires_at_from_response(
+                tokens, default_ttl_seconds=oauth_tokens._OBO_DEFAULT_TTL_SECONDS
+            )
+            try:
+                await oauth_tokens._persist_app_mint_cache_row(
+                    token_store,
+                    _APP_CACHE_USER,
+                    cache_server,
+                    access_token=access_token,
+                    expires_at=expires_at,
+                    scopes=scope,
+                    issuer=token_url,
+                    audience=audience,
+                )
+            except Exception:
+                log.warning("model_cc.cache_persist_failed", alias=alias, exc_info=True)
+            _memoize_minted_token(
+                app_state,
+                user_id=_APP_CACHE_USER,
+                cache_server=cache_server,
+                access_token=access_token,
+                expires_at=expires_at,
+                scopes=scope,
+                issuer=token_url,
+                audience=audience,
+                generation=app_generation,
+            )
+            _clear_rejected_token(cache_server)
+            oauth_tokens._clear_refresh_backoff(coordination, _APP_CACHE_USER, cooldown_key)
+            _clear_mint_refusal_cause("model_app", cause_key, _APP_CACHE_USER)
+            log.info("model_cc.minted", alias=alias, token_url=token_url, expires_at=expires_at)
+            return access_token
+    finally:
+        oauth_locking._prune_token_lock_when_idle(coordination, _APP_CACHE_USER, cache_server, lock)
+
+
+async def _purge_client_credentials_token(*, app_state: Any, alias: str) -> bool:
+    """Drop *alias*'s cached app-row token (memo and DB), its cooldowns and its 401 mark.
+
+    Runs on the OAuth loop. Returns whether a memo entry or DB row was held. A mint already in
+    flight may still write its token afterwards; the cache keying (see above) is what
+    guarantees a changed definition never serves it.
+    """
+    alias = str(alias or "").strip()
+    if not alias:
+        return False
+    context = oauth_context(app_state)
+    cache_server = model_app_cache_server(alias)
+    generations = context.token_memo_generation
+    generations[_APP_CACHE_USER] = generations.get(_APP_CACHE_USER, 0) + 1
+    held = _model_mint_memo(app_state).pop((_APP_CACHE_USER, cache_server), None) is not None
+    for key in [
+        key
+        for key in context.coordination.backoff
+        if key[0] == _APP_CACHE_USER
+        and (key[1] == cache_server or key[1].startswith(cache_server + _SYNTHETIC_KEY_SEP))
+    ]:
+        context.coordination.backoff.pop(key, None)
+    _clear_rejected_token(cache_server)
+    token_store = context.token_store
+    if token_store is not None:
+        deleted = await durable_write(token_store.delete_user_token, _APP_CACHE_USER, cache_server)
+        held = held or bool(deleted)
+    log.info("model_cc.purged", alias=alias, held=held)
+    return held
+
+
+def resolve_client_credentials_secret(raw_secret: str) -> str:
+    """The client secret a mint sends: ``secret://`` resolved, ``${VAR}`` expanded.
+
+    Same rules as :func:`turnstone.core.model_registry.materialize_api_key`. Blocking (a
+    ``secret://file`` read), so callers on an event loop run it in a thread. Raises
+    ``SecretError`` / ``HeaderValueError`` without quoting the value.
+    """
+    from turnstone.core.model_registry import materialize_api_key
+
+    return materialize_api_key(raw_secret)
+
+
 class ModelTokenClient(Protocol):
     """Model-policy boundary, independent of MCP configuration and transports."""
 
@@ -1056,6 +1396,30 @@ class ModelTokenClient(Protocol):
     def mint_app_token_sync(
         self, *, alias: str, audience: str, timeout: float = 20.0, deadline: float | None = None
     ) -> str | None: ...
+
+    def mint_client_credentials_token_sync(
+        self,
+        *,
+        alias: str,
+        token_url: str,
+        client_id: str,
+        client_secret: str,
+        scope: str,
+        allowlist: frozenset[str],
+        refresh_margin_seconds: int,
+        timeout: float = 20.0,
+        deadline: float | None = None,
+    ) -> str | None:
+        """Mint or serve an ``oauth_client_credentials`` token; ``None`` means refuse the call.
+
+        *client_secret* is the definition's RAW value (``secret://`` or literal); it is resolved
+        here, at mint time.
+        """
+        ...
+
+    def purge_client_credentials_token_sync(self, *, alias: str, timeout: float = 5.0) -> bool:
+        """Drop *alias*'s cached client-credentials token; return whether one was held."""
+        ...
 
     def invalidate_model_mint_memo_sync(
         self, *, user_id: str, server_prefix: str, timeout: float = 5.0
@@ -1141,6 +1505,83 @@ class OAuthModelTokenClient:
             log.debug("model app token mint failed alias=%s", alias, exc_info=True)
         return None
 
+    def mint_client_credentials_token_sync(
+        self,
+        *,
+        alias: str,
+        token_url: str,
+        client_id: str,
+        client_secret: str,
+        scope: str,
+        allowlist: frozenset[str],
+        refresh_margin_seconds: int,
+        timeout: float = 20.0,
+        deadline: float | None = None,
+    ) -> str | None:
+        if not alias:
+            return None
+        cause_key = model_app_cache_server(alias)
+        try:
+            resolved_secret = resolve_client_credentials_secret(client_secret)
+        except Exception as exc:
+            # SecretError / HeaderValueError messages never quote the value.
+            _record_mint_refusal_cause(
+                "model_app", cause_key, _APP_CACHE_USER, "secret_unavailable"
+            )
+            log.warning("model_cc.secret_unavailable", alias=alias, error_type=type(exc).__name__)
+            return None
+        try:
+            deadline_kwargs = {"deadline": deadline} if deadline is not None else {}
+            runtime = ensure_oauth_runtime(self.context, **deadline_kwargs)
+            if runtime is None:
+                _record_mint_refusal_cause(
+                    "model_app", cause_key, _APP_CACHE_USER, "token_store_unavailable"
+                )
+                return None
+            return runtime.call_sync(
+                lambda: _mint_client_credentials_access_token(
+                    app_state=self.context,
+                    alias=alias,
+                    token_url=token_url,
+                    client_id=client_id,
+                    client_secret=resolved_secret,
+                    scope=scope,
+                    allowlist=allowlist,
+                    refresh_margin_seconds=refresh_margin_seconds,
+                ),
+                timeout=timeout,
+                **deadline_kwargs,
+            )
+        except MintDispatchContractError:
+            log.error("model client-credentials mint contract violation alias=%s", alias)
+        except OAuthUnavailableError:
+            log.warning("model client-credentials mint unavailable alias=%s", alias)
+        except Exception:
+            log.debug("model client-credentials mint failed alias=%s", alias, exc_info=True)
+        return None
+
+    def purge_client_credentials_token_sync(self, *, alias: str, timeout: float = 5.0) -> bool:
+        runtime = self.context.runtime
+        if runtime is None:
+            # No loop ever memoized anything; still drop the DB row and the 401 mark.
+            _clear_rejected_token(model_app_cache_server(str(alias or "").strip()))
+            token_store = self.context.token_store
+            if token_store is None or not str(alias or "").strip():
+                return False
+            return bool(
+                token_store.delete_user_token(
+                    _APP_CACHE_USER, model_app_cache_server(str(alias).strip())
+                )
+            )
+
+        async def purge() -> bool:
+            return await _purge_client_credentials_token(app_state=self.context, alias=alias)
+
+        try:
+            return runtime.call_sync(purge, timeout=timeout)
+        except OAuthRuntimeRefusedError:
+            return False
+
     def invalidate_model_mint_memo_sync(
         self, *, user_id: str, server_prefix: str, timeout: float = 5.0
     ) -> int:
@@ -1224,3 +1665,73 @@ async def mint_app_access_token(
         return await runtime.call(mint)
     except OAuthUnavailableError:
         return None
+
+
+async def mint_client_credentials_access_token(
+    *,
+    app_state: Any,
+    alias: str,
+    token_url: str,
+    client_id: str,
+    client_secret: str,
+    scope: str,
+    allowlist: frozenset[str],
+    refresh_margin_seconds: int,
+    force_refresh: bool = False,
+) -> str | None:
+    """Async ``oauth_client_credentials`` entry point (console Test connection, harnesses).
+
+    *client_secret* is the RAW definition value; it is resolved here in a worker thread.
+    Returns ``None`` on any refusal; read the cause with :func:`model_mint_refusal_cause`
+    (``"model_app"``, :func:`model_app_cache_server` (alias), ``MODEL_APP_MINT_PRINCIPAL``).
+    """
+    context = oauth_context(app_state)
+    cause_key = model_app_cache_server(str(alias or "").strip())
+    try:
+        resolved_secret = await asyncio.to_thread(resolve_client_credentials_secret, client_secret)
+    except Exception:
+        _record_mint_refusal_cause("model_app", cause_key, _APP_CACHE_USER, "secret_unavailable")
+        return None
+
+    def mint() -> Coroutine[Any, Any, str | None]:
+        return _mint_client_credentials_access_token(
+            app_state=context,
+            alias=alias,
+            token_url=token_url,
+            client_id=client_id,
+            client_secret=resolved_secret,
+            scope=scope,
+            allowlist=allowlist,
+            refresh_margin_seconds=refresh_margin_seconds,
+            force_refresh=force_refresh,
+        )
+
+    try:
+        runtime = ensure_oauth_runtime(context)
+        if runtime is None:
+            return await mint()
+        return await runtime.call(mint)
+    except OAuthUnavailableError:
+        return None
+
+
+async def purge_client_credentials_token(*, app_state: Any, alias: str) -> bool:
+    """Drop *alias*'s cached ``oauth_client_credentials`` token (memo, DB row, cooldown, 401 mark).
+
+    Public for the console (B6 auth edits, B7): call it after an edit or delete of an
+    ``oauth_client_credentials`` definition. Not required for correctness on edits, since the
+    cache row is keyed on the token URL, client id, secret and scope, but it frees the row
+    at once instead of at the next mint. Returns whether a token was held.
+    """
+    context = oauth_context(app_state)
+
+    def purge() -> Coroutine[Any, Any, bool]:
+        return _purge_client_credentials_token(app_state=context, alias=alias)
+
+    try:
+        runtime = ensure_oauth_runtime(context)
+        if runtime is None:
+            return await purge()
+        return await runtime.call(purge)
+    except OAuthUnavailableError:
+        return False

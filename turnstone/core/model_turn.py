@@ -1276,6 +1276,65 @@ def lane_call_client(
     return call_client
 
 
+def _backend_rejected_credential(exc: BaseException) -> bool:
+    """Whether *exc* is the backend answering 401 (the SDKs' AuthenticationError, or an adapter
+    error carrying ``status_code == 401``), on the exception or its direct cause."""
+    for candidate in (exc, exc.__cause__):
+        status = getattr(candidate, "status_code", None)
+        if isinstance(status, int) and not isinstance(status, bool) and status == 401:
+            return True
+    return False
+
+
+def _create_with_backend_auth_retry(
+    lane: ModelLane,
+    *,
+    backend_auth_token: str | None,
+    cancel_ref: Any,
+    create: Callable[[Any], Any],
+) -> Any:
+    """Resolve the lane's call client and run *create* on it, re-minting once after a 401.
+
+    Only a resolver-minted ``oauth_client_credentials`` credential is retried
+    (:func:`~turnstone.core.model_backend_auth.note_backend_auth_rejected` decides): the rejected
+    token is marked, the next resolve mints a new one, and the request is created exactly once
+    more. A second 401 surfaces. The 401 arrives at stream creation, before any chunk, so the
+    retry cannot duplicate output. An explicit *backend_auth_token* is the caller's, so it is
+    never retried here.
+    """
+    from turnstone.core.model_backend_auth import note_backend_auth_rejected
+
+    retried = False
+    while True:
+        call_client = lane_call_client(
+            lane,
+            backend_auth_token=backend_auth_token,
+            cancel_ref=cancel_ref,
+        )
+        _raise_if_aborted(cancel_ref, lane)
+        mark_dispatch = getattr(cancel_ref, "mark_dispatch", None)
+        if callable(mark_dispatch):
+            with contextlib.suppress(Exception):
+                mark_dispatch()
+        try:
+            return create(call_client)
+        except Exception as exc:
+            if (
+                retried
+                or backend_auth_token is not None
+                or lane.backend_auth_resolver is None
+                or not _backend_rejected_credential(exc)
+                or not note_backend_auth_rejected(
+                    lane.alias,
+                    lane.backend_auth_config,
+                    getattr(call_client, "api_key", None),
+                )
+            ):
+                raise
+            retried = True
+            log.info("model_turn.backend_auth_remint_retry", alias=lane.alias)
+
+
 def _prepare_wire_for_lane(
     messages: list[dict[str, Any]],
     lane: ModelLane,
@@ -1697,26 +1756,20 @@ def model_turn(
             # Dynamic credential mint and the full create+drain remain inside
             # the hold; local request admission completed before this slot was
             # acquired. The context exits before any retry backoff below.
-            call_client = lane_call_client(
-                lane,
-                backend_auth_token=backend_auth_token,
-                cancel_ref=cancel_ref,
-            )
-            _raise_if_aborted(cancel_ref, lane)
-            mark_dispatch = getattr(cancel_ref, "mark_dispatch", None)
-            if callable(mark_dispatch):
-                with contextlib.suppress(Exception):
-                    mark_dispatch()
             # SDK creation errors retain the SDK's retry policy. An adapter can
             # also reject a response before returning an iterator (an HTTP-200
             # JSON error body): nothing ran, so it is a rejected request.
             # Nonstreaming product callers spend their shared allowance on it;
             # the streaming owner keeps its own creation ladder for it.
-            try:
-                chunks = lane.provider.create_streaming(
+            def create(
+                call_client: Any,
+                wire: list[dict[str, Any]] = dispatched_wire,
+                metrics: list[ProviderRequestMetrics] = request_metrics,
+            ) -> Any:
+                return lane.provider.create_streaming(
                     client=call_client,
                     model=lane.model,
-                    messages=dispatched_wire,
+                    messages=wire,
                     tools=tools,
                     max_tokens=max_tokens,
                     temperature=temperature if temperature is not None else lane.temperature,
@@ -1731,7 +1784,15 @@ def model_turn(
                     # Already materialized above after request admission; provider
                     # translators retain their no-op fallback for direct callers.
                     resolve_attachments=None,
-                    request_metrics_ref=request_metrics,
+                    request_metrics_ref=metrics,
+                )
+
+            try:
+                chunks = _create_with_backend_auth_retry(
+                    lane,
+                    backend_auth_token=backend_auth_token,
+                    cancel_ref=cancel_ref,
+                    create=create,
                 )
             except ProviderResponseError as exc:
                 if not product_recovery or on_chunk is not None:

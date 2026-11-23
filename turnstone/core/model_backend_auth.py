@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 from turnstone.core.log import get_logger
 from turnstone.core.model_registry import (
     APP_IDENTITY_MODEL_AUTH_MODES,
+    CLIENT_CREDENTIALS_MODEL_AUTH_MODES,
     DYNAMIC_MODEL_AUTH_MODES,
     MODEL_AUTH_MODE_PROFILES,
     SCOPES_MODEL_AUTH_MODES,
@@ -27,6 +28,99 @@ log = get_logger(__name__)
 
 class BackendAuthUnavailableError(RuntimeError):
     """A fail-closed dynamic model credential could not be resolved."""
+
+
+# Default for ``model.oauth_refresh_margin_seconds`` when no config store is wired
+# (CLI/test hosts); the settings registry carries the same default and minimum.
+_DEFAULT_REFRESH_MARGIN_SECONDS = 660
+_MIN_REFRESH_MARGIN_SECONDS = 60
+
+
+def _refresh_margin_seconds(config_store: Any | None) -> int:
+    raw = config_store.get("model.oauth_refresh_margin_seconds") if config_store else None
+    try:
+        margin = int(raw) if raw is not None and not isinstance(raw, bool) else 0
+    except (TypeError, ValueError):
+        margin = 0
+    if margin <= 0:
+        margin = _DEFAULT_REFRESH_MARGIN_SECONDS
+    return max(margin, _MIN_REFRESH_MARGIN_SECONDS)
+
+
+def _resolve_client_credentials_token(
+    alias: str,
+    config: ModelConfig,
+    *,
+    config_store: Any | None,
+    mint_client: ModelTokenClient | None,
+    deadline: float | None,
+) -> str:
+    """The ``oauth_client_credentials`` leg: mint or serve, and ALWAYS fail closed.
+
+    There is no static-key fallback for this mode whatever ``model.auth_fail_closed`` says:
+    every refusal (no mint client, a token URL outside ``model.oauth_token_url_allowlist``,
+    an unresolvable secret, a rejected grant, the failure cooldown) raises
+    :class:`BackendAuthUnavailableError`.
+    """
+    from turnstone.core.model_oauth import parse_token_url_allowlist
+
+    token_url = str(getattr(config, "oauth_token_url", "") or "")
+    mint = getattr(mint_client, "mint_client_credentials_token_sync", None)
+    if mint_client is None or not callable(mint):
+        log.warning(
+            "model_backend_auth.mint_client_unavailable",
+            alias=alias,
+            auth_mode="oauth_client_credentials",
+            token_url=token_url,
+        )
+        raise BackendAuthUnavailableError(
+            f"Client-credentials backend authentication unavailable for model alias {alias!r}"
+        )
+    allowlist = parse_token_url_allowlist(
+        config_store.get("model.oauth_token_url_allowlist") if config_store is not None else ""
+    )
+    kwargs: dict[str, Any] = {"deadline": deadline} if deadline is not None else {}
+    token = mint(
+        alias=alias,
+        token_url=token_url,
+        client_id=str(getattr(config, "oauth_client_id", "") or ""),
+        client_secret=str(getattr(config, "oauth_client_secret", "") or ""),
+        scope=str(getattr(config, "obo_scopes", "") or ""),
+        allowlist=allowlist,
+        refresh_margin_seconds=_refresh_margin_seconds(config_store),
+        **kwargs,
+    )
+    if deadline is not None and time.monotonic() >= deadline:
+        raise TimeoutError("Model credential deadline exceeded")
+    if not token:
+        log.warning(
+            "model_cc.refused",
+            alias=alias,
+            token_url=token_url,
+            cause=_mint_refusal_cause("model_app", alias),
+        )
+        raise BackendAuthUnavailableError(
+            f"Client-credentials backend authentication unavailable for model alias {alias!r}"
+        )
+    return str(token)
+
+
+def note_backend_auth_rejected(alias: str, config: ModelConfig | None, token: str | None) -> bool:
+    """A backend answered *token* with 401: mark it for re-mint; return whether to retry once.
+
+    Only ``oauth_client_credentials`` definitions re-mint on a 401 (their token can be revoked
+    or rotated before its expiry). The caller retries the request exactly once and lets a
+    second 401 surface. Returns ``False`` for every other mode, or when no token was sent.
+    """
+    if config is None or not token:
+        return False
+    if getattr(config, "auth_mode", "static") not in CLIENT_CREDENTIALS_MODEL_AUTH_MODES:
+        return False
+    from turnstone.core.model_oauth import note_client_credentials_token_rejected
+
+    note_client_credentials_token_rejected(alias, token)
+    log.info("model_cc.backend_rejected_token", alias=alias)
+    return True
 
 
 def _mint_refusal_cause(
@@ -79,6 +173,14 @@ def resolve_model_backend_auth_token(
     if not alias or config is None:
         return None
     mode = getattr(config, "auth_mode", "static")
+    if mode in CLIENT_CREDENTIALS_MODEL_AUTH_MODES:
+        return _resolve_client_credentials_token(
+            alias,
+            config,
+            config_store=config_store,
+            mint_client=mint_client,
+            deadline=deadline,
+        )
     obo_audience = getattr(config, "obo_audience", "")
     if mode not in DYNAMIC_MODEL_AUTH_MODES or not obo_audience:
         return None

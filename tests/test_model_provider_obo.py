@@ -23,6 +23,7 @@ gateway with a per-user Entra On-Behalf-Of access token instead of one static
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
@@ -1284,6 +1285,436 @@ class TestMintAppAccessToken:
 
 
 # ---------------------------------------------------------------------------
+# oauth_client_credentials — per-definition mint, cache, margin, 401 re-mint (B5)
+# ---------------------------------------------------------------------------
+
+CC_ALIAS = "gw-cc-model"
+CC_TOKEN_URL = "https://aidp.auth.us-east-1.amazoncognito.com/oauth2/token"
+CC_SCOPE = "ai-gateway/invoke"
+
+
+def _mint_cc(state: SimpleNamespace, **kwargs: Any) -> Any:
+    kwargs.setdefault("alias", CC_ALIAS)
+    kwargs.setdefault("token_url", CC_TOKEN_URL)
+    kwargs.setdefault("client_id", "cc-cid")
+    kwargs.setdefault("client_secret", "cc-secret")
+    kwargs.setdefault("scope", CC_SCOPE)
+    kwargs.setdefault("allowlist", frozenset({CC_TOKEN_URL}))
+    kwargs.setdefault("refresh_margin_seconds", 660)
+
+    async def _run() -> Any:
+        return await model_oauth.mint_client_credentials_access_token(app_state=state, **kwargs)
+
+    return asyncio.run(_run())
+
+
+def _cc_tokens(*tokens: str, expires_in: int = 3600) -> list[MagicMock]:
+    return [_mk_response(200, {"access_token": t, "expires_in": expires_in}) for t in tokens]
+
+
+def _cc_state(storage: SQLiteBackend, responses: list[MagicMock]) -> tuple[SimpleNamespace, Any]:
+    client = MagicMock(spec=httpx2.AsyncClient)
+    client.post = AsyncMock(side_effect=responses)
+    return _make_app_state(storage, http_client=client, oidc_config=make_oidc_config()), client
+
+
+def _cc_cause() -> str:
+    from turnstone.core.token_store.store import MODEL_APP_MINT_PRINCIPAL
+
+    return model_oauth.model_mint_refusal_cause(
+        "model_app", model_oauth.model_app_cache_server(CC_ALIAS), MODEL_APP_MINT_PRINCIPAL
+    )
+
+
+def _shift_mint_clock(monkeypatch: pytest.MonkeyPatch, seconds: float) -> None:
+    """Move model_oauth's clock (the refresh-margin check) forward by *seconds*."""
+    from datetime import datetime as real_datetime
+    from datetime import timedelta
+
+    class _Shifted(real_datetime):
+        @classmethod
+        def now(cls, tz: Any = None) -> Any:  # type: ignore[override]
+            return real_datetime.now(tz) + timedelta(seconds=seconds)
+
+    monkeypatch.setattr(model_oauth, "datetime", _Shifted)
+
+
+class TestMintClientCredentials:
+    def test_mints_with_basic_auth_raw_scope_and_caches(self, storage: SQLiteBackend) -> None:
+        state, client = _cc_state(storage, _cc_tokens("cc-1"))
+
+        assert _mint_cc(state) == "cc-1"
+        assert _mint_cc(state) == "cc-1"
+        assert client.post.call_count == 1
+        call = client.post.call_args
+        assert call.args == (CC_TOKEN_URL,)
+        assert call.kwargs["data"] == {"grant_type": "client_credentials", "scope": CC_SCOPE}
+        assert call.kwargs["headers"]["Authorization"].startswith("Basic ")
+        # The shared __model_app__:<alias> row under __app__, keyed by URL + fingerprint + scope.
+        plain = oauth_context(state).token_store.get_user_token(
+            "__app__", f"__model_app__:{CC_ALIAS}"
+        )
+        assert plain is not None and plain["refresh_token"] is None
+        assert plain["audience"].startswith(CC_TOKEN_URL + "#cc:")
+        assert "cc-secret" not in plain["audience"]
+        assert plain["scopes"] == CC_SCOPE
+
+    def test_concurrent_calls_at_expiry_mint_once(
+        self, storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        state, client = _cc_state(storage, _cc_tokens("cc-old", "cc-new", "cc-extra"))
+        assert _mint_cc(state) == "cc-old"
+        # Past the refresh point: every caller in the burst needs a new token.
+        _shift_mint_clock(monkeypatch, 3500)
+
+        async def burst() -> list[Any]:
+            return await asyncio.gather(
+                *(
+                    model_oauth.mint_client_credentials_access_token(
+                        app_state=state,
+                        alias=CC_ALIAS,
+                        token_url=CC_TOKEN_URL,
+                        client_id="cc-cid",
+                        client_secret="cc-secret",
+                        scope=CC_SCOPE,
+                        allowlist=frozenset({CC_TOKEN_URL}),
+                        refresh_margin_seconds=660,
+                    )
+                    for _ in range(8)
+                )
+            )
+
+        assert asyncio.run(burst()) == ["cc-new"] * 8
+        assert client.post.call_count == 2
+
+    def test_token_within_refresh_margin_is_reminted(
+        self, storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        state, client = _cc_state(storage, _cc_tokens("cc-1", "cc-2"))
+        assert _mint_cc(state) == "cc-1"
+        # 700 s left of 3600 > 660: still served.
+        _shift_mint_clock(monkeypatch, 2900)
+        assert _mint_cc(state) == "cc-1"
+        assert client.post.call_count == 1
+        # 600 s left < 660: re-minted before the call.
+        _shift_mint_clock(monkeypatch, 3000)
+        assert _mint_cc(state) == "cc-2"
+        assert client.post.call_count == 2
+
+    def test_token_shorter_than_margin_does_not_mint_every_call(
+        self, storage: SQLiteBackend
+    ) -> None:
+        """The margin is capped at half the lifetime, so a 600 s token is reused."""
+        state, client = _cc_state(storage, _cc_tokens("cc-short", expires_in=600))
+        assert _mint_cc(state) == "cc-short"
+        assert _mint_cc(state) == "cc-short"
+        assert client.post.call_count == 1
+
+    def test_non_allowlisted_token_url_is_refused_without_http(
+        self, storage: SQLiteBackend
+    ) -> None:
+        state, client = _cc_state(storage, _cc_tokens("never"))
+        assert _mint_cc(state, allowlist=frozenset()) is None
+        assert _mint_cc(state, allowlist=frozenset({"https://other.example.com/token"})) is None
+        client.post.assert_not_called()
+        assert _cc_cause() == "token_url_not_allowlisted"
+
+    def test_delisting_the_url_stops_a_cached_token(self, storage: SQLiteBackend) -> None:
+        state, client = _cc_state(storage, _cc_tokens("cc-1"))
+        assert _mint_cc(state) == "cc-1"
+        assert _mint_cc(state, allowlist=frozenset()) is None
+        assert client.post.call_count == 1
+
+    def test_rejected_client_fails_and_does_not_tight_retry(self, storage: SQLiteBackend) -> None:
+        """Cognito invalid_client is TRANSIENT; the 30 s cooldown stops a retry storm."""
+        state, client = _cc_state(
+            storage, [_mk_response(400, {"error": "invalid_client"}), *_cc_tokens("never")]
+        )
+        assert _mint_cc(state) is None
+        assert _mint_cc(state) is None
+        assert _mint_cc(state) is None
+        assert client.post.call_count == 1
+        assert _cc_cause() == "mint_failed"
+
+    @pytest.mark.parametrize(
+        "change",
+        [
+            {"client_secret": "rotated-secret"},
+            {"client_id": "other-cid"},
+            {"scope": "ai-gateway/admin"},
+            {
+                "token_url": "https://aidp2.auth.us-east-1.amazoncognito.com/oauth2/token",
+                "allowlist": frozenset(
+                    {CC_TOKEN_URL, "https://aidp2.auth.us-east-1.amazoncognito.com/oauth2/token"}
+                ),
+            },
+        ],
+    )
+    def test_changed_auth_never_reuses_the_cached_token(
+        self, storage: SQLiteBackend, change: dict[str, Any]
+    ) -> None:
+        state, client = _cc_state(storage, _cc_tokens("cc-1", "cc-2"))
+        assert _mint_cc(state) == "cc-1"
+        assert _mint_cc(state, **change) == "cc-2"
+        assert client.post.call_count == 2
+
+    def test_a_changed_auth_is_a_clean_slate_after_a_failure(self, storage: SQLiteBackend) -> None:
+        state, client = _cc_state(
+            storage, [_mk_response(400, {"error": "invalid_client"}), *_cc_tokens("cc-fixed")]
+        )
+        assert _mint_cc(state) is None
+        assert _mint_cc(state, client_secret="fixed-secret") == "cc-fixed"
+
+    def test_rejected_token_is_reminted_once(self, storage: SQLiteBackend) -> None:
+        state, client = _cc_state(storage, _cc_tokens("cc-1", "cc-2", "cc-3"))
+        assert _mint_cc(state) == "cc-1"
+        model_oauth.note_client_credentials_token_rejected(CC_ALIAS, "cc-1")
+        assert _mint_cc(state) == "cc-2"
+        # Later callers, and a stale report of the old token, reuse the new one.
+        model_oauth.note_client_credentials_token_rejected(CC_ALIAS, "cc-1")
+        assert _mint_cc(state) == "cc-2"
+        assert client.post.call_count == 2
+
+    def test_purge_drops_the_cached_token(self, storage: SQLiteBackend) -> None:
+        state, client = _cc_state(storage, _cc_tokens("cc-1", "cc-2"))
+        assert _mint_cc(state) == "cc-1"
+
+        async def purge() -> bool:
+            return await model_oauth.purge_client_credentials_token(app_state=state, alias=CC_ALIAS)
+
+        assert asyncio.run(purge()) is True
+        assert storage.get_oauth_token("__app__", f"__model_app__:{CC_ALIAS}") is None
+        assert asyncio.run(purge()) is False
+        assert _mint_cc(state) == "cc-2"
+
+    def test_purge_sync_on_the_token_client(self, storage: SQLiteBackend) -> None:
+        state, _client = _cc_state(storage, _cc_tokens("cc-1"))
+        assert _mint_cc(state) == "cc-1"
+        token_client = model_oauth.OAuthModelTokenClient(oauth_context(state))
+        assert token_client.purge_client_credentials_token_sync(alias=CC_ALIAS) is True
+        assert storage.get_oauth_token("__app__", f"__model_app__:{CC_ALIAS}") is None
+
+    def test_sync_client_resolves_the_secret_at_mint_time(
+        self, storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import base64
+
+        state, client = _cc_state(storage, _cc_tokens("cc-1"))
+        monkeypatch.setenv("B5_CC_SECRET", "from-env")
+        token_client = model_oauth.OAuthModelTokenClient(oauth_context(state))
+        token = token_client.mint_client_credentials_token_sync(
+            alias=CC_ALIAS,
+            token_url=CC_TOKEN_URL,
+            client_id="cc-cid",
+            client_secret="${B5_CC_SECRET}",
+            scope=CC_SCOPE,
+            allowlist=frozenset({CC_TOKEN_URL}),
+            refresh_margin_seconds=660,
+        )
+        assert token == "cc-1"
+        expected = base64.b64encode(b"cc-cid:from-env").decode()
+        assert client.post.call_args.kwargs["headers"]["Authorization"] == f"Basic {expected}"
+
+    def test_sync_client_refuses_an_unresolvable_secret(self, storage: SQLiteBackend) -> None:
+        state, client = _cc_state(storage, _cc_tokens("never"))
+        token_client = model_oauth.OAuthModelTokenClient(oauth_context(state))
+        token = token_client.mint_client_credentials_token_sync(
+            alias=CC_ALIAS,
+            token_url=CC_TOKEN_URL,
+            client_id="cc-cid",
+            client_secret="${B5_CC_SECRET_UNSET_XYZ}",
+            scope=CC_SCOPE,
+            allowlist=frozenset({CC_TOKEN_URL}),
+            refresh_margin_seconds=660,
+        )
+        assert token is None
+        client.post.assert_not_called()
+        assert _cc_cause() == "secret_unavailable"
+
+
+def _cc_cfg(*, api_key: str = "static-key") -> ModelConfig:
+    return ModelConfig(
+        alias=CC_ALIAS,
+        base_url="https://aidp.example.com/v1",
+        api_key=api_key,
+        model="aiq-agent",
+        provider="openai",
+        auth_mode="oauth_client_credentials",
+        obo_scopes=CC_SCOPE,
+        oauth_token_url=CC_TOKEN_URL,
+        oauth_client_id="cc-cid",
+        oauth_client_secret="secret://file/cc",
+    )
+
+
+class _Store:
+    def __init__(self, **values: Any) -> None:
+        self.values = values
+
+    def get(self, key: str) -> Any:
+        return self.values.get(key)
+
+
+class TestResolveClientCredentials:
+    def test_passes_definition_allowlist_and_margin_to_the_mint(self) -> None:
+        from turnstone.core.model_backend_auth import resolve_model_backend_auth_token
+
+        mint = MagicMock(return_value="cc-token")
+        token_client = SimpleNamespace(mint_client_credentials_token_sync=mint)
+        store = _Store(
+            **{
+                "model.oauth_token_url_allowlist": f"{CC_TOKEN_URL},\n https://x.example.com/t",
+                "model.oauth_refresh_margin_seconds": 900,
+            }
+        )
+        token = resolve_model_backend_auth_token(
+            CC_ALIAS, _cc_cfg(), principal_id="", config_store=store, mint_client=token_client
+        )
+        assert token == "cc-token"
+        mint.assert_called_once_with(
+            alias=CC_ALIAS,
+            token_url=CC_TOKEN_URL,
+            client_id="cc-cid",
+            client_secret="secret://file/cc",
+            scope=CC_SCOPE,
+            allowlist=frozenset({CC_TOKEN_URL, "https://x.example.com/t"}),
+            refresh_margin_seconds=900,
+        )
+
+    def test_mint_failure_refuses_even_with_a_static_key(self) -> None:
+        """No static-key fallback for this mode, even with auth_fail_closed off."""
+        from turnstone.core.model_backend_auth import resolve_model_backend_auth_token
+
+        token_client = SimpleNamespace(
+            mint_client_credentials_token_sync=MagicMock(return_value=None)
+        )
+        with pytest.raises(BackendAuthUnavailableError):
+            resolve_model_backend_auth_token(
+                CC_ALIAS,
+                _cc_cfg(api_key="static-key"),
+                principal_id=USER,
+                config_store=_Store(**{"model.auth_fail_closed": False}),
+                mint_client=token_client,
+            )
+
+    def test_no_mint_client_refuses(self) -> None:
+        from turnstone.core.model_backend_auth import resolve_model_backend_auth_token
+
+        for token_client in (None, SimpleNamespace()):
+            with pytest.raises(BackendAuthUnavailableError):
+                resolve_model_backend_auth_token(
+                    CC_ALIAS,
+                    _cc_cfg(),
+                    principal_id="",
+                    config_store=None,
+                    mint_client=token_client,  # type: ignore[arg-type]
+                )
+
+    def test_non_allowlisted_url_refuses_end_to_end(self, storage: SQLiteBackend) -> None:
+        from turnstone.core.model_backend_auth import resolve_model_backend_auth_token
+
+        state, client = _cc_state(storage, _cc_tokens("never"))
+        token_client = model_oauth.OAuthModelTokenClient(oauth_context(state))
+        cfg = dataclasses.replace(_cc_cfg(), oauth_client_secret="literal-secret")
+        with pytest.raises(BackendAuthUnavailableError):
+            resolve_model_backend_auth_token(
+                CC_ALIAS,
+                cfg,
+                principal_id="",
+                config_store=_Store(**{"model.oauth_token_url_allowlist": ""}),
+                mint_client=token_client,
+            )
+        client.post.assert_not_called()
+
+
+class _Status401Error(Exception):
+    status_code = 401
+
+
+class _AuthRetryProvider:
+    provider_name = "openai-compatible"
+
+    def __init__(self, failures: int) -> None:
+        self.failures = failures
+        self.clients: list[Any] = []
+
+    def create_streaming(self, **kwargs: Any) -> Any:
+        from tests._session_helpers import as_stream
+        from turnstone.core.providers._protocol import CompletionResult
+
+        self.clients.append(kwargs["client"])
+        if self.failures:
+            self.failures -= 1
+            raise _Status401Error("unauthorized")
+        return as_stream(CompletionResult(content="ok"))
+
+
+def _cc_lane(provider: _AuthRetryProvider, resolver: Any, cfg: Any) -> ModelLane:
+    client = MagicMock(name="registry-client")
+    client.with_options.side_effect = lambda api_key: SimpleNamespace(api_key=api_key)
+    return ModelLane(
+        provider=provider,  # type: ignore[arg-type]
+        client=client,
+        model="aiq-agent",
+        alias=CC_ALIAS,
+        backend_auth_resolver=resolver,
+        backend_auth_config=cfg,
+    )
+
+
+class TestBackendRejection401:
+    def test_a_401_remints_and_retries_exactly_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from turnstone.core.model_turn import model_turn
+        from turnstone.core.trajectory import Turn
+
+        noted: list[tuple[str, str]] = []
+        monkeypatch.setattr(
+            model_oauth,
+            "note_client_credentials_token_rejected",
+            lambda alias, token: noted.append((alias, token)),
+        )
+        provider = _AuthRetryProvider(failures=1)
+        resolver = MagicMock(side_effect=["cc-stale", "cc-fresh"])
+        model_turn(_cc_lane(provider, resolver, _cc_cfg()), [Turn.user("hi")])
+        assert [c.api_key for c in provider.clients] == ["cc-stale", "cc-fresh"]
+        assert resolver.call_count == 2
+        assert noted == [(CC_ALIAS, "cc-stale")]
+
+    def test_a_second_401_surfaces(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from turnstone.core.model_turn import model_turn
+        from turnstone.core.trajectory import Turn
+
+        monkeypatch.setattr(
+            model_oauth, "note_client_credentials_token_rejected", lambda alias, token: None
+        )
+        provider = _AuthRetryProvider(failures=5)
+        resolver = MagicMock(side_effect=["cc-1", "cc-2", "cc-3"])
+        with pytest.raises(_Status401Error):
+            model_turn(_cc_lane(provider, resolver, _cc_cfg()), [Turn.user("hi")])
+        assert len(provider.clients) == 2
+        assert resolver.call_count == 2
+
+    def test_other_modes_do_not_retry_a_401(self) -> None:
+        from turnstone.core.model_turn import model_turn
+        from turnstone.core.trajectory import Turn
+
+        provider = _AuthRetryProvider(failures=1)
+        resolver = MagicMock(return_value="app-token")
+        cfg = ModelConfig(
+            alias=CC_ALIAS,
+            base_url="https://gateway.example.com",
+            api_key="",
+            model="m",
+            provider="openai",
+            auth_mode="entra_app",
+            obo_audience=AUDIENCE,
+        )
+        with pytest.raises(_Status401Error):
+            model_turn(_cc_lane(provider, resolver, cfg), [Turn.user("hi")])
+        assert len(provider.clients) == 1
+
+
+# ---------------------------------------------------------------------------
 # ChatSession._model_backend_auth_token — resolve at the model call site
 # ---------------------------------------------------------------------------
 
@@ -2054,7 +2485,12 @@ def test_only_the_guarded_writers_store_delegated_tokens_and_credentials() -> No
             "core/mcp_oauth.py:_mint_mcp_obo_operation",
             "core/model_oauth.py:_mint_obo_access_token",
         },
-        "_persist_app_mint_cache_row": {"core/model_oauth.py:_mint_app_access_token"},
+        # Both app-identity mints (entra_app, oauth_client_credentials) store under the shared
+        # __app__ principal, which no user unlink revokes.
+        "_persist_app_mint_cache_row": {
+            "core/model_oauth.py:_mint_app_access_token",
+            "core/model_oauth.py:_mint_client_credentials_access_token",
+        },
         "create_user_token": {"core/oauth/tokens.py:_persist_app_mint_cache_row"},
         "create_oauth_token": {"core/token_store/store.py:create_user_token"},
         # The consent callback stores an oauth_user grant, not a delegated token.
