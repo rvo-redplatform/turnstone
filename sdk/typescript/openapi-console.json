@@ -4845,6 +4845,77 @@
         }
       }
     },
+    "/v1/api/admin/model-definitions/test-connection": {
+      "post": {
+        "summary": "Mint one token for an oauth_client_credentials definition (stored or submitted) and report ok and expires_in; never returns the token or the secret",
+        "operationId": "v1_api_admin_model-definitions_test-connection_post",
+        "tags": [
+          "Admin"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ModelConnectionTestRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelConnectionTestResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/api/admin/model-definitions/{definition_id}/calibrate": {
       "post": {
         "summary": "Calibrate a reranker model definition and persist its per-model floor",
@@ -15055,6 +15126,82 @@
           }
         },
         "title": "DetectModelResponse",
+        "type": "object"
+      },
+      "ModelConnectionTestRequest": {
+        "description": "Mint one token for an ``oauth_client_credentials`` definition.\n\n``definition_id`` selects a stored row; any other field given overrides it\nfor this test only (nothing is saved). ``oauth_client_secret`` follows the\nupdate rules: ``\"\"``, ``***`` or the stored reference keep the stored one.",
+        "properties": {
+          "definition_id": {
+            "default": "",
+            "title": "Definition Id",
+            "type": "string"
+          },
+          "alias": {
+            "default": "",
+            "title": "Alias",
+            "type": "string"
+          },
+          "auth_mode": {
+            "default": "",
+            "title": "Auth Mode",
+            "type": "string"
+          },
+          "oauth_token_url": {
+            "default": "",
+            "title": "Oauth Token Url",
+            "type": "string"
+          },
+          "oauth_client_id": {
+            "default": "",
+            "title": "Oauth Client Id",
+            "type": "string"
+          },
+          "oauth_client_secret": {
+            "default": "",
+            "title": "Oauth Client Secret",
+            "type": "string"
+          },
+          "obo_scopes": {
+            "default": "",
+            "title": "Obo Scopes",
+            "type": "string"
+          }
+        },
+        "title": "ModelConnectionTestRequest",
+        "type": "object"
+      },
+      "ModelConnectionTestResponse": {
+        "description": "Outcome of a Test connection. Never carries the token or the secret.",
+        "properties": {
+          "ok": {
+            "default": false,
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "expires_in": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Expires In"
+          },
+          "error": {
+            "default": null,
+            "title": "Error",
+            "type": "string"
+          },
+          "failure_class": {
+            "default": null,
+            "title": "Failure Class",
+            "type": "string"
+          }
+        },
+        "title": "ModelConnectionTestResponse",
         "type": "object"
       },
       "CalibrateModelResponse": {

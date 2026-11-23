@@ -13951,9 +13951,11 @@ def _model_oauth_token_url_allowlist(request: Request) -> frozenset[str]:
     Literal match only (no wildcard or host matching), empty = deny all; the
     setting's help text carries the contract.
     """
+    from turnstone.core.model_oauth import parse_token_url_allowlist
+
     config_store = getattr(request.app.state, "config_store", None)
     raw = config_store.get("model.oauth_token_url_allowlist") if config_store is not None else ""
-    return frozenset(item.strip() for item in re.split(r"[,\n]", str(raw or "")) if item.strip())
+    return parse_token_url_allowlist(raw)
 
 
 # Dynamic modes that read ``obo_audience``: every dynamic mode except the
@@ -16588,6 +16590,211 @@ async def admin_detect_model(request: Request) -> JSONResponse:
 
         result["fallback_context_window"] = FALLBACK_CONTEXT_WINDOW
     return JSONResponse(result)
+
+
+# Upper bound on the error text a Test connection returns: the grant's message
+# is already redacted, this only keeps an AS's verbose error body off the form.
+_TEST_CONNECTION_ERROR_MAX_LEN = 300
+
+
+def _sanitized_mint_error(message: str, secrets: tuple[str, ...]) -> str:
+    """*message* with every *secrets* value masked, control characters dropped, and bounded.
+
+    Defence in depth over the grant's own redaction: the raw and resolved
+    secret are masked again here, so no code path can echo either.
+    """
+    for value in secrets:
+        if value:
+            message = message.replace(value, "***")
+    message = strip_control_characters(message).strip()
+    if len(message) > _TEST_CONNECTION_ERROR_MAX_LEN:
+        message = message[:_TEST_CONNECTION_ERROR_MAX_LEN] + "..."
+    return message
+
+
+async def admin_test_model_connection(request: Request) -> JSONResponse:
+    """POST /v1/api/admin/model-definitions/test-connection.
+
+    Mint one token for an ``oauth_client_credentials`` definition, stored
+    (``definition_id``) or submitted (the form's unsaved fields, laid over the
+    stored row when ``definition_id`` is given), and report whether it worked.
+    The reply is ``{"ok": true, "expires_in": int | null}`` or ``{"ok": false,
+    "error": str, "failure_class": str}``; it never carries the token or the
+    secret, and neither is logged.
+
+    The mint is always fresh: no cache row is read or written, no cooldown is
+    consulted or armed, and no refusal cause is recorded, so a test never
+    changes what the runtime serves or reports for the alias. The secret is
+    resolved as a real mint resolves it
+    (:func:`turnstone.core.model_oauth.resolve_client_credentials_secret`) and
+    the token URL must be in ``model.oauth_token_url_allowlist``.
+
+    Gate: ``admin.models``. Testing the stored pair unchanged needs nothing
+    more, as the row already passed the save gate. Any submitted token URL,
+    client id, secret or scope that differs from the stored row (or any test
+    without a stored row) also needs ``admin.mcp`` without the service bypass:
+    the capability saving those values would need. The gate runs before the
+    allowlist check, so the 400s cannot be used to probe the allowlist.
+    """
+    from turnstone.core.auth import require_permission
+    from turnstone.core.http_headers import HeaderValueError
+    from turnstone.core.model_oauth import resolve_client_credentials_secret
+    from turnstone.core.oauth import grants as oauth_grants
+    from turnstone.core.oauth import http as oauth_http
+    from turnstone.core.secret_refs import SecretError
+    from turnstone.core.secret_refs import is_reference as is_secret_reference
+    from turnstone.core.web_helpers import read_json_or_400, require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.models")
+    if err:
+        return err
+
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
+
+    raw_definition_id = body.get("definition_id", "")
+    if not isinstance(raw_definition_id, str):
+        return JSONResponse({"error": "definition_id must be a string"}, status_code=400)
+    definition_id = raw_definition_id.strip()
+    stored: dict[str, Any] = {}
+    if definition_id:
+        row = storage.get_model_definition(definition_id)
+        if row is None:
+            return JSONResponse({"error": "Model definition not found"}, status_code=404)
+        stored = dict(row)
+
+    submitted: dict[str, str] = {}
+    for field in _CLIENT_CREDENTIALS_FIELDS:
+        value, field_err = _parse_client_credentials_text(body, field)
+        if field_err is not None:
+            return field_err
+        if value is not None:
+            submitted[field] = value
+    for field in ("auth_mode", "alias"):
+        if field in body and not isinstance(body[field], str):
+            return JSONResponse({"error": f"{field} must be a string"}, status_code=400)
+    stored_scopes = sanitize_backend_auth_scopes(stored.get("obo_scopes"))
+    scopes = stored_scopes
+    if "obo_scopes" in body:
+        parsed_scopes, scopes_err = _parse_obo_scopes_field(body["obo_scopes"], stored_scopes)
+        if scopes_err is not None:
+            return scopes_err
+        if parsed_scopes is not None:
+            scopes = parsed_scopes
+
+    auth_mode = (
+        str(body.get("auth_mode") or "").strip() or str(stored.get("auth_mode") or "").strip()
+    )
+    if auth_mode not in CLIENT_CREDENTIALS_MODEL_AUTH_MODES:
+        return JSONResponse(
+            {
+                "error": "Test connection applies only to auth_mode "
+                f"{'/'.join(sorted(CLIENT_CREDENTIALS_MODEL_AUTH_MODES))}"
+            },
+            status_code=400,
+        )
+    alias = str(body.get("alias") or "").strip() or str(stored.get("alias") or "").strip()
+    alias = alias or "test-connection"
+
+    stored_cc = {
+        field: str(stored.get(field) or "").strip() for field in _CLIENT_CREDENTIALS_FIELDS
+    }
+    effective = dict(stored_cc)
+    for field in ("oauth_token_url", "oauth_client_id"):
+        if field in submitted:
+            effective[field] = submitted[field]
+    secret = submitted.get("oauth_client_secret", "")
+    # api_key's sentinel rules, as on update: "", "***" and the stored
+    # reference echoed back keep the stored secret.
+    if secret and secret != "***" and secret != stored_cc["oauth_client_secret"]:
+        effective["oauth_client_secret"] = secret
+
+    unsaved = not stored or scopes != stored_scopes or effective != stored_cc
+    if unsaved:
+        err = require_permission(request, "admin.mcp", allow_service_bypass=False)
+        if err:
+            return err
+
+    placeholder_error = stored_definition_error(effective)
+    if placeholder_error:
+        return JSONResponse({"error": placeholder_error}, status_code=400)
+    cc_error = _client_credentials_error(
+        alias,
+        auth_mode,
+        effective["oauth_token_url"],
+        effective["oauth_client_id"],
+        effective["oauth_client_secret"],
+        scopes,
+    )
+    if cc_error:
+        return JSONResponse({"error": cc_error}, status_code=400)
+    token_url = effective["oauth_token_url"]
+    if token_url not in _model_oauth_token_url_allowlist(request):
+        return JSONResponse({"error": _TOKEN_URL_NOT_ALLOWED_ERROR}, status_code=400)
+
+    raw_secret = effective["oauth_client_secret"]
+    if is_secret_reference(raw_secret) and raw_secret != stored_cc["oauth_client_secret"]:
+        # A typed reference is resolved with the console's store role: the
+        # gate a save applies (admin.mcp, checked above) plus its syntax check.
+        ref_err = await _check_secret_reference(raw_secret)
+        if ref_err is not None:
+            return ref_err
+    try:
+        client_secret = await asyncio.to_thread(resolve_client_credentials_secret, raw_secret)
+    except SecretError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=503 if exc.retryable else 400)
+    except HeaderValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+
+    secrets = (raw_secret, client_secret)
+    try:
+        async with oauth_http.json_http_client() as http_client:
+            tokens = await oauth_grants.mint_client_credentials_basic(
+                token_endpoint=token_url,
+                client_id=effective["oauth_client_id"],
+                client_secret=client_secret,
+                scope=scopes,
+                http_client=http_client,
+            )
+    except oauth_http.OAuthRefreshError as exc:
+        failure_class = exc.failure_class.value
+        log.info(
+            "admin.models.test_connection_failed alias=%s token_url=%s failure_class=%s",
+            alias,
+            token_url,
+            failure_class,
+        )
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": _sanitized_mint_error(str(exc), secrets) or "token request failed",
+                "failure_class": failure_class,
+            }
+        )
+    except Exception as exc:
+        # No exc_info and no message: an unexpected exception may carry request detail.
+        log.warning(
+            "admin.models.test_connection_error alias=%s token_url=%s error_type=%s",
+            alias,
+            token_url,
+            type(exc).__name__,
+        )
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": f"token request failed ({type(exc).__name__})",
+                "failure_class": "unknown",
+            }
+        )
+    expires_in = tokens.get("expires_in")
+    log.info("admin.models.test_connection_ok alias=%s token_url=%s", alias, token_url)
+    return JSONResponse(
+        {"ok": True, "expires_in": expires_in if isinstance(expires_in, int) else None}
+    )
 
 
 async def admin_calibrate_model_definition(request: Request) -> JSONResponse:
@@ -19343,6 +19550,11 @@ def create_app(
                     Route(
                         "/api/admin/model-definitions/detect",
                         admin_detect_model,
+                        methods=["POST"],
+                    ),
+                    Route(
+                        "/api/admin/model-definitions/test-connection",
+                        admin_test_model_connection,
                         methods=["POST"],
                     ),
                     Route(

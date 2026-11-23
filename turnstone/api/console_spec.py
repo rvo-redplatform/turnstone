@@ -81,6 +81,8 @@ from turnstone.api.console_schemas import (
     MemoryIndexHealthResponse,
     ModelAuthConstraintsResponse,
     ModelCapabilitiesResponse,
+    ModelConnectionTestRequest,
+    ModelConnectionTestResponse,
     ModelDefinitionInfo,
     ModelDefinitionWriteResponse,
     ModelReloadResponse,
@@ -1082,6 +1084,18 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         tags=["Admin"],
     ),
     EndpointSpec(
+        "/v1/api/admin/model-definitions/test-connection",
+        "POST",
+        "Mint one token for an oauth_client_credentials definition (stored or submitted) "
+        "and report ok and expires_in; never returns the token or the secret",
+        request_model=ModelConnectionTestRequest,
+        response_model=ModelConnectionTestResponse,
+        # 403: an unsaved token URL, client id, secret or scope also needs admin.mcp.
+        # 503: a secret:// store that cannot answer.
+        error_codes=[400, 403, 404, 503],
+        tags=["Admin"],
+    ),
+    EndpointSpec(
         "/v1/api/admin/model-definitions/{definition_id}/calibrate",
         "POST",
         "Calibrate a reranker model definition and persist its per-model floor",
@@ -2015,6 +2029,8 @@ _ALL_MODELS: list[type[BaseModel]] = [
     DeleteModelDefinitionResponse,
     DetectModelRequest,
     DetectModelResponse,
+    ModelConnectionTestRequest,
+    ModelConnectionTestResponse,
     CalibrateModelResponse,
     ModelCapabilitiesResponse,
     KnownModelsResponse,
