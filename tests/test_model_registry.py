@@ -6362,6 +6362,7 @@ class TestContextWindowAutoDetect:
             static_table=False,
             timeout=mr_module._LOADER_PROBE_TIMEOUT,
             workspace_id="",
+            default_headers={},
         )
         assert reg.get_config("local").context_window == 262144
 
@@ -6760,7 +6761,11 @@ class TestLocalProviderPlaceholderKey:
         with patch("turnstone.core.model_registry.create_client") as cc:
             reg.get_client("m")
         cc.assert_called_once_with(
-            "openai-compatible", base_url="http://localhost:8000/v1", api_key="", workspace_id=""
+            "openai-compatible",
+            base_url="http://localhost:8000/v1",
+            api_key="",
+            workspace_id="",
+            default_headers={},
         )
 
 
@@ -7155,7 +7160,7 @@ class TestAnthropicWorkspaceId:
         with patch("turnstone.core.model_registry.create_client") as factory:
             reg.get_client("a")
         factory.assert_called_once_with(
-            "anthropic", base_url="", api_key="k", workspace_id="wrkspc_01ABC"
+            "anthropic", base_url="", api_key="k", workspace_id="wrkspc_01ABC", default_headers={}
         )
 
     def test_reload_rebuilds_the_client_when_the_scope_changes(self) -> None:

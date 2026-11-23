@@ -522,7 +522,7 @@ class OutputGuardJudge:
     # -- Client lifecycle helpers ------------------------------------------
 
     @staticmethod
-    def _extract_client_config(client: Any, provider_name: str) -> dict[str, str]:
+    def _extract_client_config(client: Any, provider_name: str) -> dict[str, Any]:
         """Extract connection config from an existing SDK client.
 
         Reads ``base_url`` and ``api_key`` from the client and returns

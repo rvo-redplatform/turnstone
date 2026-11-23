@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import threading
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from turnstone.core.http_headers import checked_header_value
 from turnstone.core.providers._http_client import shutdown_on_close
@@ -28,12 +28,22 @@ from turnstone.core.providers._protocol import (
     transport_guarded,
 )
 from turnstone.core.providers._xai import XAI_DEFAULT_BASE_URL, XAIProvider
+from turnstone.core.providers.headers import (
+    RESERVED_DEFAULT_HEADER_NAMES,
+    DefaultHeadersError,
+    validate_default_headers,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 __all__ = [
     "ANTHROPIC_PROTOCOL_PROVIDERS",
     "ANTHROPIC_WORKSPACE_HEADER",
+    "RESERVED_DEFAULT_HEADER_NAMES",
     "CompletionResult",
     "ContextWindowExceededError",
+    "DefaultHeadersError",
     "IncompleteStreamError",
     "LLMProvider",
     "ModelCapabilities",
@@ -54,6 +64,7 @@ __all__ = [
     "refuse_credential_headers",
     "thinking_off_template_kwargs",
     "transport_guarded",
+    "validate_default_headers",
 ]
 
 # Singleton instances (stateless, safe to share).
@@ -213,7 +224,12 @@ def _sdk_variable_credentials(variables: dict[str, str]) -> dict[str, str]:
 
 
 def create_client(
-    provider_name: str, *, base_url: str, api_key: str, workspace_id: str = ""
+    provider_name: str,
+    *,
+    base_url: str,
+    api_key: str,
+    workspace_id: str = "",
+    default_headers: Mapping[str, str] | None = None,
 ) -> Any:
     """Create an SDK client for the given provider.
 
@@ -234,7 +250,16 @@ def create_client(
     lanes; an organization-level key in a multi-workspace organization is
     refused by the API without it.  Ignored for every other provider — the
     console refuses to store it there.
+
+    *default_headers* (the definition's ``default_headers``) become the
+    client's default headers on every lane, so they ride every request the
+    client and its ``with_options`` copies make.  They are checked again here
+    (:func:`~turnstone.core.providers.headers.validate_default_headers`):
+    a credential or Turnstone-owned name raises
+    :class:`~turnstone.core.providers.headers.DefaultHeadersError` (a
+    ``ValueError``) before any client exists.
     """
+    extra_headers = validate_default_headers(default_headers)
     resolved_key: str | None = api_key if api_key else None
     if provider_name in ("openai", "openai-compatible", "google", "xai"):
         from openai import DefaultHttpxClient, OpenAI
@@ -260,10 +285,13 @@ def create_client(
         if resolved_key is None and local_without_key:
             resolved_key = LOCAL_PLACEHOLDER_API_KEY
         openai_key = resolved_key or _sdk_variable_credentials(_OPENAI_SDK_VARIABLES).get("api_key")
-        http_client = shutdown_on_close(DefaultHttpxClient())
+        openai_kwargs: dict[str, Any] = {"api_key": openai_key}
         if base_url:
-            return OpenAI(base_url=base_url, api_key=openai_key, http_client=http_client)
-        return OpenAI(api_key=openai_key, http_client=http_client)
+            openai_kwargs["base_url"] = base_url
+        if extra_headers:
+            openai_kwargs["default_headers"] = extra_headers
+        openai_kwargs["http_client"] = shutdown_on_close(DefaultHttpxClient())
+        return OpenAI(**openai_kwargs)
     if provider_name in ("anthropic", "anthropic-compatible"):
         from turnstone.core.providers._anthropic import (
             _ensure_anthropic,
@@ -281,8 +309,12 @@ def create_client(
             kwargs["api_key"] = resolved_key
         else:
             kwargs.update(_sdk_variable_credentials(_ANTHROPIC_SDK_VARIABLES))
+        # The workspace header is reserved, so the two never collide.
+        anthropic_headers = dict(extra_headers)
         if workspace_id:
-            kwargs["default_headers"] = {ANTHROPIC_WORKSPACE_HEADER: workspace_id}
+            anthropic_headers[ANTHROPIC_WORKSPACE_HEADER] = workspace_id
+        if anthropic_headers:
+            kwargs["default_headers"] = anthropic_headers
         if provider_name == "anthropic-compatible":
             # The lane targets local /v1/messages servers; without a
             # base_url the SDK would default to https://api.anthropic.com
