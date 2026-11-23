@@ -18,6 +18,69 @@
     <link rel="stylesheet" href="/shared/shell.css" />
     <link rel="stylesheet" href="/shared/katex-0.19.1/katex.min.css" />
     <link rel="stylesheet" href="/static/coordinator/coordinator.css" />
+    <!-- Model shelf: client-credentials fields, header editor, Test
+         connection line (AI-DP-3013). Built from the shared tokens. -->
+    <style>
+      .model-field-err {
+        font-size: 11.5px;
+        line-height: 1.5;
+        color: var(--red);
+        margin: 5px 0 0;
+      }
+      #model-shelf input[aria-invalid="true"] {
+        border-color: var(--red);
+      }
+      .model-header-row {
+        display: grid;
+        grid-template-columns: minmax(0, 2fr) minmax(0, 3fr) 36px;
+        gap: 8px;
+        margin-top: 8px;
+        align-items: start;
+      }
+      .model-header-row .model-header-remove {
+        height: 36px;
+        padding: 0;
+        justify-content: center;
+      }
+      @media (max-width: 560px) {
+        .model-header-row {
+          grid-template-columns: minmax(0, 1fr) 36px;
+        }
+        .model-header-row .model-header-remove {
+          grid-column: 2;
+          grid-row: 1;
+        }
+        .model-header-row input:nth-child(2) {
+          grid-column: 1;
+          grid-row: 2;
+        }
+      }
+      .model-header-add {
+        margin-top: 8px;
+      }
+      .model-header-add .sh-btn {
+        padding-left: 0;
+      }
+      .model-session-toggle {
+        margin-top: 14px;
+      }
+      .model-test-result {
+        white-space: normal;
+        font-size: 11.5px;
+        color: var(--fg-dim);
+      }
+      .model-test-result .ok {
+        color: var(--green);
+        font-weight: 600;
+      }
+      .model-test-result .err {
+        color: var(--red);
+        font-weight: 600;
+      }
+      .scope-badge.model-auth-badge {
+        color: var(--cyan);
+      }
+    </style>
     <link rel="stylesheet" href="/static/coordinator/coord-chrome.css" />
     <link rel="stylesheet" href="/shared/interactive.css" />
     <link rel="stylesheet" href="/shared/mcp_error.css" />
@@ -1765,7 +1828,7 @@
                 <div>
                   <label for="model-api-key"
                     >API Key
-                    <span class="label-hint"
+                    <span class="label-hint" id="model-api-key-hint"
                       >write-only, never displayed</span
                     ></label
                   >
@@ -1856,12 +1919,16 @@
                       <option value="entra_app">
                         This deployment (entra_app)
                       </option>
+                      <option value="oauth_client_credentials">
+                        A service account, via client credentials
+                        (oauth_client_credentials)
+                      </option>
                       <option value="rfc8693_obo">
                         Each user, via token exchange (rfc8693_obo)
                       </option>
                     </select>
                   </div>
-                  <div>
+                  <div id="model-obo-audience-field">
                     <label for="model-obo-audience"
                       >Gateway audience
                       <span
@@ -1882,19 +1949,130 @@
                     <datalist id="model-obo-audience-options"></datalist>
                   </div>
                 </div>
+                <!-- oauth_client_credentials only: the definition's own
+                     service account. Scope reuses the obo_scopes input
+                     beside the secret. -->
+                <div class="field-pair" id="model-cc-row" hidden>
+                  <div>
+                    <label for="model-oauth-token-url"
+                      >Token URL
+                      <span class="label-hint" id="model-oauth-token-url-hint"
+                        >must be on the allowlist</span
+                      ></label
+                    >
+                    <input
+                      type="text"
+                      id="model-oauth-token-url"
+                      class="sh-mono"
+                      list="model-oauth-token-url-options"
+                      placeholder="https://…/oauth2/token"
+                      autocomplete="off"
+                      spellcheck="false"
+                      aria-describedby="model-oauth-token-url-error"
+                    />
+                    <datalist id="model-oauth-token-url-options"></datalist>
+                    <p
+                      class="model-field-err"
+                      id="model-oauth-token-url-error"
+                      hidden
+                    ></p>
+                  </div>
+                  <div>
+                    <label for="model-oauth-client-id">Client ID</label>
+                    <input
+                      type="text"
+                      id="model-oauth-client-id"
+                      class="sh-mono"
+                      placeholder="the service account's client id"
+                      autocomplete="off"
+                      spellcheck="false"
+                      aria-describedby="model-oauth-client-id-error"
+                    />
+                    <p
+                      class="model-field-err"
+                      id="model-oauth-client-id-error"
+                      hidden
+                    ></p>
+                  </div>
+                </div>
                 <div class="field-pair">
+                  <div id="model-cc-secret-field" hidden>
+                    <label for="model-oauth-client-secret"
+                      >Client secret
+                      <span class="label-hint" id="model-oauth-client-secret-hint"
+                        >write-only; a secret:// reference is best</span
+                      ></label
+                    >
+                    <!-- Password while it holds a literal; text while it holds
+                         a secret:// reference, which is not itself secret. -->
+                    <input
+                      type="password"
+                      id="model-oauth-client-secret"
+                      class="sh-mono"
+                      placeholder="secret://file/run/turnstone/secrets/…"
+                      autocomplete="new-password"
+                      spellcheck="false"
+                      aria-describedby="model-oauth-client-secret-error"
+                    />
+                    <p
+                      class="model-field-err"
+                      id="model-oauth-client-secret-error"
+                      hidden
+                    ></p>
+                  </div>
                   <div>
                     <label for="model-obo-scopes"
-                      >Token-exchange scopes
+                      ><span id="model-obo-scopes-label"
+                        >Token-exchange scopes</span
+                      >
                       <span class="label-hint" id="model-obo-scopes-hint"></span
                     ></label>
                     <input
                       type="text"
                       id="model-obo-scopes"
                       placeholder="space-separated scopes"
+                      aria-describedby="model-obo-scopes-error"
                     />
+                    <p
+                      class="model-field-err"
+                      id="model-obo-scopes-error"
+                      hidden
+                    ></p>
                   </div>
                 </div>
+              </div>
+              <div id="model-headers-section">
+                <div class="sh-section">Request headers</div>
+                <span class="label-hint hint-block"
+                  >Sent on every call to this model. Credential headers and the
+                  run session headers can't be set here.</span
+                >
+                <div id="model-headers-rows"></div>
+                <p class="model-field-err" id="model-headers-error" hidden></p>
+                <div class="model-header-add">
+                  <button
+                    type="button"
+                    id="model-header-add"
+                    class="sh-btn sh-btn--quiet"
+                  >
+                    + Add header
+                  </button>
+                </div>
+                <label class="toggle-switch model-session-toggle">
+                  <input
+                    type="checkbox"
+                    id="model-session-headers"
+                    aria-describedby="model-session-headers-hint"
+                  />
+                  <span class="toggle-track" aria-hidden="true"></span>
+                  <span class="toggle-label">Send run session headers</span>
+                </label>
+                <span
+                  class="label-hint hint-block"
+                  id="model-session-headers-hint"
+                  >Every call of one run sends the same x-switchyard-session-id,
+                  for sticky routing and per-run cost on AI-DP.</span
+                >
               </div>
               <label class="toggle-switch">
                 <input type="checkbox" id="model-enabled" checked />
@@ -2208,7 +2386,23 @@
             <footer class="sh-foot">
               <div class="sh-foot-meta">
                 <span id="model-calibration-chip" class="scope-badge"></span>
+                <span
+                  id="model-test-result"
+                  class="model-test-result"
+                  role="status"
+                  aria-live="polite"
+                  hidden
+                ></span>
               </div>
+              <button
+                type="button"
+                id="model-test-conn-btn"
+                class="sh-btn sh-btn--quiet"
+                hidden
+                title="Mint one token with these client-credentials settings; nothing is saved"
+              >
+                Test connection
+              </button>
               <button
                 type="button"
                 id="model-detect-btn"

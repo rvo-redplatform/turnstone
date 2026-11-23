@@ -6953,10 +6953,13 @@ function _servedModeListHas(constraintsKey, fallbackModes, mode) {
 // The hand-kept auth-mode -> grant-profile pairing, used ONLY as the
 // fail-open fallback when served constraints are missing; the dynamic-mode
 // fallback list derives from its keys so the two cannot drift.
+// A client-credentials mode pairs with NO profile: its value is "", which
+// the option-disable loop reads as "nothing required".
 const _AUTH_MODE_FALLBACK_PROFILES = {
   entra_obo: "entra",
   entra_app: "entra",
   rfc8693_obo: "rfc8693",
+  oauth_client_credentials: "",
 };
 
 // The dynamic (non-shared-key) auth-mode predicate.
@@ -6970,13 +6973,41 @@ function _isDynamicAuthMode(mode) {
 
 // The scopes-reading mode predicate.
 function _isScopesAuthMode(mode) {
-  return _servedModeListHas("scopes_auth_modes", ["rfc8693_obo"], mode);
+  return _servedModeListHas(
+    "scopes_auth_modes",
+    ["rfc8693_obo", "oauth_client_credentials"],
+    mode,
+  );
+}
+
+// The per-definition client-credentials mode predicate: the definition holds
+// its own token URL, client id and secret, needs no [oidc] profile and no
+// audience, and its scope is required and sent as is.
+function _isClientCredentialsAuthMode(mode) {
+  return _servedModeListHas(
+    "client_credentials_auth_modes",
+    ["oauth_client_credentials"],
+    mode,
+  );
+}
+
+// The served token-URL allowlist, or null while it is unknown (not fetched,
+// failed, or an older server). Unknown checks nothing: the server decides.
+function _modelTokenUrlAllowlist() {
+  return _modelAuthConstraints &&
+    Array.isArray(_modelAuthConstraints.oauth_token_url_allowlist)
+    ? _modelAuthConstraints.oauth_token_url_allowlist
+    : null;
 }
 
 // The app-identity (shared deployment credential) mode predicate — drives
 // the model list's auth badge wording; per-user is every OTHER dynamic mode.
 function _isAppIdentityAuthMode(mode) {
-  return _servedModeListHas("app_identity_auth_modes", ["entra_app"], mode);
+  return _servedModeListHas(
+    "app_identity_auth_modes",
+    ["entra_app", "oauth_client_credentials"],
+    mode,
+  );
 }
 
 function _modelRolesAccessible() {
@@ -7022,6 +7053,15 @@ function _renderModelAudienceOptions() {
     opt.value = value;
     list.appendChild(opt);
   });
+  const urlList = document.getElementById("model-oauth-token-url-options");
+  if (urlList) {
+    urlList.textContent = "";
+    (_modelTokenUrlAllowlist() || []).forEach(function (value) {
+      const opt = document.createElement("option");
+      opt.value = value;
+      urlList.appendChild(opt);
+    });
+  }
 }
 
 // Fetch the affordance data for the Backend-auth block, once per shelf open,
@@ -7132,8 +7172,15 @@ function _syncModelAuthFields() {
       !dynamic &&
       !_modelAuthPersisted.audience &&
       !_modelAuthPersisted.scopes;
+    // A deployment with no [oidc] profile can still offer the modes that
+    // need none (client credentials), so "no profile" alone is not useless.
+    const profileless =
+      known &&
+      Array.isArray(_modelAuthConstraints.client_credentials_auth_modes) &&
+      _modelAuthConstraints.client_credentials_auth_modes.length > 0;
     const useless =
-      (known && !profile && nothingDynamic) || (!editable && nothingDynamic);
+      (known && !profile && !profileless && nothingDynamic) ||
+      (!editable && nothingDynamic);
     section.style.display = useless ? "none" : "";
   }
 
@@ -7178,6 +7225,39 @@ function _syncModelAuthFields() {
 
   modeSel.disabled = !editable;
   const stored = audSel.value || "";
+  const clientCreds = _isClientCredentialsAuthMode(mode);
+  const tokenUrls = _modelTokenUrlAllowlist();
+
+  // Client credentials: the four inputs replace the audience, and the shared
+  // API key is not used. An audience lingering from another mode is hidden
+  // and cleared on save (the registry ignores it for this mode).
+  const audField = document.getElementById("model-obo-audience-field");
+  if (audField) audField.hidden = clientCreds;
+  const ccRow = document.getElementById("model-cc-row");
+  if (ccRow) ccRow.hidden = !clientCreds;
+  const secretField = document.getElementById("model-cc-secret-field");
+  if (secretField) secretField.hidden = !clientCreds;
+  [
+    "model-oauth-token-url",
+    "model-oauth-client-id",
+    "model-oauth-client-secret",
+  ].forEach(function (id) {
+    const el = document.getElementById(id);
+    if (el) el.disabled = !editable;
+  });
+  const apiKeyEl = document.getElementById("model-api-key");
+  const apiKeyHint = document.getElementById("model-api-key-hint");
+  if (apiKeyEl) apiKeyEl.disabled = clientCreds;
+  if (apiKeyHint)
+    apiKeyHint.textContent = clientCreds
+      ? "not used by this auth mode"
+      : "write-only, never displayed";
+  const urlHintEl = document.getElementById("model-oauth-token-url-hint");
+  if (urlHintEl)
+    urlHintEl.textContent =
+      tokenUrls && !tokenUrls.length
+        ? "none allowed yet: an admin adds them in Settings"
+        : "must be on the allowlist";
 
   // Editable whenever a dynamic mode is selected, and ALSO when a stale value
   // lingers on a static row — otherwise it can never be cleared and every
@@ -7187,7 +7267,11 @@ function _syncModelAuthFields() {
   if (modeHint) {
     modeHint.textContent = !editable
       ? "needs the MCP admin permission to change"
-      : persistedMismatch
+      : clientCreds
+        ? tokenUrls && !tokenUrls.length
+          ? "no token URL is allowed yet; set model.oauth_token_url_allowlist in Settings first"
+          : "no user involved; works for every turn"
+        : persistedMismatch
         ? "saved mode doesn't match this deployment's sign-in profile — it will not mint until changed"
         : unavailable
           ? "greyed-out modes need a different sign-in profile than this deployment uses"
@@ -7222,6 +7306,13 @@ function _syncModelAuthFields() {
   // repainting the rest of the block.
   const scopesInput = document.getElementById("model-obo-scopes");
   const scopesHint = document.getElementById("model-obo-scopes-hint");
+  const scopesLabel = document.getElementById("model-obo-scopes-label");
+  if (scopesLabel)
+    scopesLabel.textContent = clientCreds ? "Scope" : "Token-exchange scopes";
+  if (scopesInput)
+    scopesInput.placeholder = clientCreds
+      ? "e.g. ai-gateway/invoke"
+      : "space-separated scopes";
   if (scopesInput) {
     const scopesMode = _isScopesAuthMode(mode);
     const storedScopes = scopesInput.value || "";
@@ -7234,6 +7325,8 @@ function _syncModelAuthFields() {
         scopesHint.textContent = storedScopes
           ? "unused by this mode — clear it to drop the value; a different value would be refused"
           : "only used by token-exchange modes";
+      } else if (clientCreds) {
+        scopesHint.textContent = "space-separated, sent as is";
       } else {
         scopesHint.textContent =
           "space-separated; requested on the token exchange (optional)";
@@ -7255,6 +7348,474 @@ function _syncModelAuthFields() {
         ? "empty = provider default; changing it counts as an auth change"
         : "empty = provider default";
   }
+  _syncModelTestConnection();
+}
+
+// ── Client credentials, request headers, Test connection (AI-DP-3013) ──────
+
+// Header names a definition's default_headers may not set, mirroring the
+// console's _RESERVED_DEFAULT_HEADER_NAMES (compared lower-case). The server
+// is the authority; this only names the problem before a round trip.
+const _MODEL_CREDENTIAL_HEADERS = [
+  "authorization",
+  "proxy-authorization",
+  "x-api-key",
+  "api-key",
+  "x-goog-api-key",
+  "cookie",
+];
+const _MODEL_TURNSTONE_HEADERS = [
+  "anthropic-workspace-id",
+  "x-switchyard-session-id",
+  "x-switchyard-agent-id",
+  "x-switchyard-is-subagent",
+  "agent-session-id",
+  "host",
+  "content-length",
+  "content-type",
+  "transfer-encoding",
+  "connection",
+];
+const _MODEL_HEADERS_MAX = 32;
+// RFC 9110 field-name token, as the server checks it.
+const _MODEL_HEADER_NAME_RE = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
+
+// Pure: why one header row cannot be saved, or "". `seen` holds the
+// lower-cased names of the rows before it.
+function _modelHeaderProblem(name, value, seen) {
+  if (!name) return "Enter a header name, or remove the row.";
+  if (name.length > 128 || !_MODEL_HEADER_NAME_RE.test(name))
+    return "'" + name + "' isn't a valid header name.";
+  const lower = name.toLowerCase();
+  if (_MODEL_CREDENTIAL_HEADERS.indexOf(lower) !== -1)
+    return name + " can't be set here: the token comes from Backend auth.";
+  if (_MODEL_TURNSTONE_HEADERS.indexOf(lower) !== -1)
+    return name + " is set by Turnstone and can't be set here.";
+  if (seen.indexOf(lower) !== -1) return name + " appears more than once.";
+  if (value.length > 2048) return name + "'s value is over 2048 characters.";
+  if (/[\u0000-\u001f\u007f]/.test(value))
+    return name + "'s value contains control characters.";
+  if (value.indexOf("secret://") !== -1)
+    return (
+      name + "'s value is sent as typed; a secret:// reference isn't resolved."
+    );
+  return "";
+}
+
+// Pure: the client-credentials inputs that cannot be saved or tested, as
+// [{id, msg}]. `allowlist` is the served token-URL allowlist or null when
+// unknown; `requireSecret` is false when a stored secret will be kept.
+function _modelCcProblems(f, allowlist, requireSecret) {
+  const out = [];
+  if (!f.token_url) {
+    out.push({ id: "model-oauth-token-url", msg: "Enter the token URL." });
+  } else if (!/^https:\/\/[^\s/?#]+/i.test(f.token_url)) {
+    out.push({
+      id: "model-oauth-token-url",
+      msg: "The token URL must start with https://.",
+    });
+  } else if (allowlist && allowlist.indexOf(f.token_url) === -1) {
+    const host = f.token_url.replace(/^https:\/\//i, "").split(/[/?#]/)[0];
+    out.push({
+      id: "model-oauth-token-url",
+      msg: allowlist.length
+        ? host +
+          " isn't on model.oauth_token_url_allowlist. Ask an admin to add it in Settings."
+        : "No token URL is allowed yet. Ask an admin to add one to model.oauth_token_url_allowlist in Settings.",
+    });
+  }
+  if (!f.client_id)
+    out.push({ id: "model-oauth-client-id", msg: "Enter the client ID." });
+  if (requireSecret && !f.client_secret)
+    out.push({
+      id: "model-oauth-client-secret",
+      msg: "Enter the client secret, or a secret:// reference to it.",
+    });
+  if (!f.scopes)
+    out.push({
+      id: "model-obo-scopes",
+      msg: "Enter the scope to request, for example ai-gateway/invoke.",
+    });
+  return out;
+}
+
+function _modelCcValues() {
+  const val = function (id) {
+    const el = document.getElementById(id);
+    return el ? el.value.trim() : "";
+  };
+  return {
+    token_url: val("model-oauth-token-url"),
+    client_id: val("model-oauth-client-id"),
+    client_secret: val("model-oauth-client-secret"),
+    scopes: val("model-obo-scopes"),
+  };
+}
+
+function _setModelFieldError(id, msg) {
+  const input = document.getElementById(id);
+  const err = document.getElementById(id + "-error");
+  if (input) {
+    if (msg) input.setAttribute("aria-invalid", "true");
+    else input.removeAttribute("aria-invalid");
+  }
+  if (err) {
+    err.textContent = msg || "";
+    err.hidden = !msg;
+  }
+}
+
+function _clearModelFieldErrors() {
+  [
+    "model-oauth-token-url",
+    "model-oauth-client-id",
+    "model-oauth-client-secret",
+    "model-obo-scopes",
+  ].forEach(function (id) {
+    _setModelFieldError(id, "");
+  });
+  _clearModelHeaderErrors();
+}
+
+// A literal secret is masked; a secret:// reference is not itself secret,
+// so it is shown, as the API returns it.
+function _syncModelSecretInputType() {
+  const el = document.getElementById("model-oauth-client-secret");
+  if (!el) return;
+  el.type = /^secret:\/\//.test(el.value.trim()) ? "text" : "password";
+}
+
+function _addModelHeaderRow(name, value) {
+  const rows = document.getElementById("model-headers-rows");
+  if (!rows) return null;
+  const row = document.createElement("div");
+  row.className = "model-header-row";
+  const nameEl = document.createElement("input");
+  nameEl.type = "text";
+  nameEl.className = "sh-mono model-header-name";
+  nameEl.placeholder = "x-app-name";
+  nameEl.autocomplete = "off";
+  nameEl.spellcheck = false;
+  nameEl.setAttribute("aria-label", "Header name");
+  nameEl.value = name || "";
+  const valueEl = document.createElement("input");
+  valueEl.type = "text";
+  valueEl.className = "sh-mono model-header-value";
+  valueEl.placeholder = "value";
+  valueEl.autocomplete = "off";
+  valueEl.spellcheck = false;
+  valueEl.setAttribute("aria-label", "Header value");
+  valueEl.value = value || "";
+  const remove = document.createElement("button");
+  remove.type = "button";
+  remove.className = "sh-btn sh-btn--quiet model-header-remove";
+  remove.setAttribute("aria-label", "Remove header");
+  remove.textContent = "✕";
+  remove.addEventListener("click", function () {
+    row.remove();
+    _clearModelHeaderErrors();
+    const add = document.getElementById("model-header-add");
+    if (add) add.focus();
+  });
+  [nameEl, valueEl].forEach(function (el) {
+    el.addEventListener("input", _clearModelHeaderErrors);
+  });
+  row.appendChild(nameEl);
+  row.appendChild(valueEl);
+  row.appendChild(remove);
+  rows.appendChild(row);
+  return row;
+}
+
+function _setModelHeaders(headers) {
+  const rows = document.getElementById("model-headers-rows");
+  if (rows) rows.textContent = "";
+  _clearModelHeaderErrors();
+  if (!_isPlainObject(headers)) return;
+  Object.keys(headers).forEach(function (name) {
+    const value = headers[name];
+    _addModelHeaderRow(name, typeof value === "string" ? value : String(value));
+  });
+}
+
+// The stored default_headers arrive as JSON text (or an object); anything
+// unreadable reads as none rather than failing the shelf open.
+function _parseModelDefaultHeaders(raw) {
+  if (_isPlainObject(raw)) return raw;
+  if (typeof raw !== "string" || !raw) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    return _isPlainObject(parsed) ? parsed : {};
+  } catch (e) {
+    return {};
+  }
+}
+
+function _clearModelHeaderErrors() {
+  const err = document.getElementById("model-headers-error");
+  if (err) {
+    err.textContent = "";
+    err.hidden = true;
+  }
+  const invalid = document.querySelectorAll(
+    "#model-headers-rows input[aria-invalid]",
+  );
+  for (let i = 0; i < invalid.length; i++)
+    invalid[i].removeAttribute("aria-invalid");
+}
+
+// Read the header editor: {headers, problem} where problem is the first
+// row that cannot be saved ({input, msg}) or null. Blank rows are skipped.
+function _collectModelHeaders() {
+  const rows = document.querySelectorAll(
+    "#model-headers-rows .model-header-row",
+  );
+  const headers = {};
+  const seen = [];
+  let problem = null;
+  for (let i = 0; i < rows.length; i++) {
+    const nameEl = rows[i].querySelector(".model-header-name");
+    const valueEl = rows[i].querySelector(".model-header-value");
+    const name = nameEl.value.trim();
+    const value = valueEl.value.trim();
+    if (!name && !value) continue;
+    const msg = _modelHeaderProblem(name, value, seen);
+    if (msg && !problem) problem = { input: nameEl, msg: msg };
+    seen.push(name.toLowerCase());
+    headers[name] = value;
+  }
+  if (!problem && seen.length > _MODEL_HEADERS_MAX)
+    problem = {
+      input: null,
+      msg: "At most " + _MODEL_HEADERS_MAX + " headers.",
+    };
+  return { headers: headers, problem: problem };
+}
+
+// Check the client-credentials fields (when that mode is selected) and the
+// header rows, marking each problem on its field. Returns the problem count;
+// the caller shows the summary alert.
+function _markModelFormProblems(includeCc) {
+  _clearModelFieldErrors();
+  let count = 0;
+  let first = null;
+  if (includeCc) {
+    const requireSecret = !_modelAuthPersisted.secretStored;
+    _modelCcProblems(
+      _modelCcValues(),
+      _modelTokenUrlAllowlist(),
+      requireSecret,
+    ).forEach(function (p) {
+      _setModelFieldError(p.id, p.msg);
+      if (!first) first = document.getElementById(p.id);
+      count++;
+    });
+  }
+  const collected = _collectModelHeaders();
+  if (collected.problem) {
+    const err = document.getElementById("model-headers-error");
+    if (err) {
+      err.textContent = collected.problem.msg;
+      err.hidden = false;
+    }
+    if (collected.problem.input) {
+      collected.problem.input.setAttribute("aria-invalid", "true");
+      collected.problem.input.setAttribute(
+        "aria-describedby",
+        "model-headers-error",
+      );
+      if (!first) first = collected.problem.input;
+    }
+    count++;
+  }
+  if (first && first.focus) first.focus();
+  return count;
+}
+
+function _modelProblemsMessage(count, verb) {
+  return (
+    "Fix the " +
+    (count === 1 ? "field" : count + " fields") +
+    " marked below before " +
+    verb +
+    "."
+  );
+}
+
+// Test connection: one fresh token mint through
+// POST /v1/api/admin/model-definitions/test-connection (AI-DP-3010). The
+// reply is {ok: true, expires_in} or {ok: false, error, failure_class}; a
+// 4xx carries {error}. It never returns the token, and nothing is saved.
+let _modelTestGen = 0;
+let _modelTestBusy = false;
+let _modelTestOutcome = null;
+
+// Forget the last result: any change to what would be tested makes it stale.
+function _markModelTestStale() {
+  _modelTestGen++;
+  _modelTestBusy = false;
+  if (_modelTestOutcome && _modelTestOutcome.alert) {
+    document.getElementById("model-create-error").classList.remove("is-visible");
+  }
+  _modelTestOutcome = null;
+}
+
+function _modelExpiresText(seconds) {
+  if (typeof seconds !== "number" || !isFinite(seconds) || seconds <= 0)
+    return "no expiry reported";
+  if (seconds < 120) return "expires in " + Math.round(seconds) + " s";
+  return "expires in " + Math.round(seconds / 60) + " min";
+}
+
+function _syncModelTestConnection() {
+  const btn = document.getElementById("model-test-conn-btn");
+  const out = document.getElementById("model-test-result");
+  if (!btn || !out) return;
+  const modeSel = document.getElementById("model-auth-mode");
+  const clientCreds = _isClientCredentialsAuthMode(
+    (modeSel && modeSel.value) || "static",
+  );
+  btn.hidden = !clientCreds;
+  out.hidden = !clientCreds;
+  if (!clientCreds) return;
+  const v = _modelCcValues();
+  const complete =
+    !!v.token_url &&
+    !!v.client_id &&
+    !!v.scopes &&
+    (!!v.client_secret || !!_modelAuthPersisted.secretStored);
+  btn.disabled = !complete || _modelTestBusy;
+  btn.textContent = _modelTestBusy ? "Testing…" : "Test connection";
+  out.textContent = "";
+  const o = _modelTestOutcome;
+  if (_modelTestBusy) {
+    out.textContent = "Requesting a token…";
+  } else if (o) {
+    const head = document.createElement("span");
+    head.className = o.ok ? "ok" : "err";
+    head.textContent = (o.ok ? "✓ " : "✕ ") + o.head;
+    out.appendChild(head);
+    o.parts.forEach(function (part) {
+      out.appendChild(document.createTextNode(" · " + part));
+    });
+  } else {
+    out.textContent = complete
+      ? "Not tested since the last change."
+      : "Fill in the four auth fields to test.";
+  }
+}
+
+function testModelConnection() {
+  const modeSel = document.getElementById("model-auth-mode");
+  const authMode = (modeSel && modeSel.value) || "static";
+  if (!_isClientCredentialsAuthMode(authMode)) return;
+  _markModelTestStale();
+  document.getElementById("model-create-error").classList.remove("is-visible");
+  const problems = _markModelFormProblems(true);
+  // Header rows don't take part in a token mint; only the auth fields gate it.
+  const ccProblems = _modelCcProblems(
+    _modelCcValues(),
+    _modelTokenUrlAllowlist(),
+    !_modelAuthPersisted.secretStored,
+  ).length;
+  if (ccProblems) {
+    _showModelError(_modelProblemsMessage(problems, "testing"));
+    _syncModelTestConnection();
+    return;
+  }
+  const v = _modelCcValues();
+  const editId = document.getElementById("model-edit-id").value;
+  const body = {
+    alias: document.getElementById("model-alias").value.trim(),
+    auth_mode: authMode,
+    oauth_token_url: v.token_url,
+    oauth_client_id: v.client_id,
+    obo_scopes: v.scopes,
+  };
+  if (editId) body.definition_id = editId;
+  // "" keeps the stored secret, as on save.
+  if (v.client_secret) body.oauth_client_secret = v.client_secret;
+  const gen = _modelTestGen;
+  const started = Date.now();
+  _modelTestBusy = true;
+  _syncModelTestConnection();
+  authFetch("/v1/api/admin/model-definitions/test-connection", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  })
+    .then(function (r) {
+      return r
+        .json()
+        .catch(function () {
+          return {};
+        })
+        .then(function (d) {
+          return { status: r.status, okHttp: r.ok, d: d || {} };
+        });
+    })
+    .then(function (res) {
+      if (gen !== _modelTestGen) return;
+      const ms = Date.now() - started + " ms";
+      const d = res.d;
+      if (res.okHttp && d.ok === true) {
+        _modelTestOutcome = {
+          ok: true,
+          head: "Token minted",
+          parts: [_modelExpiresText(d.expires_in), "scope " + v.scopes, ms],
+        };
+        return;
+      }
+      let host = v.token_url.replace(/^https:\/\//i, "").split(/[/?#]/)[0];
+      // The footer is one line: keep the host's first two labels.
+      if (host.length > 32) host = host.split(".").slice(0, 2).join(".") + "\u2026";
+      if (res.okHttp && d.ok === false) {
+        // The authorization server refused or failed: a mint error.
+        const advice =
+          d.failure_class === "transient"
+            ? " The token URL may be busy or down; try again shortly."
+            : " Check the client ID and scope, and that the secret is this client's current one.";
+        let reason = String(d.error || "The token request failed.").trim();
+        if (!/[.!?]$/.test(reason)) reason += ".";
+        _showModelError("Couldn't get a token. " + reason + advice);
+        _modelTestOutcome = {
+          ok: false,
+          alert: true,
+          head: "Token request failed",
+          parts: ["from " + host, ms],
+        };
+        return;
+      }
+      // A 4xx/5xx: the console refused the test before any mint.
+      const msg = d.error || "Test connection failed (HTTP " + res.status + ")";
+      if (/token_url|allowlist/i.test(msg)) {
+        _setModelFieldError("model-oauth-token-url", msg);
+      }
+      _showModelError(
+        res.status === 403
+          ? "Testing changed auth settings needs the MCP admin permission."
+          : msg,
+      );
+      _modelTestOutcome = {
+        ok: false,
+        alert: true,
+        head: "Not tested",
+        parts: ["HTTP " + res.status],
+      };
+    })
+    .catch(function () {
+      if (gen !== _modelTestGen) return;
+      _modelTestOutcome = {
+        ok: false,
+        head: "Couldn't reach the console",
+        parts: [],
+      };
+    })
+    .finally(function () {
+      if (gen !== _modelTestGen) return;
+      _modelTestBusy = false;
+      _syncModelTestConnection();
+    });
 }
 
 function loadAdminModels() {
@@ -7633,6 +8194,15 @@ function _renderModels(items) {
       colAlias.appendChild(document.createTextNode(" "));
       colAlias.appendChild(defBadge);
     }
+    if (_isClientCredentialsAuthMode(m.auth_mode)) {
+      const authBadge = document.createElement("span");
+      authBadge.className = "scope-badge model-auth-badge";
+      authBadge.textContent = "client creds";
+      authBadge.title =
+        "Authenticates as its own service account (oauth_client_credentials)";
+      colAlias.appendChild(document.createTextNode(" "));
+      colAlias.appendChild(authBadge);
+    }
     // Non-default per-model setting indicators
     const overrides = [];
     if (m.max_concurrency > 0) overrides.push("limit=" + m.max_concurrency);
@@ -7668,7 +8238,12 @@ function _renderModels(items) {
     // identity the gateway sees. Static is the default and stays silent.
     // Derived from the shared mode predicates, never a hand list — a new
     // dynamic mode gets a badge without touching this site.
-    if (_isDynamicAuthMode(m.auth_mode))
+    // A client-credentials row gets its own badge beside the alias (below),
+    // not the generic deployment hint.
+    if (
+      _isDynamicAuthMode(m.auth_mode) &&
+      !_isClientCredentialsAuthMode(m.auth_mode)
+    )
       overrides.push(
         _isAppIdentityAuthMode(m.auth_mode)
           ? "auth=deployment"
@@ -7941,9 +8516,29 @@ function showCreateModelModal() {
   document.getElementById("model-obo-audience").value = "";
   const scopesReset = document.getElementById("model-obo-scopes");
   if (scopesReset) scopesReset.value = "";
+  ["model-oauth-token-url", "model-oauth-client-id"].forEach(function (id) {
+    const el = document.getElementById(id);
+    if (el) el.value = "";
+  });
+  const secretReset = document.getElementById("model-oauth-client-secret");
+  if (secretReset) {
+    secretReset.value = "";
+    secretReset.placeholder = "secret://file/run/turnstone/secrets/…";
+  }
+  _syncModelSecretInputType();
+  _setModelHeaders({});
+  const sessionReset = document.getElementById("model-session-headers");
+  if (sessionReset) sessionReset.checked = false;
+  _clearModelFieldErrors();
+  _markModelTestStale();
   // A create has no persisted row; the constraints fetch (fresh per open)
   // supplies the suggestions and re-syncs the block when it lands.
-  _modelAuthPersisted = { mode: "static", audience: "", scopes: "" };
+  _modelAuthPersisted = {
+    mode: "static",
+    audience: "",
+    scopes: "",
+    secretStored: false,
+  };
   _fetchModelAuthConstraints();
   document.getElementById("model-detect-result").hidden = true;
   document.getElementById("model-detect-btn").disabled = false;
@@ -8039,7 +8634,30 @@ function showEditModelModal(definitionId) {
         mode: m.auth_mode || "static",
         audience: m.obo_audience || "",
         scopes: m.obo_scopes || "",
+        // A literal comes back "***", a secret:// reference verbatim; either
+        // way a blank input keeps the stored one on save and on test.
+        secretStored: !!m.oauth_client_secret,
       };
+      document.getElementById("model-oauth-token-url").value =
+        m.oauth_token_url || "";
+      document.getElementById("model-oauth-client-id").value =
+        m.oauth_client_id || "";
+      const secretEl = document.getElementById("model-oauth-client-secret");
+      const storedSecret =
+        typeof m.oauth_client_secret === "string" ? m.oauth_client_secret : "";
+      if (storedSecret.startsWith("secret://")) {
+        // Not itself secret: shown, and echoing it back keeps it.
+        secretEl.value = storedSecret;
+      } else {
+        secretEl.value = "";
+        secretEl.placeholder = storedSecret
+          ? "••• (leave blank to keep existing)"
+          : "secret://file/run/turnstone/secrets/…";
+      }
+      _syncModelSecretInputType();
+      _setModelHeaders(_parseModelDefaultHeaders(m.default_headers));
+      document.getElementById("model-session-headers").checked =
+        m.session_headers === true;
       const authModeSel = document.getElementById("model-auth-mode");
       // An unknown persisted mode gets its own (marked) option so the row
       // round-trips it — see _ensureAuthModeOption.
@@ -8335,18 +8953,42 @@ function submitCreateModel() {
   const scopesEl = document.getElementById("model-obo-scopes");
   const oboScopes = scopesEl ? scopesEl.value.trim() : "";
   const authDynamic = _isDynamicAuthMode(authMode);
-  if (authDynamic && oboAudience === "") {
+  const clientCreds = _isClientCredentialsAuthMode(authMode);
+  const problems = _markModelFormProblems(clientCreds);
+  if (problems) {
+    _showModelError(_modelProblemsMessage(problems, "saving"));
+    return;
+  }
+  if (authDynamic && !clientCreds && oboAudience === "") {
     _showModelError("Enter a gateway audience for this auth mode");
     return;
   }
   const editId = document.getElementById("model-edit-id").value;
   Object.assign(
     form,
-    _authSubmitFields(authMode, oboAudience, oboScopes, !!editId, !!scopesEl),
+    _authSubmitFields(
+      authMode,
+      oboAudience,
+      oboScopes,
+      !!editId,
+      !!scopesEl,
+      clientCreds ? _modelCcValues() : null,
+    ),
   );
 
+  // Request headers and the run session-headers switch apply to every mode.
+  // Always sent: the server compares them with the stored row, so an
+  // untouched edit is no change.
+  if (document.getElementById("model-headers-rows")) {
+    form.default_headers = _collectModelHeaders().headers;
+  }
+  const sessionEl = document.getElementById("model-session-headers");
+  if (sessionEl) form.session_headers = sessionEl.checked;
+
+  // The shared API key is not used by client credentials (the input is
+  // disabled there), so nothing typed earlier rides along.
   const apiKey = document.getElementById("model-api-key").value;
-  if (apiKey) form.api_key = apiKey;
+  if (apiKey && !clientCreds) form.api_key = apiKey;
 
   const method = editId ? "PUT" : "POST";
   const url = editId
@@ -8395,19 +9037,34 @@ function submitCreateModel() {
 // server preserves). The mode-derived facts are computed here, not
 // parameters — three adjacent booleans made call sites transposable with
 // no signal.
+//
+// Client credentials (`cc` = the four inputs, or null for any other mode):
+// the audience is not read, so a CREATE omits it and an EDIT clears whatever
+// another mode left there. The token URL, client id and secret ride only in
+// that mode; other modes omit them, so stored residue is preserved. A blank
+// secret is omitted, which keeps the stored one ("", "***" and the stored
+// reference all mean "keep").
 function _authSubmitFields(
   authMode,
   oboAudience,
   oboScopes,
   isEdit,
   hasScopesInput,
+  cc,
 ) {
   const fields = { auth_mode: authMode };
-  if (isEdit || _isDynamicAuthMode(authMode)) {
+  if (cc) {
+    if (isEdit) fields.obo_audience = "";
+  } else if (isEdit || _isDynamicAuthMode(authMode)) {
     fields.obo_audience = oboAudience;
   }
   if (hasScopesInput && (isEdit || _isScopesAuthMode(authMode))) {
     fields.obo_scopes = oboScopes;
+  }
+  if (cc) {
+    fields.oauth_token_url = cc.token_url;
+    fields.oauth_client_id = cc.client_id;
+    if (cc.client_secret) fields.oauth_client_secret = cc.client_secret;
   }
   return fields;
 }
@@ -9189,8 +9846,33 @@ function _refreshModelSuggestions() {
   if (authModeEl)
     authModeEl.addEventListener("change", function () {
       // The typed audience is untouched; only mode-dependent state recomputes.
+      _markModelTestStale();
+      _clearModelFieldErrors();
       _syncModelAuthFields();
     });
+  [
+    "model-oauth-token-url",
+    "model-oauth-client-id",
+    "model-oauth-client-secret",
+    "model-obo-scopes",
+  ].forEach(function (id) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.addEventListener("input", function () {
+      _setModelFieldError(id, "");
+      if (id === "model-oauth-client-secret") _syncModelSecretInputType();
+      _markModelTestStale();
+      _syncModelTestConnection();
+    });
+  });
+  const headerAdd = document.getElementById("model-header-add");
+  if (headerAdd)
+    headerAdd.addEventListener("click", function () {
+      const row = _addModelHeaderRow("", "");
+      if (row) row.querySelector("input").focus();
+    });
+  const testConnBtn = document.getElementById("model-test-conn-btn");
+  if (testConnBtn) testConnBtn.addEventListener("click", testModelConnection);
   _MODEL_RESPONSE_CONTROLS.forEach(function (spec) {
     const select = document.getElementById(spec.elementId);
     if (select)
