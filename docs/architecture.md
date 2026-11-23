@@ -1721,25 +1721,48 @@ GET returns it as JSON text, the same way it returns `capabilities`:
 { "default_headers": { "x-aidp-app": "aiq", "x-aidp-env": "nonprod" } }
 ```
 
-Registry load requires an object of string names to string values. The
-console also refuses these names (case-insensitive) with a 400:
+One rule checks `default_headers`: `validate_default_headers()` in
+`turnstone/core/providers/headers.py`. It runs in three places:
+
+- Registry load, for both DB rows and `config.toml`. A failure is a fatal
+  `ModelAuthConfigError`, the same as any other bad definition.
+- Console create and update. A failure is a 400 that carries the rule's
+  message.
+- `create_client()`, which checks the headers again before it builds the
+  client.
+
+The console and the registry therefore refuse exactly the same headers. The
+rule's messages never quote a header value.
+
+The rule refuses these names, compared case-insensitively. The full list is
+`RESERVED_DEFAULT_HEADER_NAMES`:
 
 - Credential headers: `authorization`, `proxy-authorization`, `x-api-key`,
-  `api-key`, `x-goog-api-key`, `cookie`. Credentials belong in `api_key` or
-  in the auth mode.
-- Headers Turnstone sets itself: `anthropic-workspace-id`,
-  `x-switchyard-session-id`, `x-switchyard-agent-id`,
-  `x-switchyard-is-subagent` and `agent-session-id`.
+  `api-key`, `x-goog-api-key`, `x-auth-token`, `x-amz-security-token`,
+  `cookie`. Credentials belong in `api_key` or in the auth mode.
+- Headers that Turnstone, or the SDK for it, sets: `anthropic-workspace-id`,
+  `anthropic-beta`, `anthropic-version`, `x-switchyard-session-id`,
+  `x-switchyard-agent-id`, `x-switchyard-is-subagent` and `agent-session-id`.
 - Transport headers: `host`, `content-length`, `content-type`,
-  `transfer-encoding`, `connection`.
+  `content-encoding`, `transfer-encoding`, `connection`, `keep-alive`, `te`,
+  `trailer`, `upgrade`, `expect`.
 
-A definition may have at most 32 headers. A name must be an RFC 9110 token of
-at most 128 characters, and the same name may not appear twice in different
-case. A value may be at most 2048 characters, and may not contain control
-characters or `secret://` text, because a header value is sent as written and
-never resolved. On a dynamic-auth
-definition, changing `default_headers` is gated like other auth changes, and
-it retires the cached client on reload.
+The list holds exact names only. There is no `x-switchyard-*` prefix rule, so
+an operator can still set other Switchyard routing headers.
+
+The rule also checks the shape of the map:
+
+- It must be an object of string names to string values, with at most 32
+  headers.
+- Each name must be an RFC 9110 token of at most 128 characters. The same
+  name may not appear twice in different case.
+- Each value is at most 2048 characters of printable ASCII. A space or tab is
+  allowed inside the value, but not at either end.
+- A value may not contain a control character, a character outside ASCII, or
+  `secret://` text. A header value is sent as written and never resolved.
+
+On a dynamic-auth definition, changing `default_headers` is gated like other
+auth changes, and it retires the cached client on reload.
 
 #### Run session headers
 
