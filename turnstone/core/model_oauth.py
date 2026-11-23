@@ -1188,6 +1188,11 @@ async def _mint_client_credentials_access_token(
     cache, so de-listing an endpoint stops its cached tokens too); no token store; the
     failure cooldown. A cached token is served while more than *refresh_margin_seconds*
     remain and it was not rejected by a 401 (:func:`note_client_credentials_token_rejected`).
+
+    Inside the margin the mint is refresh-ahead: when it fails (any failure class, or the
+    cooldown it armed), the cached token is still served until it actually expires
+    (the inner ``serve_still_valid``), so an IdP blip does not fail calls a good token covers.
+    A 401-rejected token, and a ``force_refresh`` caller, never take that fallback.
     """
     alias = str(alias or "").strip()
     token_url = strip_control_characters(str(token_url or "")).strip()
@@ -1250,12 +1255,35 @@ async def _mint_client_credentials_access_token(
             return None
         return token
 
+    async def serve_still_valid(failure: str) -> str | None:
+        """The refresh-ahead fallback after a failed (or cooling-down) mint.
+
+        The cached token inside the refresh margin but not yet expired: margin 0 leaves only
+        the shared freshness gate (expiry with skew, audience, scope). ``None`` once it has
+        expired, was rejected by a 401, or the caller forced a fresh mint, so the call fails
+        closed. A recorded refusal cause stays: it explains the failed mint either way.
+        """
+        if force_refresh:
+            return None
+        token = await _serve_fresh_mint_cache(
+            app_state=app_state,
+            token_store=token_store,
+            user_id=_APP_CACHE_USER,
+            cache_server=cache_server,
+            audience=audience,
+            scopes=scope,
+        )
+        if not token or _cached_token_rejected(cache_server, token):
+            return None
+        log.info("model_cc.serving_unexpired_cached_token", alias=alias, after=failure)
+        return token
+
     cached_token = await serve_cached()
     if cached_token:
         oauth_tokens._clear_refresh_backoff(coordination, _APP_CACHE_USER, cooldown_key)
         return cached_token
     if oauth_tokens._refresh_in_cooldown(coordination, _APP_CACHE_USER, cooldown_key):
-        return None
+        return await serve_still_valid("cooldown")
 
     lock = oauth_locking._refresh_lock_for(coordination, _APP_CACHE_USER, cache_server)
     pg_lock = await oauth_locking._acquire_pg_refresh_lock(storage, _APP_CACHE_USER, cache_server)
@@ -1268,7 +1296,7 @@ async def _mint_client_credentials_access_token(
                 oauth_tokens._clear_refresh_backoff(coordination, _APP_CACHE_USER, cooldown_key)
                 return cached_token
             if oauth_tokens._refresh_in_cooldown(coordination, _APP_CACHE_USER, cooldown_key):
-                return None
+                return await serve_still_valid("cooldown")
             app_generation = _memo_generation(app_state, _APP_CACHE_USER)
             try:
                 async with oauth_http._enter_mint_client(app_state) as mint_client:
@@ -1290,7 +1318,7 @@ async def _mint_client_credentials_access_token(
                     failure_class=str(getattr(exc, "failure_class", "") or ""),
                     error=str(exc),
                 )
-                return None
+                return await serve_still_valid("mint_failed")
             access_token = tokens.get("access_token")
             if not isinstance(access_token, str) or not access_token:
                 oauth_tokens._arm_cooldown(coordination, _APP_CACHE_USER, cooldown_key)
@@ -1298,7 +1326,7 @@ async def _mint_client_credentials_access_token(
                     "model_app", cause_key, _APP_CACHE_USER, "mint_missing_access_token"
                 )
                 log.warning("model_cc.mint_missing_access_token", alias=alias, token_url=token_url)
-                return None
+                return await serve_still_valid("mint_missing_access_token")
             expires_at = oauth_tokens._expires_at_from_response(
                 tokens, default_ttl_seconds=oauth_tokens._OBO_DEFAULT_TTL_SECONDS
             )
