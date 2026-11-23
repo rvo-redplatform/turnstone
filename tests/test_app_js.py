@@ -3598,12 +3598,6 @@ def test_coordinator_tool_output_pres_are_focusable() -> None:
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="AI-DP-3007 adds oauth_client_credentials to the registry; the admin shelf "
-    "fallbacks and select option land with the model-form ticket (AI-DP-3013), "
-    "which removes this marker",
-)
 def test_admin_js_auth_mode_fallbacks_match_registry() -> None:
     """The model shelf's fail-open fallback literals track the server maps.
 
@@ -3651,6 +3645,154 @@ def test_admin_js_auth_mode_fallbacks_match_registry() -> None:
     index_body = _CONSOLE_INDEX.read_text(encoding="utf-8")
     for mode in sorted(MODEL_AUTH_MODES):
         assert f'value="{mode}"' in index_body, f"index.html option missing {mode}"
+
+
+def _run_admin_js_probe(fn_names: list[str], prelude: str, probe: str) -> Any:
+    """Run admin.js functions *fn_names* under node with *prelude* and print *probe*."""
+    body = _CONSOLE_ADMIN_JS.read_text(encoding="utf-8")
+    fns = []
+    for name in fn_names:
+        fn_body = _slice_function_body(body, name)
+        assert fn_body is not None, f"{name} missing from admin.js"
+        args = re.search(r"function\s+" + re.escape(name) + r"\s*\(([^)]*)\)", body)
+        assert args is not None
+        fns.append(f"function {name}({args.group(1)}) {fn_body}")
+    script = prelude + "\n" + "\n".join(fns) + f"\nconsole.log(JSON.stringify({probe}));"
+    try:
+        proc = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=15)
+    except FileNotFoundError:
+        pytest.skip("node binary not available on PATH")
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout)
+
+
+def _admin_js_const(name: str) -> str:
+    body = _CONSOLE_ADMIN_JS.read_text(encoding="utf-8")
+    m = re.search(r"^const " + re.escape(name) + r" = .*?;$", body, re.M | re.S)
+    assert m is not None, f"{name} missing from admin.js"
+    return m.group(0)
+
+
+def test_admin_js_model_header_problems_mirror_server_rules() -> None:
+    """AI-DP-3013: the header editor names what the console would refuse."""
+    from turnstone.console.server import _RESERVED_DEFAULT_HEADER_NAMES
+
+    prelude = "\n".join(
+        _admin_js_const(n)
+        for n in (
+            "_MODEL_CREDENTIAL_HEADERS",
+            "_MODEL_TURNSTONE_HEADERS",
+            "_MODEL_HEADER_NAME_RE",
+        )
+    )
+    out = _run_admin_js_probe(
+        ["_modelHeaderProblem"],
+        prelude + "\nconst reserved = _MODEL_CREDENTIAL_HEADERS.concat(_MODEL_TURNSTONE_HEADERS);",
+        """{
+  ok: _modelHeaderProblem("x-app-name", "aiq", []),
+  auth: _modelHeaderProblem("Authorization", "Bearer x", []),
+  session: _modelHeaderProblem("X-Switchyard-Session-Id", "abc", []),
+  bad: _modelHeaderProblem("bad name", "v", []),
+  blank: _modelHeaderProblem("", "v", []),
+  dup: _modelHeaderProblem("X-App", "v", ["x-app"]),
+  ctl: _modelHeaderProblem("x-a", "a\\nb", []),
+  ref: _modelHeaderProblem("x-a", "secret://file/x", []),
+  reserved: reserved,
+}""",
+    )
+    assert out["ok"] == ""
+    assert out["auth"] == "Authorization can't be set here: the token comes from Backend auth."
+    assert "set by Turnstone" in out["session"]
+    assert "isn't a valid header name" in out["bad"]
+    assert out["blank"].startswith("Enter a header name")
+    assert "more than once" in out["dup"]
+    assert "control characters" in out["ctl"]
+    assert "secret://" in out["ref"]
+    # The hand-kept lists are exactly the server's reserved set.
+    assert sorted(out["reserved"]) == sorted(_RESERVED_DEFAULT_HEADER_NAMES)
+
+
+def test_admin_js_client_credentials_problems_and_submit_fields() -> None:
+    """AI-DP-3013: the four inputs are checked like the server, and the submit
+    sends them only for the client-credentials mode."""
+    out = _run_admin_js_probe(
+        ["_modelCcProblems", "_authSubmitFields"],
+        """
+function _isDynamicAuthMode(m) { return m !== "static"; }
+function _isScopesAuthMode(m) { return m === "rfc8693_obo" || m === "oauth_client_credentials"; }
+const allow = ["https://idp.example/oauth2/token"];
+const good = {token_url: allow[0], client_id: "cid", client_secret: "", scopes: "ai-gateway/invoke"};
+""",
+        """{
+  goodKeep: _modelCcProblems(good, allow, false),
+  goodNeedSecret: _modelCcProblems(good, allow, true).map(function (p) { return p.id; }),
+  notAllowed: _modelCcProblems(Object.assign({}, good, {token_url: "https://auth.example.net/t"}), allow, false),
+  http: _modelCcProblems(Object.assign({}, good, {token_url: "http://idp.example/t"}), null, false),
+  emptyAllow: _modelCcProblems(good, [], false),
+  unknownAllow: _modelCcProblems(Object.assign({}, good, {token_url: "https://x.example/t"}), null, false),
+  empty: _modelCcProblems({token_url: "", client_id: "", client_secret: "", scopes: ""}, allow, true).length,
+  ccCreate: _authSubmitFields("oauth_client_credentials", "api://stale", "s", false, true,
+    {token_url: "https://t", client_id: "c", client_secret: "secret://file/x"}),
+  ccEditKeep: _authSubmitFields("oauth_client_credentials", "api://stale", "s", true, true,
+    {token_url: "https://t", client_id: "c", client_secret: ""}),
+  staticEdit: _authSubmitFields("static", "", "", true, true, null),
+  appCreate: _authSubmitFields("entra_app", "api://a", "", false, true, null),
+}""",
+    )
+    assert out["goodKeep"] == []
+    assert out["goodNeedSecret"] == ["model-oauth-client-secret"]
+    assert out["notAllowed"][0]["msg"] == (
+        "auth.example.net isn't on model.oauth_token_url_allowlist. "
+        "Ask an admin to add it in Settings."
+    )
+    assert out["http"][0]["msg"] == "The token URL must start with https://."
+    assert out["emptyAllow"][0]["msg"].startswith("No token URL is allowed yet")
+    assert out["unknownAllow"] == []
+    assert out["empty"] == 4
+    assert out["ccCreate"] == {
+        "auth_mode": "oauth_client_credentials",
+        "obo_scopes": "s",
+        "oauth_token_url": "https://t",
+        "oauth_client_id": "c",
+        "oauth_client_secret": "secret://file/x",
+    }
+    # Edit: the stale audience is cleared, and a blank secret is omitted (kept).
+    assert out["ccEditKeep"]["obo_audience"] == ""
+    assert "oauth_client_secret" not in out["ccEditKeep"]
+    # Other modes never send the client-credentials fields (stored residue kept).
+    assert "oauth_token_url" not in out["staticEdit"]
+    assert out["appCreate"] == {"auth_mode": "entra_app", "obo_audience": "api://a"}
+
+
+def test_admin_js_model_shelf_wires_test_connection_and_headers() -> None:
+    """AI-DP-3013: Test connection calls the B7 route, and the form sends the
+    headers and the session switch."""
+    admin = _CONSOLE_ADMIN_JS.read_text(encoding="utf-8")
+    assert '"/v1/api/admin/model-definitions/test-connection"' in admin
+    test_fn = _slice_function_body(admin, "testModelConnection")
+    assert test_fn is not None
+    assert "body.definition_id = editId" in test_fn
+    assert "if (v.client_secret) body.oauth_client_secret = v.client_secret;" in test_fn
+    submit = _slice_function_body(admin, "submitCreateModel")
+    assert submit is not None
+    assert "form.default_headers = _collectModelHeaders().headers;" in submit
+    assert "form.session_headers = sessionEl.checked;" in submit
+    assert "if (apiKey && !clientCreds) form.api_key = apiKey;" in submit
+    index = _CONSOLE_INDEX.read_text(encoding="utf-8")
+    for element_id in (
+        "model-oauth-token-url",
+        "model-oauth-client-id",
+        "model-oauth-client-secret",
+        "model-headers-rows",
+        "model-header-add",
+        "model-session-headers",
+        "model-test-conn-btn",
+        "model-test-result",
+    ):
+        assert f'id="{element_id}"' in index, element_id
+    # The secret input starts masked; only a secret:// reference is shown.
+    secret_input = index.split('id="model-oauth-client-secret"', 1)[0].rsplit("<input", 1)[1]
+    assert 'type="password"' in secret_input
 
 
 def test_default_labels_name_a_model_the_list_lacks() -> None:
