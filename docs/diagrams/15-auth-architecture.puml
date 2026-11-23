@@ -56,8 +56,12 @@ package "Immutable model binding" {
       + auth_mode
       + obo_audience
       + obo_scopes
+      + oauth_token_url / oauth_client_id
+      + oauth_client_secret (raw; resolved at mint)
+      + default_headers / session_headers
       --
       static | entra_obo | entra_app | rfc8693_obo
+      | oauth_client_credentials
   }
 
   class "ModelLane" as Lane <<model>> {
@@ -83,9 +87,17 @@ package "Per-call credential resolution" {
   class "Model mint client" as Mint <<runtime>> {
       + mint_model_obo_token_sync(...)
       + mint_app_token_sync(...)
+      + mint_client_credentials_token_sync(...)
       --
       Cached by alias / principal / grant leg;
       retains refusal cause for diagnostics.
+  }
+
+  class "Client-credentials token endpoint" as CCEndpoint <<token>> {
+      definition's own oauth_token_url
+      (e.g. Cognito /oauth2/token)
+      Basic client auth, raw scope
+      must be in model.oauth_token_url_allowlist
   }
 
   class "OIDC / OBO protected state" as OBOState <<storage>> {
@@ -120,6 +132,8 @@ AuthResult --> Resolver : initiating principal
 Lane --> Resolver : callable + pinned config
 Resolver --> Mint : dynamic modes only
 Mint --> OBOState : decrypt / grant policy
+Mint --> CCEndpoint : oauth_client_credentials only
+ProviderCall ..> CallClient : 401 → one re-mint + retry\n(oauth_client_credentials)
 CallClient --> Lane
 CallClient --> Resolver
 CallClient --> ProviderCall : cloned SDK client
@@ -131,8 +145,13 @@ note right of Resolver
     turns pin the authenticated initiator; single-user internal lanes
     may use their session owner. Never borrow another generation's identity.
   • entra_app: use deployment app identity, no user required.
-  • rfc8693_obo alone sends obo_scopes; each dynamic mode is paired
-    with its required Entra or RFC 8693 grant profile.
+  • rfc8693_obo sends obo_scopes; each Entra / RFC 8693 mode is paired
+    with its required grant profile.
+  • oauth_client_credentials: no user, no [oidc], no audience. Mint from
+    the definition's own token URL (allow-listed) with obo_scopes as the raw
+    scope. Cache row __model_app__:<alias>, keyed by URL + client id + secret
+    + scope; re-mint when less than model.oauth_refresh_margin_seconds
+    (default 660 s) is left. Always fails closed, never a static key.
 end note
 
 note bottom of CallClient
@@ -146,8 +165,12 @@ end note
 note bottom of ProviderCall
   If minting fails, a configured fail-closed deployment or a keyless alias
   raises BackendAuthUnavailableError. A dynamic alias with an explicit static
-  key may fall back only when policy allows. Authentication refusal is not a
-  backend-health failure.
+  key may fall back only when policy allows; oauth_client_credentials never
+  falls back. Authentication refusal is not a backend-health failure.
+  Per-definition default_headers go on the SDK client's default headers;
+  with session_headers on, every call of a run also sends
+  x-switchyard-session-id / agent-session-id (children add
+  x-switchyard-agent-id and x-switchyard-is-subagent).
 end note
 
 @enduml

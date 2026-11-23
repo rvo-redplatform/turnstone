@@ -1382,8 +1382,10 @@ axis remains private even where the three serving-kernel axes are logged for
 retry and completion diagnostics.
 
 **Model-backend authentication:** A model definition's `auth_mode` is one of
-`static`, `entra_obo`, `entra_app`, or `rfc8693_obo`. Dynamic modes keep only
-authorization parameters (`obo_audience`, and RFC 8693 `obo_scopes`) in the
+`static`, `entra_obo`, `entra_app`, `rfc8693_obo`, or `oauth_client_credentials`.
+Dynamic modes keep only authorization parameters (`obo_audience`; `obo_scopes`
+for `rfc8693_obo` and `oauth_client_credentials`; and the token URL, client ID
+and raw secret reference for `oauth_client_credentials`) in the
 immutable `ModelConfig`; access tokens are never stored on the registry client
 or lane. `model_backend_auth.resolve_model_backend_auth_token()` joins that
 pinned config with the initiating generation's principal and the process-owned
@@ -1401,6 +1403,33 @@ mismatches are surfaced at the swap boundary. The default `static` path does
 not invoke any OIDC/OBO machinery. See
 [Settings](settings.md#model-backend-authentication) and
 [OIDC](oidc.md#model-gateway-credentials) for operator configuration.
+
+**Client-credentials mode:** `oauth_client_credentials` mints from the
+definition's own token endpoint, not from `[oidc]`. In the registry it is in
+`SCOPES_MODEL_AUTH_MODES` (the raw `scope` is in `obo_scopes`),
+`APP_IDENTITY_MODEL_AUTH_MODES` (no user needed) and
+`CLIENT_CREDENTIALS_MODEL_AUTH_MODES` (no grant profile, no audience). Load
+checks the shape of `oauth_token_url`, `oauth_client_id` and
+`oauth_client_secret` and parses a `secret://` secret; the secret is resolved
+only at mint time. `resolve_model_backend_auth_token()` sends this mode to
+`_resolve_client_credentials_token()`, which reads
+`model.oauth_token_url_allowlist` and `model.oauth_refresh_margin_seconds`
+live and always fails closed: there is no static-key fallback, whatever
+`model.auth_fail_closed` says. `model_oauth` mints through
+`oauth.grants.mint_client_credentials_basic()` (HTTP Basic client auth, scope
+sent verbatim) and caches the token in the `(__app__,
+__model_app__:<alias>)` `oauth_tokens` row. The row's audience column is
+`<token_url>#cc:<digest of url, client id, secret>` and its scopes column is
+the scope, so the shared freshness check never serves a token minted for an
+older configuration. `model_turn._create_with_backend_auth_retry()` turns a
+`401` on a minted token into one re-mint and one retry
+(`note_backend_auth_rejected()`). The console deletes the cache row
+(`_purge_model_mint_cache()`) when the token URL, client ID or secret changes,
+and masks a literal secret as `***`.
+`model_oauth.purge_client_credentials_token()` also drops the host memo, the
+cooldowns and the 401 mark. See
+[OIDC](oidc.md#client-credentials-model-gateways-oauth_client_credentials) for
+configuration.
 
 **Per-model sampling overrides:** Each model can specify `temperature`,
 `max_tokens`, and `reasoning_effort` to override the global defaults from
@@ -1670,6 +1699,81 @@ coordinator model, the channel model) isn't loaded, a create that relies on it
 fails with a 503 whose body carries `"code": "model_not_loaded"`, and no other
 model is used. The console refuses to delete, disable or rename a model one of
 those settings names, unless it is the last enabled model.
+
+#### Per-definition default headers
+
+A model definition can carry `default_headers`, a map of header names to
+string values. Turnstone adds them to every request the alias makes. They are
+passed to the provider SDK's default headers in `create_client()`, for both
+the OpenAI and the Anthropic client. Use them for routing or tagging headers
+that a gateway expects, such as a team or application id.
+
+```toml
+[models.aidp-agent]
+# ... connection and auth fields ...
+default_headers = { "x-aidp-app" = "aiq", "x-aidp-env" = "nonprod" }
+```
+
+In the console API, `default_headers` is a JSON object on create and update.
+GET returns it as JSON text, the same way it returns `capabilities`:
+
+```json
+{ "default_headers": { "x-aidp-app": "aiq", "x-aidp-env": "nonprod" } }
+```
+
+Registry load requires an object of string names to string values. The
+console also refuses these names (case-insensitive) with a 400:
+
+- Credential headers: `authorization`, `proxy-authorization`, `x-api-key`,
+  `api-key`, `x-goog-api-key`, `cookie`. Credentials belong in `api_key` or
+  in the auth mode.
+- Headers Turnstone sets itself: `anthropic-workspace-id`,
+  `x-switchyard-session-id`, `x-switchyard-agent-id`,
+  `x-switchyard-is-subagent` and `agent-session-id`.
+- Transport headers: `host`, `content-length`, `content-type`,
+  `transfer-encoding`, `connection`.
+
+A definition may have at most 32 headers. A name must be an RFC 9110 token of
+at most 128 characters, and the same name may not appear twice in different
+case. A value may be at most 2048 characters, and may not contain control
+characters or `secret://` text, because a header value is sent as written and
+never resolved. On a dynamic-auth
+definition, changing `default_headers` is gated like other auth changes, and
+it retires the cached client on reload.
+
+#### Run session headers
+
+`session_headers` is a per-definition switch, off by default. When it is on,
+every model call of a run sends headers that let a gateway such as Switchyard
+group the calls of one run and keep each agent on its own sticky slot:
+
+| Header | Value |
+|--------|-------|
+| `x-switchyard-session-id` | The run id. |
+| `agent-session-id` | The run id. |
+| `x-switchyard-agent-id` | Child workstreams only: the child's own workstream id. |
+| `x-switchyard-is-subagent` | Child workstreams only: `true`. |
+
+The run id is the id of the root (coordinator) workstream. Children get it
+through `parent_ws_id`, so the coordinator and all its children send the same
+session id. A workstream create body can set an optional `session_id` to
+override the run id; for example, a calling application can pass its own run
+UUID. Judge calls made for the run send the same headers. With the switch
+off, none of these headers is sent.
+
+```toml
+[models.aidp-agent]
+# ... connection and auth fields ...
+session_headers = true
+```
+
+```json
+{ "session_headers": true }
+```
+
+Registry load requires a real boolean (`0` and `1` are accepted from the
+database). Because Turnstone sets these headers, they cannot be configured in
+`default_headers`.
 
 ### Tool Output Truncation
 
