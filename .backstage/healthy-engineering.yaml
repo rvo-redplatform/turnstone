@@ -5,4 +5,4 @@ metadata:
 spec:
   type: service # can be one of: service, library, website, iac-pipeline
   lifecycle: production # can be one of: experimental, production, deprecated
-  owner: team-data-platform-engineering # your existing tech team in Backstage, i.e. team-developer-platforms
+  owner: team-rvohrppe # your existing tech team in Backstage, i.e. team-developer-platforms
